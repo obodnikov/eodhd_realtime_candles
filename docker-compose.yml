@@ -1,0 +1,73 @@
+version: '3.8'
+
+services:
+  eodhd-candles:
+    build: .
+    container_name: eodhd-candle-aggregator
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-8765}:8765"
+    environment:
+      # EODHD API Key (required)
+      - EODHD_API_KEY=${EODHD_API_KEY}
+      
+      # API Authentication (recommended for production)
+      - API_KEY=${API_KEY:-}
+      
+      # Default tickers to track on startup
+      - DEFAULT_TICKERS=${DEFAULT_TICKERS:-AAPL,MSFT,GOOGL,TSLA,NVDA}
+      
+      # Candle configuration
+      - CANDLE_INTERVAL_MINUTES=${CANDLE_INTERVAL_MINUTES:-5}
+      - MAX_CANDLES_STORED=${MAX_CANDLES_STORED:-100}
+      - MAX_TICKERS=${MAX_TICKERS:-50}
+      
+      # WebSocket settings
+      - WS_RECONNECT_DELAY=${WS_RECONNECT_DELAY:-5}
+      - WS_PING_INTERVAL=${WS_PING_INTERVAL:-30}
+      
+      # Database path (inside container)
+      - DATABASE_PATH=/data/candles.db
+      
+      # Logging
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      # Persist database across container restarts
+      - candle_data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8765/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  candle_data:
+    name: eodhd_candle_data
+
+# =============================================================================
+# NETWORK CONFIGURATION
+# =============================================================================
+# If your n8n runs in Docker and you want to connect directly:
+#
+# Option 1: Add to same network as n8n
+# Uncomment below and replace 'n8n_network' with your actual n8n network name
+#
+# networks:
+#   default:
+#     external: true
+#     name: n8n_network
+#
+# Then in n8n HTTP Request node, use:
+#   http://eodhd-candle-aggregator:8765/candles/AAPL
+#
+# Option 2: Use host network (simpler but less isolated)
+# Add to service:
+#   network_mode: host
+# Then access via localhost:8765 from anywhere on the host
+# =============================================================================
