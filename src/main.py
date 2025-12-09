@@ -17,8 +17,10 @@ import logging
 import signal
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 from aiohttp import web
+from dotenv import load_dotenv
 
 from .config import Config, ConfigManager
 from .storage import Storage
@@ -140,6 +142,11 @@ async def on_shutdown(app: web.Application):
 
 def main():
     """Main entry point."""
+    # Load environment variables from .env file
+    env_path = Path(__file__).parent.parent / '.env'
+    if env_path.exists():
+        load_dotenv(env_path)
+
     # Load configuration
     config = Config()
     
