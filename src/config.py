@@ -6,10 +6,28 @@ Handles loading from environment variables and runtime updates.
 import os
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional
+from pathlib import Path
 import json
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def _get_default_db_path() -> str:
+    """
+    Get default database path.
+
+    For Docker: /data/candles.db
+    For local development: ./data/candles.db (relative to project root)
+    """
+    # Check if /data exists and is writable (Docker environment)
+    if os.path.exists('/data') and os.access('/data', os.W_OK):
+        return '/data/candles.db'
+
+    # Use local data directory for development
+    project_root = Path(__file__).parent.parent
+    local_data_dir = project_root / 'data'
+    return str(local_data_dir / 'candles.db')
 
 
 @dataclass
@@ -43,7 +61,7 @@ class Config:
     ws_ping_interval: int = field(default_factory=lambda: int(os.environ.get('WS_PING_INTERVAL', '30')))
     
     # Database
-    database_path: str = field(default_factory=lambda: os.environ.get('DATABASE_PATH', '/data/candles.db'))
+    database_path: str = field(default_factory=lambda: os.environ.get('DATABASE_PATH', _get_default_db_path()))
     
     # Logging
     log_level: str = field(default_factory=lambda: os.environ.get('LOG_LEVEL', 'INFO'))

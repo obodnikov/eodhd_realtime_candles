@@ -68,6 +68,13 @@ Thumbs.db
 .DS_Store
 ._*
 
+# Database files (local development)
+data/*.db
+data/*.db-shm
+data/*.db-wal
+*.db
+*.db-shm
+*.db-wal
 
 # Node (if needed later)
 node_modules/
