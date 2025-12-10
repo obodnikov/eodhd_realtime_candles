@@ -261,24 +261,67 @@ class APIRoutes:
         })
     
     async def remove_tickers(self, request: web.Request) -> web.Response:
-        """DELETE /tickers - Remove multiple tickers."""
+        """
+        DELETE /tickers - Remove tickers.
+
+        With body {"tickers": [...]}: Remove specific tickers
+        Without body (empty request): Remove ALL tickers (requires ALLOW_DELETE_ALL_TICKERS=true and ?confirm=true)
+        """
+        # Try to parse JSON body
         try:
             data = await request.json()
         except Exception:
-            return web.json_response(
-                {'error': 'Invalid JSON body'},
-                status=400
-            )
-        
+            # No body or invalid JSON - treat as "delete all" request
+            data = None
+
+        # Check if this is a "delete all tickers" request
+        if data is None or not data or not data.get('tickers'):
+            # Delete all tickers operation
+
+            # Check if feature is enabled
+            if not self.config_manager.config.allow_delete_all_tickers:
+                return web.json_response({
+                    'error': 'Removing all tickers is disabled',
+                    'detail': 'Set ALLOW_DELETE_ALL_TICKERS=true in .env to enable this operation'
+                }, status=403)
+
+            # Check for confirmation parameter
+            confirm = request.query.get('confirm', '').lower()
+            if confirm != 'true':
+                return web.json_response({
+                    'error': 'Confirmation required',
+                    'detail': 'Add ?confirm=true to confirm deletion of all tickers',
+                    'warning': 'This will remove all tracked tickers (candle data will be preserved)'
+                }, status=400)
+
+            # Proceed with deleting all tickers
+            count = self.storage.delete_all_tickers()
+
+            # Clear WebSocket subscriptions
+            await self.ws_manager.clear_subscriptions()
+
+            # Clear all active candles from engine
+            for ticker in self.candle_engine.get_active_tickers():
+                self.candle_engine.remove_ticker(ticker)
+
+            return web.json_response({
+                'message': 'All tickers removed',
+                'count': count,
+                'candles_preserved': True,
+                'current_count': 0,
+                'timestamp': datetime.now(timezone.utc).isoformat()
+            })
+
+        # Remove specific tickers
         tickers = data.get('tickers', [])
         if isinstance(tickers, str):
             tickers = [tickers]
-        
+
         tickers = [t.upper().strip() for t in tickers if t.strip()]
-        
+
         removed = []
         not_found = []
-        
+
         for ticker in tickers:
             if self.storage.ticker_exists(ticker):
                 await self.ws_manager.unsubscribe({ticker})
@@ -287,7 +330,7 @@ class APIRoutes:
                 removed.append(ticker)
             else:
                 not_found.append(ticker)
-        
+
         return web.json_response({
             'removed': removed,
             'not_found': not_found,
