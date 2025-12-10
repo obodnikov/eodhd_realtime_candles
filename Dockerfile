@@ -22,9 +22,9 @@ ENV LOG_LEVEL=INFO
 # Expose port
 EXPOSE 8765
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8765/health')" || exit 1
+# Health check with timeout to prevent hanging requests
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD python -c "import urllib.request, socket; socket.setdefaulttimeout(3); urllib.request.urlopen('http://localhost:8765/health')" || exit 1
 
 # Run the service
 CMD ["python", "-m", "src.main"]

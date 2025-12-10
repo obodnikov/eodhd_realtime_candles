@@ -198,11 +198,11 @@ def main():
         
         # Wait forever (until signal)
         stop_event = asyncio.Event()
-        
+
         def signal_handler():
             stop_event.set()
-        
-        loop = asyncio.get_event_loop()
+
+        loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, signal_handler)
         
