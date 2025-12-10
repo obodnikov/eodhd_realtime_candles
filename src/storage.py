@@ -11,6 +11,7 @@ from typing import List, Dict, Optional, Any
 from dataclasses import dataclass, asdict
 from pathlib import Path
 import threading
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -408,23 +409,23 @@ class Storage:
         """Get database statistics."""
         conn = self._get_connection()
         cursor = conn.cursor()
-        
+
         cursor.execute('SELECT COUNT(*) FROM tickers')
         ticker_count = cursor.fetchone()[0]
-        
+
         cursor.execute('SELECT COUNT(*) FROM candles')
         total_candles = cursor.fetchone()[0]
-        
+
         cursor.execute('SELECT COUNT(*) FROM candles WHERE is_complete = 1')
         complete_candles = cursor.fetchone()[0]
-        
+
         cursor.execute('''
-            SELECT ticker, COUNT(*) as count 
-            FROM candles 
+            SELECT ticker, COUNT(*) as count
+            FROM candles
             GROUP BY ticker
         ''')
         candles_per_ticker = {row['ticker']: row['count'] for row in cursor.fetchall()}
-        
+
         return {
             'ticker_count': ticker_count,
             'total_candles': total_candles,
@@ -432,3 +433,171 @@ class Storage:
             'incomplete_candles': total_candles - complete_candles,
             'candles_per_ticker': candles_per_ticker
         }
+
+
+def _get_default_config_path() -> str:
+    """
+    Get default config file path.
+
+    For Docker: /data/config.json
+    For local development: ./data/config.json (relative to project root)
+    """
+    # Check if /data exists and is writable (Docker environment)
+    if os.path.exists('/data') and os.access('/data', os.W_OK):
+        return '/data/config.json'
+
+    # Use local data directory for development
+    # Navigate from src/storage.py to project root
+    project_root = Path(__file__).parent.parent
+    local_data_dir = project_root / 'data'
+    return str(local_data_dir / 'config.json')
+
+
+class ConfigStorage:
+    """
+    JSON-based storage for runtime configuration overrides.
+
+    Stores only fields that differ from .env defaults (sparse storage).
+    Never stores sensitive information like API keys.
+    """
+
+    # Fields that should never be persisted (security sensitive)
+    EXCLUDED_FIELDS = {
+        'eodhd_api_key',
+        'api_key',
+        'database_path',
+        'http_host',
+        'http_port',
+        'log_level',
+        'default_tickers',
+        'allow_delete_all_tickers'
+    }
+
+    # Fields that can be persisted
+    ALLOWED_FIELDS = {
+        'candle_interval_minutes',
+        'max_candles_stored',
+        'max_tickers',
+        'ws_reconnect_delay',
+        'ws_ping_interval'
+    }
+
+    def __init__(self, config_path: Optional[str] = None):
+        """
+        Initialize config storage.
+
+        Args:
+            config_path: Path to config JSON file. If None, uses auto-detected default.
+        """
+        self.config_path = config_path or _get_default_config_path()
+        self._ensure_directory()
+
+    def _ensure_directory(self):
+        """Ensure the config directory exists."""
+        Path(self.config_path).parent.mkdir(parents=True, exist_ok=True)
+
+    def save_config(self, overrides: Dict[str, Any]) -> bool:
+        """
+        Save configuration overrides to JSON file.
+
+        Only saves allowed fields (excludes sensitive data).
+
+        Args:
+            overrides: Dictionary of config field overrides
+
+        Returns:
+            True if saved successfully, False otherwise
+        """
+        try:
+            # Filter to only allowed fields
+            filtered = {
+                k: v for k, v in overrides.items()
+                if k in self.ALLOWED_FIELDS
+            }
+
+            if not filtered:
+                logger.debug("No allowed fields to persist")
+                return True
+
+            data = {
+                'version': '1.0',
+                'updated_at': datetime.now(timezone.utc).isoformat(),
+                'overrides': filtered
+            }
+
+            # Atomic write using temp file
+            temp_path = f"{self.config_path}.tmp"
+            with open(temp_path, 'w') as f:
+                json.dump(data, f, indent=2)
+
+            # Atomic rename
+            os.replace(temp_path, self.config_path)
+
+            logger.info(f"Saved config overrides to {self.config_path}: {list(filtered.keys())}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to save config: {e}")
+            return False
+
+    def load_config(self) -> Optional[Dict[str, Any]]:
+        """
+        Load configuration overrides from JSON file.
+
+        Returns:
+            Dictionary of overrides, or None if file doesn't exist or is invalid
+        """
+        if not os.path.exists(self.config_path):
+            logger.debug(f"Config file not found: {self.config_path}")
+            return None
+
+        try:
+            with open(self.config_path, 'r') as f:
+                data = json.load(f)
+
+            # Validate structure
+            if not isinstance(data, dict) or 'overrides' not in data:
+                logger.warning(f"Invalid config file structure in {self.config_path}")
+                return None
+
+            overrides = data['overrides']
+
+            # Filter to only allowed fields (security check)
+            filtered = {
+                k: v for k, v in overrides.items()
+                if k in self.ALLOWED_FIELDS
+            }
+
+            if filtered:
+                logger.info(f"Loaded config overrides from {self.config_path}: {list(filtered.keys())}")
+            else:
+                logger.debug("No valid overrides found in config file")
+
+            return filtered
+
+        except json.JSONDecodeError as e:
+            logger.warning(f"Invalid JSON in config file {self.config_path}: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Failed to load config: {e}")
+            return None
+
+    def delete_config(self) -> bool:
+        """
+        Delete the config file (used on reset).
+
+        Returns:
+            True if deleted or didn't exist, False on error
+        """
+        try:
+            if os.path.exists(self.config_path):
+                os.remove(self.config_path)
+                logger.info(f"Deleted config file: {self.config_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to delete config file: {e}")
+            return False
+
+    def exists(self) -> bool:
+        """Check if config file exists."""
+        return os.path.exists(self.config_path)

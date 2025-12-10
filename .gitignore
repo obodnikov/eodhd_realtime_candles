@@ -76,6 +76,12 @@ data/*.db-wal
 *.db-shm
 *.db-wal
 
+# Runtime configuration (user-specific overrides)
+data/config.json
+data/config.json.tmp
+config.json
+config.json.tmp
+
 # Node (if needed later)
 node_modules/
 npm-debug.log*

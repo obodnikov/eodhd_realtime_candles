@@ -87,11 +87,15 @@ class APIRoutes:
         """GET /status - Detailed system status."""
         ws_status = self.ws_manager.get_status()
         db_stats = self.storage.get_stats()
-        
+        overrides = self.config_manager.get_overrides()
+
         return web.json_response({
             'websocket': ws_status,
             'database': db_stats,
-            'config': self.config_manager.config.get_public_config(),
+            'config': self.config_manager.config.get_public_config(
+                include_source=True,
+                overrides=overrides
+            ),
             'active_candles': self.candle_engine.get_active_tickers(),
             'timestamp': datetime.now(timezone.utc).isoformat()
         })
@@ -111,9 +115,16 @@ class APIRoutes:
     # =========================================================================
     
     async def get_config(self, request: web.Request) -> web.Response:
-        """GET /config - Get current configuration."""
+        """GET /config - Get current configuration with source information."""
+        overrides = self.config_manager.get_overrides()
+
         return web.json_response({
-            'config': self.config_manager.config.get_public_config(),
+            'config': self.config_manager.config.get_public_config(
+                include_source=True,
+                overrides=overrides
+            ),
+            'persistence_enabled': self.config_manager.config.persist_config,
+            'has_persisted_overrides': len(overrides) > 0,
             'timestamp': datetime.now(timezone.utc).isoformat()
         })
     
