@@ -1,0 +1,121 @@
+{
+  "name": "Real-Time Stock Momentum Analysis",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "realtime-momentum",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [0, 0],
+      "webhookId": "realtime-momentum"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Validate and prepare input\nconst body = $input.item.json.body || $input.item.json;\nlet tickers = body.tickers || ['AAPL', 'MSFT', 'GOOGL'];\n\nif (typeof tickers === 'string') {\n  tickers = tickers.split(',').map(t => t.trim());\n}\n\nreturn {\n  json: {\n    tickers: tickers.map(t => t.toUpperCase()),\n    count: body.count || 10,\n    timestamp: new Date().toISOString()\n  }\n};"
+      },
+      "id": "validate-input",
+      "name": "Validate Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [220, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:8765/candles/multi",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ tickers: $json.tickers, count: $json.count, include_current: true }) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "get-candles",
+      "name": "Get Real-Time Candles",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [440, 0],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Candle Aggregator API Key"
+        }
+      },
+      "continueOnFail": true,
+      "notes": "Configure credential with Header Name: X-API-Key and your API key as value"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Process candles and calculate momentum for each ticker\nconst response = $input.item.json;\nconst data = response.data || {};\n\nconst results = [];\n\nfor (const [ticker, candles] of Object.entries(data)) {\n  if (!candles || candles.length === 0) {\n    results.push({\n      ticker,\n      status: 'NO_DATA',\n      error: 'No candles available'\n    });\n    continue;\n  }\n  \n  // Separate completed and current candles\n  const completed = candles.filter(c => c.is_complete);\n  const current = candles.find(c => !c.is_complete);\n  \n  // Calculate price momentum\n  const firstPrice = completed[0]?.open || current?.open || 0;\n  const lastPrice = current?.close || completed[completed.length - 1]?.close || 0;\n  const priceChangePct = firstPrice > 0 \n    ? ((lastPrice - firstPrice) / firstPrice * 100) \n    : 0;\n  \n  // Calculate volume metrics\n  const volumes = completed.map(c => c.volume).filter(v => v > 0);\n  const avgVolume = volumes.length > 0 \n    ? volumes.reduce((a, b) => a + b, 0) / volumes.length \n    : 0;\n  const lastVolume = current?.volume || completed[completed.length - 1]?.volume || 0;\n  const volumeRatio = avgVolume > 0 ? lastVolume / avgVolume : 1;\n  \n  // Calculate price range\n  const highs = candles.map(c => c.high);\n  const lows = candles.map(c => c.low);\n  const rangeHigh = Math.max(...highs);\n  const rangeLow = Math.min(...lows);\n  const rangePct = rangeLow > 0 ? ((rangeHigh - rangeLow) / rangeLow * 100) : 0;\n  \n  // Determine momentum signal\n  let momentum = 'NEUTRAL';\n  let signal = 'HOLD';\n  \n  if (priceChangePct > 1.5) {\n    momentum = 'STRONG_BULLISH';\n    signal = volumeRatio > 1.2 ? 'STRONG_BUY' : 'BUY';\n  } else if (priceChangePct > 0.5) {\n    momentum = 'BULLISH';\n    signal = 'BUY';\n  } else if (priceChangePct < -1.5) {\n    momentum = 'STRONG_BEARISH';\n    signal = 'SELL';\n  } else if (priceChangePct < -0.5) {\n    momentum = 'BEARISH';\n    signal = 'CAUTION';\n  }\n  \n  results.push({\n    ticker,\n    current_price: lastPrice.toFixed(2),\n    price_change_pct: priceChangePct.toFixed(2),\n    momentum,\n    signal,\n    volume_ratio: volumeRatio.toFixed(2),\n    range_high: rangeHigh.toFixed(2),\n    range_low: rangeLow.toFixed(2),\n    range_pct: rangePct.toFixed(2),\n    candle_count: candles.length,\n    completed_candles: completed.length,\n    has_current: !!current,\n    interval: response.interval,\n    status: 'OK'\n  });\n}\n\n// Sort by momentum strength (strongest bullish first)\nconst order = ['STRONG_BULLISH', 'BULLISH', 'NEUTRAL', 'BEARISH', 'STRONG_BEARISH'];\nresults.sort((a, b) => order.indexOf(a.momentum) - order.indexOf(b.momentum));\n\nreturn results.map(r => ({ json: r }));"
+      },
+      "id": "process-candles",
+      "name": "Calculate Momentum",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [660, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Generate summary report\nconst analyses = $input.all().map(item => item.json);\n\n// Categorize by signal\nconst categories = {\n  STRONG_BUY: analyses.filter(a => a.signal === 'STRONG_BUY'),\n  BUY: analyses.filter(a => a.signal === 'BUY'),\n  HOLD: analyses.filter(a => a.signal === 'HOLD'),\n  CAUTION: analyses.filter(a => a.signal === 'CAUTION'),\n  SELL: analyses.filter(a => a.signal === 'SELL')\n};\n\n// Build markdown report\nlet report = `# Real-Time Momentum Report\\n`;\nreport += `**Generated:** ${new Date().toISOString()}\\n\\n`;\n\nreport += `## Summary\\n`;\nreport += `| Signal | Count | Tickers |\\n`;\nreport += `|--------|-------|---------|\\n`;\nfor (const [signal, items] of Object.entries(categories)) {\n  if (items.length > 0) {\n    report += `| ${signal} | ${items.length} | ${items.map(i => i.ticker).join(', ')} |\\n`;\n  }\n}\n\nreport += `\\n## Detailed Analysis\\n\\n`;\nreport += `| Ticker | Price | Change | Momentum | Signal | Vol Ratio |\\n`;\nreport += `|--------|-------|--------|----------|--------|-----------|\\n`;\n\nfor (const a of analyses) {\n  if (a.status === 'OK') {\n    report += `| ${a.ticker} | $${a.current_price} | ${a.price_change_pct}% | ${a.momentum} | ${a.signal} | ${a.volume_ratio}x |\\n`;\n  }\n}\n\n// Top picks\nconst topBuys = [...categories.STRONG_BUY, ...categories.BUY].slice(0, 3);\nif (topBuys.length > 0) {\n  report += `\\n## Top Picks\\n\\n`;\n  topBuys.forEach((pick, i) => {\n    report += `${i + 1}. **${pick.ticker}** - ${pick.momentum} (${pick.price_change_pct}% change, ${pick.volume_ratio}x volume)\\n`;\n  });\n}\n\nreturn {\n  json: {\n    report,\n    summary: {\n      total_analyzed: analyses.length,\n      strong_buys: categories.STRONG_BUY.map(a => a.ticker),\n      buys: categories.BUY.map(a => a.ticker),\n      sells: categories.SELL.map(a => a.ticker)\n    },\n    analyses,\n    timestamp: new Date().toISOString()\n  }\n};"
+      },
+      "id": "generate-report",
+      "name": "Generate Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [880, 0]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json, null, 2) }}",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              }
+            ]
+          }
+        }
+      },
+      "id": "webhook-response",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1100, 0]
+    }
+  ],
+  "connections": {
+    "Webhook Trigger": {
+      "main": [[{"node": "Validate Input", "type": "main", "index": 0}]]
+    },
+    "Validate Input": {
+      "main": [[{"node": "Get Real-Time Candles", "type": "main", "index": 0}]]
+    },
+    "Get Real-Time Candles": {
+      "main": [[{"node": "Calculate Momentum", "type": "main", "index": 0}]]
+    },
+    "Calculate Momentum": {
+      "main": [[{"node": "Generate Report", "type": "main", "index": 0}]]
+    },
+    "Generate Report": {
+      "main": [[{"node": "Respond to Webhook", "type": "main", "index": 0}]]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "description": "Analyzes real-time stock candles for momentum trading signals"
+  }
+}
