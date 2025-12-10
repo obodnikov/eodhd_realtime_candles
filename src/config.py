@@ -33,24 +33,24 @@ def _get_default_db_path() -> str:
 @dataclass
 class Config:
     """Application configuration with defaults from environment variables."""
-    
+
     # EODHD API
     eodhd_api_key: str = field(default_factory=lambda: os.environ.get('EODHD_API_KEY', 'demo'))
-    
+
     # HTTP Server
     http_host: str = field(default_factory=lambda: os.environ.get('HTTP_HOST', '0.0.0.0'))
     http_port: int = field(default_factory=lambda: int(os.environ.get('HTTP_PORT', '8765')))
-    
+
     # API Authentication
     api_key: Optional[str] = field(default_factory=lambda: os.environ.get('API_KEY', '') or None)
-    
+
     # Default Tickers
     default_tickers: List[str] = field(default_factory=lambda: [
-        t.strip().upper() 
+        t.strip().upper()
         for t in os.environ.get('DEFAULT_TICKERS', 'AAPL,MSFT,GOOGL').split(',')
         if t.strip()
     ])
-    
+
     # Ticker Management
     allow_delete_all_tickers: bool = field(default_factory=lambda: os.environ.get('ALLOW_DELETE_ALL_TICKERS', 'false').lower() == 'true')
 
@@ -58,14 +58,18 @@ class Config:
     candle_interval_minutes: int = field(default_factory=lambda: int(os.environ.get('CANDLE_INTERVAL_MINUTES', '5')))
     max_candles_stored: int = field(default_factory=lambda: int(os.environ.get('MAX_CANDLES_STORED', '100')))
     max_tickers: int = field(default_factory=lambda: int(os.environ.get('MAX_TICKERS', '50')))
-    
+
     # WebSocket
     ws_reconnect_delay: int = field(default_factory=lambda: int(os.environ.get('WS_RECONNECT_DELAY', '5')))
     ws_ping_interval: int = field(default_factory=lambda: int(os.environ.get('WS_PING_INTERVAL', '30')))
-    
+
     # Database
     database_path: str = field(default_factory=lambda: os.environ.get('DATABASE_PATH', _get_default_db_path()))
-    
+
+    # Persistence
+    config_file: str = field(default_factory=lambda: os.environ.get('CONFIG_FILE', ''))
+    persist_config: bool = field(default_factory=lambda: os.environ.get('PERSIST_CONFIG', 'true').lower() == 'true')
+
     # Logging
     log_level: str = field(default_factory=lambda: os.environ.get('LOG_LEVEL', 'INFO'))
     
@@ -100,9 +104,18 @@ class Config:
         
         return data
     
-    def get_public_config(self) -> dict:
-        """Get configuration safe to expose via API."""
-        return {
+    def get_public_config(self, include_source: bool = False, overrides: Optional[dict] = None) -> dict:
+        """
+        Get configuration safe to expose via API.
+
+        Args:
+            include_source: If True, include source info for each field
+            overrides: Dictionary of runtime overrides (to determine source)
+
+        Returns:
+            Dictionary of public configuration
+        """
+        config = {
             'candle_interval_minutes': self.candle_interval_minutes,
             'max_candles_stored': self.max_candles_stored,
             'max_tickers': self.max_tickers,
@@ -111,64 +124,156 @@ class Config:
             'authentication_enabled': self.api_key is not None,
         }
 
+        if include_source and overrides is not None:
+            # Add source information for each field
+            config_with_source = {}
+            for key, value in config.items():
+                if key == 'authentication_enabled':
+                    # Skip source for derived fields
+                    config_with_source[key] = value
+                else:
+                    config_with_source[key] = {
+                        'value': value,
+                        'source': 'runtime' if key in overrides else 'env'
+                    }
+            return config_with_source
+
+        return config
+
 
 class ConfigManager:
     """Manages runtime configuration with persistence."""
-    
-    def __init__(self, config: Config):
+
+    def __init__(self, config: Config, config_storage=None):
+        """
+        Initialize config manager.
+
+        Args:
+            config: Initial configuration (from .env)
+            config_storage: ConfigStorage instance (optional, for testing)
+        """
         self.config = config
         self._env_defaults = Config()  # Store original env defaults
-        
+        self._overrides = {}  # Track runtime overrides
+
+        # Initialize config storage
+        if config_storage is None:
+            from .storage import ConfigStorage
+            config_path = config.config_file if config.config_file else None
+            self._config_storage = ConfigStorage(config_path)
+        else:
+            self._config_storage = config_storage
+
+        # Load persisted overrides if they exist and persistence is enabled
+        if self.config.persist_config:
+            self._load_overrides()
+
+    def _load_overrides(self):
+        """Load and apply persisted configuration overrides."""
+        overrides = self._config_storage.load_config()
+        if overrides:
+            self._overrides = overrides
+            # Apply overrides to config
+            for key, value in overrides.items():
+                if hasattr(self.config, key):
+                    setattr(self.config, key, value)
+                    logger.info(f"Applied persisted config: {key} = {value}")
+
+    def _save_overrides(self) -> bool:
+        """Save current overrides to file if persistence is enabled."""
+        if not self.config.persist_config:
+            logger.debug("Config persistence disabled, not saving")
+            return False
+
+        return self._config_storage.save_config(self._overrides)
+
     def update(self, updates: dict) -> dict:
         """
         Update configuration with provided values.
-        Returns dict with 'updated' fields and any 'errors'.
+
+        Args:
+            updates: Dictionary of config fields to update
+
+        Returns:
+            Dictionary with 'updated' fields, 'errors', and 'persisted' status
         """
         errors = []
         updated = []
-        
+
         # Validate and apply updates
         for key, value in updates.items():
             if not hasattr(self.config, key):
                 errors.append(f"Unknown configuration key: {key}")
                 continue
-            
+
             # Type checking and validation
             if key == 'candle_interval_minutes':
                 if value not in [1, 5, 15, 30, 60]:
                     errors.append(f"Invalid candle_interval_minutes: {value}. Must be 1, 5, 15, 30, or 60")
                     continue
-                    
+
             if key == 'max_tickers':
                 if not isinstance(value, int) or value < 1 or value > 50:
                     errors.append(f"max_tickers must be between 1 and 50")
                     continue
-                    
+
             if key == 'max_candles_stored':
                 if not isinstance(value, int) or value < 1:
                     errors.append(f"max_candles_stored must be at least 1")
                     continue
-            
+
+            if key == 'ws_reconnect_delay':
+                if not isinstance(value, int) or value < 1:
+                    errors.append(f"ws_reconnect_delay must be at least 1")
+                    continue
+
+            if key == 'ws_ping_interval':
+                if not isinstance(value, int) or value < 1:
+                    errors.append(f"ws_ping_interval must be at least 1")
+                    continue
+
             # Don't allow updating sensitive fields via API
-            if key in ['eodhd_api_key', 'api_key', 'database_path', 'http_host', 'http_port']:
+            if key in ['eodhd_api_key', 'api_key', 'database_path', 'http_host', 'http_port', 'config_file', 'persist_config']:
                 errors.append(f"Cannot update {key} at runtime")
                 continue
-            
+
+            # Apply update
             setattr(self.config, key, value)
+            self._overrides[key] = value
             updated.append(key)
             logger.info(f"Config updated: {key} = {value}")
-        
+
+        # Persist if updates were made
+        persisted = False
+        if updated:
+            persisted = self._save_overrides()
+
         return {
             'updated': updated,
             'errors': errors,
-            'config': self.config.get_public_config()
+            'persisted': persisted,
+            'config': self.config.get_public_config(include_source=True, overrides=self._overrides)
         }
-    
+
     def reset_to_defaults(self) -> dict:
         """Reset configuration to environment variable defaults."""
+        # Clear overrides
+        self._overrides = {}
+
+        # Delete persisted config file
+        deleted = self._config_storage.delete_config()
+
+        # Reset to env defaults
         self.config = Config()
+
         logger.info("Configuration reset to defaults")
+
         return {
             'message': 'Configuration reset to defaults',
-            'config': self.config.get_public_config()
+            'persisted_config_deleted': deleted,
+            'config': self.config.get_public_config(include_source=True, overrides={})
         }
+
+    def get_overrides(self) -> dict:
+        """Get current runtime overrides."""
+        return self._overrides.copy()
