@@ -108,7 +108,8 @@ All endpoints except `/health` require authentication via one of:
 | `GET` | `/tickers` | List all tracked tickers |
 | `POST` | `/tickers` | Add ticker(s) |
 | `DELETE` | `/tickers/{ticker}` | Remove single ticker |
-| `DELETE` | `/tickers` | Remove multiple tickers (body) |
+| `DELETE` | `/tickers` (with body) | Remove multiple tickers |
+| `DELETE` | `/tickers?confirm=true` (no body) | Remove ALL tickers (requires config) |
 
 **Examples:**
 ```bash
@@ -120,9 +121,25 @@ curl -X POST -H "X-API-Key: xxx" -H "Content-Type: application/json" \
   -d '{"tickers": ["MCD", "KO", "PEP"]}' \
   http://localhost:8765/tickers
 
-# Remove ticker
+# Remove single ticker
 curl -X DELETE -H "X-API-Key: xxx" http://localhost:8765/tickers/MCD
+
+# Remove specific tickers
+curl -X DELETE -H "X-API-Key: xxx" -H "Content-Type: application/json" \
+  -d '{"tickers": ["MCD", "KO"]}' \
+  http://localhost:8765/tickers
+
+# Remove ALL tickers (requires ALLOW_DELETE_ALL_TICKERS=true)
+curl -X DELETE -H "X-API-Key: xxx" \
+  http://localhost:8765/tickers?confirm=true
 ```
+
+**Important Notes:**
+- Removing all tickers is **disabled by default** for safety
+- Set `ALLOW_DELETE_ALL_TICKERS=true` in `.env` to enable
+- Requires `?confirm=true` query parameter to prevent accidental deletion
+- Candle data is **preserved** when tickers are removed
+- Re-adding a ticker will restore access to its preserved candles
 
 #### Candle Data
 
@@ -212,6 +229,7 @@ Body:
 | `API_KEY` | (empty) | API authentication key |
 | `HTTP_PORT` | `8765` | HTTP server port |
 | `DEFAULT_TICKERS` | `AAPL,MSFT,GOOGL` | Initial tickers |
+| `ALLOW_DELETE_ALL_TICKERS` | `false` | Enable DELETE /tickers without body |
 | `CANDLE_INTERVAL_MINUTES` | `5` | 1, 5, 15, 30, or 60 |
 | `MAX_CANDLES_STORED` | `100` | Per ticker |
 | `MAX_TICKERS` | `50` | EODHD WebSocket limit |

@@ -243,7 +243,26 @@ class Storage:
         cursor = conn.cursor()
         cursor.execute('SELECT COUNT(*) FROM tickers')
         return cursor.fetchone()[0]
-    
+
+    def delete_all_tickers(self) -> int:
+        """
+        Remove all tickers from tracking (preserves candle data).
+        Returns count of removed tickers.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        # Get count before deletion
+        cursor.execute('SELECT COUNT(*) FROM tickers')
+        count = cursor.fetchone()[0]
+
+        # Delete all tickers (candles are preserved)
+        cursor.execute('DELETE FROM tickers')
+
+        conn.commit()
+        logger.info(f"Deleted all {count} tickers (candle data preserved)")
+        return count
+
     # =========================================================================
     # Candle Management
     # =========================================================================

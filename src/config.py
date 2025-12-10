@@ -51,6 +51,9 @@ class Config:
         if t.strip()
     ])
     
+    # Ticker Management
+    allow_delete_all_tickers: bool = field(default_factory=lambda: os.environ.get('ALLOW_DELETE_ALL_TICKERS', 'false').lower() == 'true')
+
     # Candle Configuration
     candle_interval_minutes: int = field(default_factory=lambda: int(os.environ.get('CANDLE_INTERVAL_MINUTES', '5')))
     max_candles_stored: int = field(default_factory=lambda: int(os.environ.get('MAX_CANDLES_STORED', '100')))

@@ -96,17 +96,34 @@ class WebSocketManager:
         """Unsubscribe from tickers."""
         tickers = {t.upper() for t in tickers}
         existing = tickers & self._subscribed_tickers
-        
+
         if not existing:
             return
-        
+
         if self._connected and self._ws:
             await self._send_unsubscribe(existing)
-        
+
         self._subscribed_tickers -= existing
         self._pending_subscribe -= tickers
-        
+
         logger.info(f"Unsubscribed from: {existing}")
+
+    async def clear_subscriptions(self):
+        """Clear all ticker subscriptions and trigger reconnection."""
+        if self._subscribed_tickers:
+            logger.info(f"Clearing {len(self._subscribed_tickers)} subscriptions")
+
+            if self._connected and self._ws:
+                await self._send_unsubscribe(self._subscribed_tickers)
+
+            self._subscribed_tickers.clear()
+            self._pending_subscribe.clear()
+            self._pending_unsubscribe.clear()
+
+            # Trigger reconnection to ensure clean state
+            if self._running:
+                await self.stop()
+                await self.start()
     
     async def _send_subscribe(self, tickers: Set[str]):
         """Send subscription message to WebSocket."""
