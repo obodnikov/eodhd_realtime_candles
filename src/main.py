@@ -149,18 +149,18 @@ def main():
 
     # Load configuration
     config = Config()
-    
+
     # Setup logging
     setup_logging(config.log_level)
     logger = logging.getLogger(__name__)
-    
+
     # Validate configuration
     errors = config.validate()
     if errors:
         for error in errors:
             logger.error(f"Configuration error: {error}")
         sys.exit(1)
-    
+
     logger.info("=" * 60)
     logger.info("EODHD Real-Time Candle Aggregator")
     logger.info("=" * 60)
@@ -170,17 +170,12 @@ def main():
     logger.info(f"Database: {config.database_path}")
     logger.info(f"HTTP server: {config.http_host}:{config.http_port}")
     logger.info("=" * 60)
-    
-    # Create and run application
-    async def run():
+
+    # Create application synchronously
+    async def init_app():
+        """Initialize the application."""
         app = await create_app(config)
-        
-        runner = web.AppRunner(app)
-        await runner.setup()
-        
-        site = web.TCPSite(runner, config.http_host, config.http_port)
-        await site.start()
-        
+
         logger.info(f"HTTP server listening on http://{config.http_host}:{config.http_port}")
         logger.info("")
         logger.info("API Endpoints:")
@@ -195,24 +190,20 @@ def main():
         logger.info("  GET  /candles/{ticker}    - Get candles")
         logger.info("  POST /candles/multi       - Get multiple tickers")
         logger.info("")
-        
-        # Wait forever (until signal)
-        stop_event = asyncio.Event()
 
-        def signal_handler():
-            stop_event.set()
+        return app
 
-        loop = asyncio.get_running_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, signal_handler)
-        
-        await stop_event.wait()
-        
-        # Cleanup
-        await runner.cleanup()
-    
+    # Run using aiohttp's recommended web.run_app()
+    # This handles all event loop management, signal handling, and graceful shutdown
     try:
-        asyncio.run(run())
+        app = asyncio.run(init_app())
+        web.run_app(
+            app,
+            host=config.http_host,
+            port=config.http_port,
+            handle_signals=True,
+            print=lambda *args: None  # Suppress aiohttp's own startup messages
+        )
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
 
