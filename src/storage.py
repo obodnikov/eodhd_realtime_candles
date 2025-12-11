@@ -6,6 +6,7 @@ Provides persistence across service restarts.
 import sqlite3
 import json
 import logging
+import time
 from datetime import datetime, timezone
 from typing import List, Dict, Optional, Any
 from dataclasses import dataclass, asdict
@@ -52,9 +53,14 @@ class TrackedTicker:
 class Storage:
     """SQLite-based storage for candles and tickers."""
     
+    # Cache TTL for get_stats() in seconds
+    STATS_CACHE_TTL = 5.0
+
     def __init__(self, db_path: str):
         self.db_path = db_path
         self._local = threading.local()
+        self._stats_cache: Optional[Dict[str, Any]] = None
+        self._stats_cache_time: float = 0.0
         self._ensure_directory()
         self._init_db()
         
@@ -63,13 +69,35 @@ class Storage:
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         
     def _get_connection(self) -> sqlite3.Connection:
-        """Get thread-local database connection."""
+        """
+        Get thread-local database connection.
+
+        Applies SQLite tuning for better concurrency:
+        - WAL journal mode for better read/write concurrency
+        - NORMAL synchronous for fewer fsyncs (good trade-off for this use case)
+        - busy_timeout to wait on locks instead of failing immediately
+        """
         if not hasattr(self._local, 'connection'):
-            self._local.connection = sqlite3.connect(
+            conn = sqlite3.connect(
                 self.db_path,
-                check_same_thread=False
+                check_same_thread=False,
+                timeout=5.0,  # seconds to wait when database is locked
             )
-            self._local.connection.row_factory = sqlite3.Row
+            conn.row_factory = sqlite3.Row
+
+            try:
+                # Enable WAL mode for better read/write concurrency
+                conn.execute("PRAGMA journal_mode=WAL;")
+                # Reduce fsyncs - acceptable trade-off for this use case
+                conn.execute("PRAGMA synchronous=NORMAL;")
+                # Wait up to 5 seconds if database is locked
+                conn.execute("PRAGMA busy_timeout=5000;")
+            except Exception as e:
+                # PRAGMA tuning is best-effort - don't break startup if it fails
+                logger.warning(f"Failed to apply SQLite PRAGMA settings: {e}")
+
+            self._local.connection = conn
+
         return self._local.connection
     
     def _init_db(self):
@@ -406,7 +434,18 @@ class Storage:
     # =========================================================================
     
     def get_stats(self) -> dict:
-        """Get database statistics."""
+        """
+        Get database statistics with TTL-based caching.
+
+        Stats are cached for STATS_CACHE_TTL seconds to avoid
+        expensive full-table scans on every /status request.
+        """
+        now = time.time()
+
+        # Return cached stats if still valid
+        if self._stats_cache and (now - self._stats_cache_time) < self.STATS_CACHE_TTL:
+            return self._stats_cache
+
         conn = self._get_connection()
         cursor = conn.cursor()
 
@@ -426,13 +465,19 @@ class Storage:
         ''')
         candles_per_ticker = {row['ticker']: row['count'] for row in cursor.fetchall()}
 
-        return {
+        result = {
             'ticker_count': ticker_count,
             'total_candles': total_candles,
             'complete_candles': complete_candles,
             'incomplete_candles': total_candles - complete_candles,
             'candles_per_ticker': candles_per_ticker
         }
+
+        # Update cache
+        self._stats_cache = result
+        self._stats_cache_time = now
+
+        return result
 
 
 def _get_default_config_path() -> str:

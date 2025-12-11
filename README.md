@@ -1,4 +1,4 @@
-# EODHD Real-Time Candle Aggregator v1.0
+# EODHD Real-Time Candle Aggregator v0.3.1
 
 > **Converts EODHD WebSocket tick data into configurable OHLCV candles with full REST API management**
 
@@ -276,3 +276,12 @@ docker-compose down
 docker volume rm eodhd_candle_data
 docker-compose up -d
 ```
+
+---
+
+## Changelog
+
+### v0.3.1 (2025-12-11)
+- **SQLite performance tuning**: Added WAL mode, `synchronous=NORMAL`, and `busy_timeout=5000` for better read/write concurrency
+- **Stats caching**: `get_stats()` now caches results for 5 seconds to reduce database load from `/status` polling
+- **Documentation**: Added `docs/sqlite-performance-tuning.md` with implementation details
