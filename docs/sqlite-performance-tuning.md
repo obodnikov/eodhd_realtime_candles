@@ -1,96 +1,263 @@
-# SQLite Performance Tuning
+# **AI.md — Engineering Rules for EODHD Real-Time Candle Service**
 
-## Problem
+## **1. Core Architecture Rules**
 
-The `/health` endpoint showed sporadic 1-1.3 second delays even with direct container access (bypassing nginx). Investigation revealed the issue was **blocking SQLite operations** in a **single-worker async process**.
+### **1.1 Never block the main event loop**
 
-### Root Causes
+The service is real-time and event-driven.
+**Any operation that can take >1ms must be executed outside the main HTTP worker**, especially:
 
-1. **Default rollback journal mode** - causes read/write blocking
-2. **No busy_timeout** - immediate failure on lock contention
-3. **Expensive `get_stats()` queries** - 3 full-table scans on every `/status` request
-4. **`cleanup_old_candles()` called on every candle completion** - heavy DELETE with subquery
+* SQLite `DELETE`, `COUNT(*)`, `VACUUM`, full scans
+* Batch candle cleanups
+* Deep historical recalculations
+* File I/O
+* External API calls
 
-## Implemented Solutions
+**Blocking operations must run in:**
 
-### 1. SQLite WAL Mode + busy_timeout
+* background tasks
+* dedicated worker threads
+* scheduled maintenance jobs
+* a separate service if needed
 
-**File:** `src/storage.py` - `_get_connection()` method
+**Do NOT perform expensive operations inside HTTP request handlers.**
 
-```python
-conn = sqlite3.connect(
-    self.db_path,
-    check_same_thread=False,
-    timeout=5.0,  # seconds to wait when database is locked
-)
+---
 
-# Enable WAL mode for better read/write concurrency
-conn.execute("PRAGMA journal_mode=WAL;")
-# Reduce fsyncs - acceptable trade-off for this use case
-conn.execute("PRAGMA synchronous=NORMAL;")
-# Wait up to 5 seconds if database is locked
-conn.execute("PRAGMA busy_timeout=5000;")
+## **2. Database Rules (SQLite)**
+
+### **2.1 Always configure SQLite for high-concurrency**
+
+Every connection **must** include:
+
+```sql
+PRAGMA journal_mode=WAL;
+PRAGMA synchronous=NORMAL;
+PRAGMA busy_timeout=5000;
 ```
 
-**Effects:**
-- **WAL (Write-Ahead Logging)**: Readers don't block writers and vice versa. Multiple readers can proceed concurrently with a single writer.
-- **synchronous=NORMAL**: Reduces disk fsyncs. Small risk of data loss on OS crash (not process crash), acceptable for this use case.
-- **busy_timeout=5000**: Instead of immediately throwing "database is locked", SQLite waits up to 5 seconds for the lock to be released.
+These improve concurrency and prevent write locks from freezing HTTP responses.
 
-### 2. TTL-Based Caching for `get_stats()`
+### **2.2 Cleanup must be incremental**
 
-**File:** `src/storage.py` - `get_stats()` method
+Never run large `DELETE` queries inline.
+Rules:
+
+* Use batch deletion (LIMIT 500–1000)
+* Cleanup only on a timer (e.g. every 30–60 sec)
+* Never cleanup inside a request handler
+* Avoid running `COUNT(*)` over entire tables frequently
+
+### **2.3 Never open or close SQLite connections per request**
+
+Always use:
+
+* a single connection per thread (`thread_local`)
+* long-lived connections only
+* no reinitialization in request handling paths
+
+---
+
+## **3. HTTP API Rules**
+
+### **3.1 `/health` must always return in < 50 ms**
+
+Never call:
+
+* DB operations
+* background services
+* anything asynchronous that may block
+
+`/health` must be pure in-memory:
 
 ```python
-STATS_CACHE_TTL = 5.0  # seconds
-
-def get_stats(self) -> dict:
-    now = time.time()
-
-    # Return cached stats if still valid
-    if self._stats_cache and (now - self._stats_cache_time) < self.STATS_CACHE_TTL:
-        return self._stats_cache
-
-    # ... expensive queries ...
-
-    # Update cache
-    self._stats_cache = result
-    self._stats_cache_time = now
-    return result
+return {"status": "healthy", "timestamp": ...}
 ```
 
-**Effects:**
-- Stats are cached for 5 seconds
-- Monitoring/UI polling `/status` won't trigger full-table scans on every request
-- Reduces database load significantly under frequent polling
+### **3.2 Use multiple HTTP workers**
 
-## Expected Impact
+When deploying under uvicorn/gunicorn:
 
-| Metric | Before | After |
-|--------|--------|-------|
-| `/health` latency spikes | 1-1.3s | < 10ms |
-| Read/write blocking | Yes | No (WAL) |
-| Lock contention errors | Immediate fail | 5s retry |
-| `/status` DB queries | Every request | Every 5s max |
+```
+workers >= number_of_cpu_cores / 2
+```
 
-## Deployment Notes
+Minimum rule: **never run with a single worker in production**.
 
-1. **WAL mode persists** - Once enabled, the database file stays in WAL mode. Two additional files appear: `candles.db-wal` and `candles.db-shm`.
+### **3.3 All HTTP handlers MUST be non-blocking**
 
-2. **Existing database** - WAL mode is applied on first connection after deployment. No manual migration needed.
+Even reading small DB chunks must use threadpool execution:
 
-3. **Docker volumes** - Ensure the `/data` volume persists the `-wal` and `-shm` files alongside the main `.db` file.
+```python
+from fastapi.concurrency import run_in_threadpool
+result = await run_in_threadpool(storage.get_candles, ticker, count)
+```
 
-## Future Improvements (Not Yet Implemented)
+(Or aiojobs if staying on aiohttp.)
 
-1. **Reduce `cleanup_old_candles()` frequency** - Currently called on every candle completion. Could be batched or throttled.
+---
 
-2. **Multiple uvicorn workers** - Would allow one worker to handle `/health` while another is busy with SQLite.
+## **4. Concurrency Rules**
 
-3. **Batch deletions** - For large cleanup operations, delete in batches of 500-1000 rows to reduce lock duration.
+### **4.1 WebSocket ingestion must be isolated**
 
-## References
+The ingestion loop must NOT:
 
-- [SQLite WAL Mode](https://www.sqlite.org/wal.html)
-- [SQLite PRAGMA Statements](https://www.sqlite.org/pragma.html)
-- [SQLite Locking](https://www.sqlite.org/lockingv3.html)
+* hold locks needed by SQLite readers
+* execute heavy computations inline
+* block the global event loop
+
+It must push data into a queue, and a dedicated worker must write to SQLite.
+
+### **4.2 No shared mutable global state**
+
+If global state is required:
+
+* protect access via locks
+* prefer message queues (asyncio.Queue)
+* avoid global dicts or lists modified across threads
+
+---
+
+## **5. Docker & Deployment Rules**
+
+### **5.1 Always specify resource expectations**
+
+The service must declare:
+
+* minimum CPUs: `1–2`
+* memory: `512MB–2GB`
+* no strict container memory limit unless required
+
+Do not rely on “default unlimited Docker resources”, because that may vary between hosts.
+
+### **5.2 Use a production ASGI server**
+
+Never run with:
+
+```bash
+python -m src.main
+```
+
+Use:
+
+```
+uvicorn src.main:app --host 0.0.0.0 --port 8765 --workers 2
+```
+
+or
+
+```
+gunicorn -k uvicorn.workers.UvicornWorker -w 2 src.main:app
+```
+
+### **5.3 Health checks must time out fast**
+
+Dockerfile:
+
+```
+HEALTHCHECK --interval=60s --timeout=3s --retries=2 CMD wget -qO- http://localhost:8765/health || exit 1
+```
+
+Never allow the health check to hang the container.
+
+---
+
+## **6. Code Quality Rules**
+
+### **6.1 Any new endpoint must follow this checklist**
+
+Before merging, the endpoint must:
+
+* return in < 200ms under load
+* NOT perform DB writes
+* NOT perform large DB reads
+* NOT touch SQLite schema
+* log duration for troubleshooting
+
+### **6.2 All heavy operations must include duration logging**
+
+Examples:
+
+```python
+start = time.monotonic()
+...
+logger.info("cleanup done in %.3f sec", time.monotonic() - start)
+```
+
+### **6.3 Any async code must be actually async**
+
+Avoid:
+
+* time.sleep
+* blocking libraries
+* synchronous network calls
+* synchronous file I/O
+
+Use async alternatives or `run_in_executor`.
+
+---
+
+## **7. Scalability Path Rules**
+
+Before adding new features, evaluate whether the following is required:
+
+* Migration from SQLite → PostgreSQL
+* Offloading ingestion to a separate microservice
+* Offloading cleanup to a cron job
+* Switching from aiohttp → FastAPI for API growth and ergonomics
+* Running multiple replicas behind nginx / Traefik
+
+---
+
+## **8. When rewriting to FastAPI is allowed**
+
+Rewrite is justified only if:
+
+* the API surface grows (5–10+ endpoints)
+* you need OpenAPI docs
+* you need standard auth
+* you want multi-worker performance without manual aiohttp tuning
+* you want long-term maintainability
+
+FastAPI rewrite is **not allowed solely to “fix latency”** unless data layer and concurrency design are also fixed.
+
+---
+
+## **9. Rules for Future Contributors (LLM or human)**
+
+### **9.1 Never introduce new blocking operations**
+
+If adding a new feature, you must explain:
+
+* how it avoids blocking
+* how it interacts with SQLite
+* how it affects worker concurrency
+* what happens if two heavy tasks overlap
+
+### **9.2 Always justify DB schema changes**
+
+Every schema change must consider:
+
+* impact on real-time ingestion
+* cost of migration
+* cost of full-table scans
+* effect on cleanup logic
+
+### **9.3 PR must include performance considerations**
+
+Every PR must answer:
+
+* What is the worst-case impact on latency?
+* Can this block `/health`?
+* Should this run in a background worker?
+* Does this increase DB I/O significantly?
+
+---
+
+## **10. Golden Rule**
+
+> **Nothing heavy ever runs inline with request processing — all heavy work is delegated.
+> The HTTP layer must stay responsive under any internal load.**
+
+---
