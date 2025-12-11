@@ -63,6 +63,12 @@ async def error_middleware(request: web.Request, handler):
 @web.middleware
 async def logging_middleware(request: web.Request, handler):
     """Request logging middleware."""
-    logger.debug(f"{request.method} {request.path}")
-    response = await handler(request)
-    return response
+    logger.info(f">>> REQUEST: {request.method} {request.path} from {request.remote}")
+    logger.debug(f"    Headers: {dict(request.headers)}")
+    try:
+        response = await handler(request)
+        logger.info(f"<<< RESPONSE: {request.method} {request.path} -> {response.status}")
+        return response
+    except Exception as e:
+        logger.error(f"!!! ERROR in request handler: {e}", exc_info=True)
+        raise
