@@ -78,6 +78,7 @@ class APIRoutes:
     
     async def health(self, request: web.Request) -> web.Response:
         """GET /health - Basic health check."""
+        logger.debug("Health check endpoint called")
         return web.json_response({
             'status': 'healthy',
             'timestamp': datetime.now(timezone.utc).isoformat()

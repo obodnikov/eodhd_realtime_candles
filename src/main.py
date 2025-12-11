@@ -199,11 +199,13 @@ def main():
     # This properly manages the event loop, signal handling, and graceful shutdown
     try:
         logger.info("Starting web.run_app()...")
+        logger.info(f"Will bind to {config.http_host}:{config.http_port}")
         web.run_app(
             create_app_wrapper(),
             host=config.http_host,
             port=config.http_port,
             handle_signals=True,
+            access_log=logger,  # Enable access logging
             print=lambda msg: logger.info(f"aiohttp: {msg}") if msg else None
         )
         logger.info("web.run_app() exited")
