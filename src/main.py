@@ -149,18 +149,18 @@ def main():
 
     # Load configuration
     config = Config()
-    
+
     # Setup logging
     setup_logging(config.log_level)
     logger = logging.getLogger(__name__)
-    
+
     # Validate configuration
     errors = config.validate()
     if errors:
         for error in errors:
             logger.error(f"Configuration error: {error}")
         sys.exit(1)
-    
+
     logger.info("=" * 60)
     logger.info("EODHD Real-Time Candle Aggregator")
     logger.info("=" * 60)
@@ -170,18 +170,15 @@ def main():
     logger.info(f"Database: {config.database_path}")
     logger.info(f"HTTP server: {config.http_host}:{config.http_port}")
     logger.info("=" * 60)
-    
-    # Create and run application
-    async def run():
+
+    # Create application factory for web.run_app
+    async def create_app_wrapper():
+        """Create and configure the application."""
+        logger.info("Creating application...")
         app = await create_app(config)
-        
-        runner = web.AppRunner(app)
-        await runner.setup()
-        
-        site = web.TCPSite(runner, config.http_host, config.http_port)
-        await site.start()
-        
-        logger.info(f"HTTP server listening on http://{config.http_host}:{config.http_port}")
+        logger.info("Application created successfully")
+
+        # Log after app is created but before server starts
         logger.info("")
         logger.info("API Endpoints:")
         logger.info("  GET  /health              - Health check")
@@ -195,26 +192,25 @@ def main():
         logger.info("  GET  /candles/{ticker}    - Get candles")
         logger.info("  POST /candles/multi       - Get multiple tickers")
         logger.info("")
-        
-        # Wait forever (until signal)
-        stop_event = asyncio.Event()
-        
-        def signal_handler():
-            stop_event.set()
-        
-        loop = asyncio.get_event_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, signal_handler)
-        
-        await stop_event.wait()
-        
-        # Cleanup
-        await runner.cleanup()
-    
+
+        return app
+
+    # Run using aiohttp's web.run_app()
+    # This properly manages the event loop, signal handling, and graceful shutdown
     try:
-        asyncio.run(run())
+        logger.info("Starting web.run_app()...")
+        web.run_app(
+            create_app_wrapper(),
+            host=config.http_host,
+            port=config.http_port,
+            handle_signals=True,
+            print=lambda msg: logger.info(f"aiohttp: {msg}") if msg else None
+        )
+        logger.info("web.run_app() exited")
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
+    except Exception as e:
+        logger.error(f"Error in web.run_app(): {e}", exc_info=True)
 
 
 if __name__ == '__main__':
