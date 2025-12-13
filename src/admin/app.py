@@ -177,7 +177,8 @@ def create_app() -> Flask:
         """Configuration management page."""
         try:
             config_data = api_client.get_config()
-            return render_template('config.html', config=config_data)
+            # Extract the 'config' key from the response
+            return render_template('config.html', config=config_data.get('config'))
         except Exception as e:
             logger.error(f"Failed to load config: {e}")
             flash(f'Error loading configuration: {str(e)}', 'danger')

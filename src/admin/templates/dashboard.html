@@ -54,11 +54,23 @@
                 </div>
                 <div class="status-item">
                     <span class="status-label">Oldest Candle:</span>
-                    <span class="status-value">{{ status.database.oldest_candle_timestamp|datetime if status.database.oldest_candle_timestamp else 'N/A' }}</span>
+                    <span class="status-value" data-timestamp="{{ status.database.oldest_candle_timestamp }}">
+                        {% if status.database.oldest_candle_timestamp %}
+                            <span class="timestamp-loading">{{ status.database.oldest_candle_timestamp }}</span>
+                        {% else %}
+                            N/A
+                        {% endif %}
+                    </span>
                 </div>
                 <div class="status-item">
                     <span class="status-label">Newest Candle:</span>
-                    <span class="status-value">{{ status.database.newest_candle_timestamp|datetime if status.database.newest_candle_timestamp else 'N/A' }}</span>
+                    <span class="status-value" data-timestamp="{{ status.database.newest_candle_timestamp }}">
+                        {% if status.database.newest_candle_timestamp %}
+                            <span class="timestamp-loading">{{ status.database.newest_candle_timestamp }}</span>
+                        {% else %}
+                            N/A
+                        {% endif %}
+                    </span>
                 </div>
             </div>
 
@@ -69,19 +81,43 @@
                 </div>
                 <div class="status-item">
                     <span class="status-label">Interval:</span>
-                    <span class="status-value">{{ status.config.candle_interval_minutes }} min</span>
+                    <span class="status-value">
+                        {% if status.config.candle_interval_minutes.value is defined %}
+                            {{ status.config.candle_interval_minutes.value }} minutes ({{ status.config.candle_interval_minutes.source }})
+                        {% else %}
+                            {{ status.config.candle_interval_minutes }} minutes
+                        {% endif %}
+                    </span>
                 </div>
                 <div class="status-item">
                     <span class="status-label">Max Candles:</span>
-                    <span class="status-value">{{ status.config.max_candles_stored }}</span>
+                    <span class="status-value">
+                        {% if status.config.max_candles_stored.value is defined %}
+                            {{ status.config.max_candles_stored.value }} ({{ status.config.max_candles_stored.source }})
+                        {% else %}
+                            {{ status.config.max_candles_stored }}
+                        {% endif %}
+                    </span>
                 </div>
                 <div class="status-item">
                     <span class="status-label">Max Tickers:</span>
-                    <span class="status-value">{{ status.config.max_tickers }}</span>
+                    <span class="status-value">
+                        {% if status.config.max_tickers.value is defined %}
+                            {{ status.config.max_tickers.value }} ({{ status.config.max_tickers.source }})
+                        {% else %}
+                            {{ status.config.max_tickers }}
+                        {% endif %}
+                    </span>
                 </div>
                 <div class="status-item">
                     <span class="status-label">WS Reconnect:</span>
-                    <span class="status-value">{{ status.config.ws_reconnect_delay }}s</span>
+                    <span class="status-value">
+                        {% if status.config.ws_reconnect_delay.value is defined %}
+                            {{ status.config.ws_reconnect_delay.value }} seconds ({{ status.config.ws_reconnect_delay.source }})
+                        {% else %}
+                            {{ status.config.ws_reconnect_delay }} seconds
+                        {% endif %}
+                    </span>
                 </div>
             </div>
         </div>
@@ -133,6 +169,36 @@
 
 {% block extra_scripts %}
 <script>
+// Convert Unix timestamps to local datetime format
+document.addEventListener('DOMContentLoaded', function() {
+    document.querySelectorAll('[data-timestamp]').forEach(function(element) {
+        const timestamp = element.getAttribute('data-timestamp');
+
+        if (timestamp && timestamp !== 'None' && timestamp !== '') {
+            const timestampNum = parseInt(timestamp);
+
+            if (!isNaN(timestampNum) && timestampNum > 0) {
+                // Convert Unix timestamp to JavaScript Date (milliseconds)
+                const date = new Date(timestampNum * 1000);
+
+                // Format using browser's locale and timezone
+                const formattedDate = date.toLocaleString(undefined, {
+                    year: 'numeric',
+                    month: '2-digit',
+                    day: '2-digit',
+                    hour: '2-digit',
+                    minute: '2-digit',
+                    second: '2-digit',
+                    hour12: false
+                });
+
+                // Update the content
+                element.textContent = formattedDate;
+            }
+        }
+    });
+});
+
 async function reconnectWebSocket() {
     if (!confirm('Reconnect WebSocket connection?')) return;
 

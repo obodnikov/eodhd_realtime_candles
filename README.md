@@ -1,4 +1,4 @@
-# EODHD Real-Time Candle Aggregator v0.4.1
+# EODHD Real-Time Candle Aggregator v0.4.2
 
 > **Converts EODHD WebSocket tick data into configurable OHLCV candles with full REST API management**
 
@@ -107,9 +107,29 @@ All endpoints except `/health` require authentication via one of:
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `GET` | `/config` | Get current configuration |
+| `GET` | `/config` | Get current configuration with source information |
 | `PATCH` | `/config` | Update configuration |
 | `POST` | `/config/reset` | Reset to .env defaults |
+
+**GET /config response format:**
+```json
+{
+  "config": {
+    "candle_interval_minutes": {"value": 5, "source": "env"},
+    "max_candles_stored": {"value": 100, "source": "env"},
+    "max_tickers": {"value": 50, "source": "env"},
+    "ws_reconnect_delay": {"value": 5, "source": "env"},
+    "ws_ping_interval": {"value": 30, "source": "env"}
+  },
+  "persistence_enabled": true,
+  "has_persisted_overrides": false,
+  "timestamp": "2025-12-13T12:00:00.000Z"
+}
+```
+
+**Source values:**
+- `env` - From environment variables (.env file)
+- `override` - Runtime overrides (persisted in config.json)
 
 **Configurable fields via PATCH /config:**
 ```json
@@ -309,7 +329,6 @@ Body:
 | `ADMIN_ENABLED` | `true` | Enable admin web UI |
 | `ADMIN_HOST` | `127.0.0.1` | Admin UI host (localhost only by default) |
 | `ADMIN_PORT` | `5000` | Admin UI port |
-| `ADMIN_SESSION_SECRET` | (auto-generated) | Session encryption key |
 
 ---
 
@@ -355,6 +374,14 @@ docker-compose up -d
 ---
 
 ## Changelog
+
+### v0.4.2 (2025-12-13)
+- **Admin UI Improvements**: Enhanced admin dashboard user experience
+  - Removed unused `ADMIN_SESSION_SECRET` from configuration (auto-generated internally)
+  - Fixed Configuration display to show human-readable format (e.g., "5 minutes" instead of "5 min")
+  - Added oldest/newest candle timestamps to Database statistics display
+  - Candle data now sorted with newest candles on top for better usability
+  - Config form inputs now show current values as placeholders for better UX
 
 ### v0.4.1 (2025-12-13)
 - **New Endpoint**: Added `GET /candles/all` to retrieve candles for ALL tracked tickers

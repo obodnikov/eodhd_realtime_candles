@@ -465,12 +465,21 @@ class Storage:
         ''')
         candles_per_ticker = {row['ticker']: row['count'] for row in cursor.fetchall()}
 
+        # Get oldest and newest candle timestamps
+        cursor.execute('SELECT MIN(timestamp) FROM candles')
+        oldest_timestamp = cursor.fetchone()[0]
+
+        cursor.execute('SELECT MAX(timestamp) FROM candles')
+        newest_timestamp = cursor.fetchone()[0]
+
         result = {
             'ticker_count': ticker_count,
             'total_candles': total_candles,
             'complete_candles': complete_candles,
             'incomplete_candles': total_candles - complete_candles,
-            'candles_per_ticker': candles_per_ticker
+            'candles_per_ticker': candles_per_ticker,
+            'oldest_candle_timestamp': oldest_timestamp,
+            'newest_candle_timestamp': newest_timestamp
         }
 
         # Update cache
