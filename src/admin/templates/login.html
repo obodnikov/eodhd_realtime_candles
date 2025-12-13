@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+
+{% block title %}Login{% endblock %}
+
+{% block content %}
+<div class="login-page">
+    <div class="login-container">
+        <div class="login-card card">
+            <div class="login-header">
+                <img src="{{ url_for('static', filename='img/logo-dark.png') }}" alt="sqowe" class="login-logo" />
+                <h1 class="login-title">Admin Panel</h1>
+                <p class="login-subtitle">EODHD Candle Aggregator</p>
+            </div>
+
+            <form method="POST" action="{{ url_for('login') }}" class="login-form">
+                <div class="form-group">
+                    <label for="api_key" class="form-label">API Key</label>
+                    <input
+                        type="password"
+                        id="api_key"
+                        name="api_key"
+                        class="form-input"
+                        placeholder="Enter your API key"
+                        required
+                        autofocus
+                    />
+                    <p class="form-help">Use the same API_KEY from your .env configuration</p>
+                </div>
+
+                <button type="submit" class="btn btn-primary btn-large" style="width: 100%;">
+                    Sign In
+                </button>
+            </form>
+
+            <div class="login-footer">
+                <p class="text-small" style="color: var(--sqowe-light-grey); text-align: center;">
+                    Protected access only. Unauthorized access is prohibited.
+                </p>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

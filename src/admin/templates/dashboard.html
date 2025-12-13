@@ -1,0 +1,158 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard{% endblock %}
+
+{% block content %}
+<section class="section">
+    <div class="container">
+        <div class="section-header">
+            <h1>System Dashboard</h1>
+            <p>Real-time monitoring of the candle aggregator service</p>
+        </div>
+
+        {% if status %}
+        <!-- Status Cards -->
+        <div class="grid grid-3">
+            <!-- WebSocket Status -->
+            <div class="card">
+                <div class="card-header">
+                    <h3 class="card-title">WebSocket</h3>
+                </div>
+                <div class="status-item">
+                    <span class="status-label">Status:</span>
+                    <span class="status-badge status-{{ 'success' if status.websocket.connected else 'danger' }}">
+                        {{ 'Connected' if status.websocket.connected else 'Disconnected' }}
+                    </span>
+                </div>
+                {% if status.websocket.connected %}
+                <div class="status-item">
+                    <span class="status-label">Subscriptions:</span>
+                    <span class="status-value">{{ status.websocket.subscribed_count }}</span>
+                </div>
+                {% endif %}
+                <div class="status-item">
+                    <span class="status-label">Connected At:</span>
+                    <span class="status-value">{{ status.websocket.connected_at|datetime }}</span>
+                </div>
+                <button class="btn btn-secondary btn-small" onclick="reconnectWebSocket()">
+                    Reconnect
+                </button>
+            </div>
+
+            <!-- Database Status -->
+            <div class="card">
+                <div class="card-header">
+                    <h3 class="card-title">Database</h3>
+                </div>
+                <div class="status-item">
+                    <span class="status-label">Total Candles:</span>
+                    <span class="status-value">{{ status.database.total_candles }}</span>
+                </div>
+                <div class="status-item">
+                    <span class="status-label">Tracked Tickers:</span>
+                    <span class="status-value">{{ status.database.ticker_count }}</span>
+                </div>
+                <div class="status-item">
+                    <span class="status-label">Oldest Candle:</span>
+                    <span class="status-value">{{ status.database.oldest_candle_timestamp|datetime if status.database.oldest_candle_timestamp else 'N/A' }}</span>
+                </div>
+                <div class="status-item">
+                    <span class="status-label">Newest Candle:</span>
+                    <span class="status-value">{{ status.database.newest_candle_timestamp|datetime if status.database.newest_candle_timestamp else 'N/A' }}</span>
+                </div>
+            </div>
+
+            <!-- Configuration -->
+            <div class="card">
+                <div class="card-header">
+                    <h3 class="card-title">Configuration</h3>
+                </div>
+                <div class="status-item">
+                    <span class="status-label">Interval:</span>
+                    <span class="status-value">{{ status.config.candle_interval_minutes }} min</span>
+                </div>
+                <div class="status-item">
+                    <span class="status-label">Max Candles:</span>
+                    <span class="status-value">{{ status.config.max_candles_stored }}</span>
+                </div>
+                <div class="status-item">
+                    <span class="status-label">Max Tickers:</span>
+                    <span class="status-value">{{ status.config.max_tickers }}</span>
+                </div>
+                <div class="status-item">
+                    <span class="status-label">WS Reconnect:</span>
+                    <span class="status-value">{{ status.config.ws_reconnect_delay }}s</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Active Candles -->
+        {% if status.active_candles %}
+        <div class="card" style="margin-top: 2rem;">
+            <div class="card-header">
+                <h3 class="card-title">Active Candles ({{ status.active_candles|length }})</h3>
+            </div>
+            <div class="table-responsive">
+                <table class="table">
+                    <thead>
+                        <tr>
+                            <th>Ticker</th>
+                            <th>Open</th>
+                            <th>High</th>
+                            <th>Low</th>
+                            <th>Close</th>
+                            <th>Volume</th>
+                            <th>Ticks</th>
+                            <th>Started</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for ticker in status.active_candles %}
+                        <tr>
+                            <td><strong>{{ ticker }}</strong></td>
+                            <td colspan="7" class="text-muted">Building candle...</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        {% endif %}
+
+        {% else %}
+        <div class="card">
+            <div class="card-header">
+                <h3 class="card-title">Error</h3>
+            </div>
+            <p>Unable to load system status. Please check if the main API is running.</p>
+        </div>
+        {% endif %}
+    </div>
+</section>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+async function reconnectWebSocket() {
+    if (!confirm('Reconnect WebSocket connection?')) return;
+
+    try {
+        const response = await fetch('/api/reconnect', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'}
+        });
+
+        const data = await response.json();
+
+        if (data.success) {
+            showAlert('WebSocket reconnection initiated', 'success');
+            setTimeout(() => location.reload(), 2000);
+        } else {
+            showAlert('Failed to reconnect: ' + (data.error || 'Unknown error'), 'danger');
+        }
+    } catch (error) {
+        showAlert('Request failed: ' + error.message, 'danger');
+    }
+}
+</script>
+{% endblock %}

@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Admin Panel{% endblock %} - EODHD Candle Aggregator</title>
+
+    <!-- Google Fonts - Montserrat -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@300;400;500;700&display=swap" rel="stylesheet">
+
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+
+    <!-- Admin CSS -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/admin.css') }}">
+
+    {% block extra_head %}{% endblock %}
+</head>
+<body>
+    {% if session.authenticated %}
+    <!-- Navigation Bar -->
+    <nav class="navbar navbar-dark">
+        <div class="navbar-container container">
+            <a href="{{ url_for('dashboard') }}" class="navbar-logo">
+                <img src="{{ url_for('static', filename='img/logo-light.png') }}" alt="sqowe" class="logo" />
+            </a>
+
+            <ul class="navbar-menu">
+                <li><a href="{{ url_for('dashboard') }}" class="navbar-link {% if request.endpoint == 'dashboard' %}active{% endif %}">Dashboard</a></li>
+                <li><a href="{{ url_for('tickers') }}" class="navbar-link {% if request.endpoint == 'tickers' %}active{% endif %}">Tickers</a></li>
+                <li><a href="{{ url_for('candles') }}" class="navbar-link {% if request.endpoint == 'candles' %}active{% endif %}">Candles</a></li>
+                <li><a href="{{ url_for('config') }}" class="navbar-link {% if request.endpoint == 'config' %}active{% endif %}">Config</a></li>
+                <li><a href="{{ url_for('logout') }}" class="navbar-link">Logout</a></li>
+            </ul>
+        </div>
+    </nav>
+    {% endif %}
+
+    <!-- Flash Messages -->
+    {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+            <div class="container" style="margin-top: 1rem;">
+                {% for category, message in messages %}
+                    <div class="alert alert-{{ category }}">
+                        {{ message }}
+                        <button class="alert-close" onclick="this.parentElement.remove()">&times;</button>
+                    </div>
+                {% endfor %}
+            </div>
+        {% endif %}
+    {% endwith %}
+
+    <!-- Main Content -->
+    <main>
+        {% block content %}{% endblock %}
+    </main>
+
+    <!-- Footer -->
+    <footer class="bg-dark">
+        <div class="container">
+            <p style="color: rgba(255,255,255,0.7); text-align: center; margin: 0;">
+                &copy; 2025 EODHD Candle Aggregator v0.4.0 | Admin Panel
+            </p>
+        </div>
+    </footer>
+
+    <!-- Admin JS -->
+    <script src="{{ url_for('static', filename='js/admin.js') }}"></script>
+
+    {% block extra_scripts %}{% endblock %}
+</body>
+</html>

@@ -1,0 +1,219 @@
+{% extends "base.html" %}
+
+{% block title %}Candle Viewer{% endblock %}
+
+{% block content %}
+<section class="section">
+    <div class="container">
+        <div class="section-header">
+            <h1>Candle Data Viewer</h1>
+            <p>Browse and visualize OHLCV candle data</p>
+        </div>
+
+        <!-- Ticker Selection -->
+        <div class="card">
+            <div class="card-header">
+                <h3 class="card-title">Select Ticker</h3>
+            </div>
+            <form method="GET" action="{{ url_for('candles') }}">
+                <div class="form-group">
+                    <label for="ticker" class="form-label">Ticker Symbol</label>
+                    <select id="ticker" name="ticker" class="form-select" onchange="this.form.submit()">
+                        <option value="">-- Select a ticker --</option>
+                        {% for t in tickers %}
+                        <option value="{{ t }}" {% if t == selected_ticker %}selected{% endif %}>{{ t }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <input type="hidden" name="count" value="50">
+            </form>
+        </div>
+
+        {% if candle_data %}
+        <!-- Chart -->
+        <div class="card" style="margin-top: 2rem;">
+            <div class="card-header">
+                <h3 class="card-title">{{ selected_ticker }} - Price Chart</h3>
+            </div>
+            <div style="padding: 1rem;">
+                <canvas id="priceChart" style="max-height: 400px;"></canvas>
+            </div>
+        </div>
+
+        <!-- Candle Data Table -->
+        <div class="card" style="margin-top: 2rem;">
+            <div class="card-header">
+                <h3 class="card-title">Candle Data ({{ candle_data.candles|length }} candles)</h3>
+            </div>
+            <div class="table-responsive">
+                <table class="table">
+                    <thead>
+                        <tr>
+                            <th>Timestamp</th>
+                            <th>Open</th>
+                            <th>High</th>
+                            <th>Low</th>
+                            <th>Close</th>
+                            <th>Volume</th>
+                            <th>Ticks</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for candle in candle_data.candles %}
+                        <tr class="{% if not candle.is_complete %}candle-incomplete{% endif %}">
+                            <td>{{ candle.datetime_utc }}</td>
+                            <td>{{ candle.open|number }}</td>
+                            <td class="text-success">{{ candle.high|number }}</td>
+                            <td class="text-danger">{{ candle.low|number }}</td>
+                            <td>{{ candle.close|number }}</td>
+                            <td>{{ candle.volume }}</td>
+                            <td>{{ candle.tick_count }}</td>
+                            <td>
+                                {% if candle.is_complete %}
+                                <span class="status-badge status-success">Complete</span>
+                                {% else %}
+                                <span class="status-badge status-warning">In Progress</span>
+                                {% endif %}
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        {% elif selected_ticker %}
+        <div class="card" style="margin-top: 2rem;">
+            <p style="padding: 1rem; color: var(--sqowe-light-grey);">No candle data available for {{ selected_ticker }}.</p>
+        </div>
+        {% endif %}
+    </div>
+</section>
+{% endblock %}
+
+{% block extra_scripts %}
+{% if candle_data and candle_data.candles %}
+<script>
+(function() {
+    const candleData = {{ candle_data.candles|tojson }};
+
+    // Prepare chart data
+    const labels = candleData.map(c => c.datetime_utc.split(' ')[1].substring(0, 5)); // HH:MM
+    const openPrices = candleData.map(c => c.open);
+    const highPrices = candleData.map(c => c.high);
+    const lowPrices = candleData.map(c => c.low);
+    const closePrices = candleData.map(c => c.close);
+    const volumes = candleData.map(c => c.volume);
+
+    // Create chart
+    const ctx = document.getElementById('priceChart').getContext('2d');
+    new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: labels,
+            datasets: [
+                {
+                    label: 'Close Price',
+                    data: closePrices,
+                    borderColor: '#5B5377',
+                    backgroundColor: 'rgba(91, 83, 119, 0.1)',
+                    borderWidth: 2,
+                    tension: 0.1,
+                    fill: true
+                },
+                {
+                    label: 'High',
+                    data: highPrices,
+                    borderColor: '#8E88A3',
+                    borderWidth: 1,
+                    borderDash: [5, 5],
+                    pointRadius: 0,
+                    fill: false
+                },
+                {
+                    label: 'Low',
+                    data: lowPrices,
+                    borderColor: '#B2B3B2',
+                    borderWidth: 1,
+                    borderDash: [5, 5],
+                    pointRadius: 0,
+                    fill: false
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: true,
+            interaction: {
+                mode: 'index',
+                intersect: false
+            },
+            plugins: {
+                legend: {
+                    display: true,
+                    position: 'top',
+                    labels: {
+                        font: {
+                            family: 'Montserrat',
+                            size: 12
+                        }
+                    }
+                },
+                tooltip: {
+                    mode: 'index',
+                    intersect: false,
+                    backgroundColor: 'rgba(34, 34, 34, 0.9)',
+                    titleFont: {
+                        family: 'Montserrat',
+                        size: 14
+                    },
+                    bodyFont: {
+                        family: 'Montserrat',
+                        size: 12
+                    },
+                    callbacks: {
+                        label: function(context) {
+                            let label = context.dataset.label || '';
+                            if (label) {
+                                label += ': ';
+                            }
+                            label += '$' + context.parsed.y.toFixed(2);
+                            return label;
+                        }
+                    }
+                }
+            },
+            scales: {
+                x: {
+                    grid: {
+                        color: 'rgba(178, 179, 178, 0.2)'
+                    },
+                    ticks: {
+                        font: {
+                            family: 'Montserrat',
+                            size: 11
+                        }
+                    }
+                },
+                y: {
+                    grid: {
+                        color: 'rgba(178, 179, 178, 0.2)'
+                    },
+                    ticks: {
+                        font: {
+                            family: 'Montserrat',
+                            size: 11
+                        },
+                        callback: function(value) {
+                            return '$' + value.toFixed(2);
+                        }
+                    }
+                }
+            }
+        }
+    });
+})();
+</script>
+{% endif %}
+{% endblock %}

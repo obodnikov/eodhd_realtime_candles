@@ -1,5 +1,6 @@
 # EODHD Real-Time Candle Aggregator Dependencies
 
+# === Main API ===
 # Async HTTP server
 aiohttp>=3.9.0
 
@@ -8,6 +9,13 @@ websockets>=12.0
 
 # Environment variable management
 python-dotenv>=1.0.0
+
+# === Admin Web UI ===
+# Flask web framework
+Flask>=3.0.0
+
+# HTTP client for API communication
+requests>=2.31.0
 
 # No additional dependencies needed - using Python standard library for:
 # - sqlite3 (database)

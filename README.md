@@ -1,4 +1,4 @@
-# EODHD Real-Time Candle Aggregator v0.3.1
+# EODHD Real-Time Candle Aggregator v0.4.0
 
 > **Converts EODHD WebSocket tick data into configurable OHLCV candles with full REST API management**
 
@@ -60,6 +60,27 @@ curl -H "X-API-Key: your_secret_api_key" http://localhost:8765/status
 # Get candles for AAPL
 curl -H "X-API-Key: your_secret_api_key" http://localhost:8765/candles/AAPL?count=10
 ```
+
+### 4. Access Admin Web UI
+
+The service includes a Flask-based admin web interface for easy management:
+
+```bash
+# Access admin panel (default: localhost only)
+http://localhost:5000
+
+# Login with your API_KEY from .env
+```
+
+**Features:**
+- 📊 **Dashboard**: Real-time system status and monitoring
+- 🎯 **Ticker Management**: Add/remove tickers with visual interface
+- 📈 **Candle Viewer**: Browse and visualize OHLCV data with Chart.js
+- ⚙️ **Configuration**: Update service settings via web UI
+
+**Security Note:** By default, the admin UI is only accessible from `localhost` (`127.0.0.1`). To enable external access, set `ADMIN_HOST=0.0.0.0` in `.env` (not recommended for production without additional security measures).
+
+For detailed admin UI documentation, see [docs/ADMIN_UI.md](docs/ADMIN_UI.md).
 
 ---
 
@@ -235,6 +256,10 @@ Body:
 | `MAX_TICKERS` | `50` | EODHD WebSocket limit |
 | `DATABASE_PATH` | `/data/candles.db` | SQLite path |
 | `LOG_LEVEL` | `INFO` | DEBUG, INFO, WARNING, ERROR |
+| `ADMIN_ENABLED` | `true` | Enable admin web UI |
+| `ADMIN_HOST` | `127.0.0.1` | Admin UI host (localhost only by default) |
+| `ADMIN_PORT` | `5000` | Admin UI port |
+| `ADMIN_SESSION_SECRET` | (auto-generated) | Session encryption key |
 
 ---
 
@@ -280,6 +305,15 @@ docker-compose up -d
 ---
 
 ## Changelog
+
+### v0.4.0 (2025-12-13)
+- **Admin Web UI**: Added Flask-based admin panel with sqowe branding
+- **Interactive Dashboard**: Real-time system monitoring with Chart.js visualizations
+- **Ticker Management UI**: Visual interface for managing tickers
+- **Candle Data Viewer**: Browse and visualize OHLCV candles with interactive charts
+- **Configuration UI**: Web interface for updating service configuration
+- **Multi-process Container**: Supervisord manages both REST API and admin UI
+- **Configurable Access**: Admin UI host configurable for localhost or external access
 
 ### v0.3.1 (2025-12-11)
 - **SQLite performance tuning**: Added WAL mode, `synchronous=NORMAL`, and `busy_timeout=5000` for better read/write concurrency

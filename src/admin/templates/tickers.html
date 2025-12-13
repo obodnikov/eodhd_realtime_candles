@@ -1,0 +1,187 @@
+{% extends "base.html" %}
+
+{% block title %}Ticker Management{% endblock %}
+
+{% block content %}
+<section class="section">
+    <div class="container">
+        <div class="section-header">
+            <h1>Ticker Management</h1>
+            <p>Add, remove, and monitor tracked tickers</p>
+        </div>
+
+        <!-- Add Tickers -->
+        <div class="card">
+            <div class="card-header">
+                <h3 class="card-title">Add Tickers</h3>
+            </div>
+            <form id="addTickersForm" onsubmit="addTickers(event)">
+                <div class="form-group">
+                    <label for="newTickers" class="form-label">Ticker Symbols</label>
+                    <input
+                        type="text"
+                        id="newTickers"
+                        class="form-input"
+                        placeholder="AAPL, MSFT, GOOGL"
+                        required
+                    />
+                    <p class="form-help">Enter comma-separated ticker symbols (e.g., AAPL, MSFT, GOOGL)</p>
+                </div>
+                <button type="submit" class="btn btn-primary">Add Tickers</button>
+            </form>
+        </div>
+
+        <!-- Current Tickers -->
+        <div class="card" style="margin-top: 2rem;">
+            <div class="card-header">
+                <h3 class="card-title">Tracked Tickers ({{ tickers|length }})</h3>
+                <button class="btn btn-secondary btn-small" onclick="location.reload()">Refresh</button>
+            </div>
+
+            {% if tickers %}
+            <div class="table-responsive">
+                <table class="table">
+                    <thead>
+                        <tr>
+                            <th><input type="checkbox" id="selectAll" onchange="toggleSelectAll(this)"></th>
+                            <th>Symbol</th>
+                            <th>Status</th>
+                            <th>Added At</th>
+                            <th>Last Tick</th>
+                            <th>Last Price</th>
+                            <th>Candles</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for ticker in tickers %}
+                        <tr>
+                            <td><input type="checkbox" class="ticker-checkbox" value="{{ ticker.symbol }}"></td>
+                            <td><strong>{{ ticker.symbol }}</strong></td>
+                            <td>
+                                <span class="status-badge status-{{ 'success' if ticker.status == 'active' else 'warning' }}">
+                                    {{ ticker.status }}
+                                </span>
+                            </td>
+                            <td>{{ ticker.added_at|datetime if ticker.added_at else 'N/A' }}</td>
+                            <td>{{ ticker.last_tick_at|datetime if ticker.last_tick_at else 'Never' }}</td>
+                            <td>{{ ticker.last_price|number if ticker.last_price else 'N/A' }}</td>
+                            <td>{{ ticker.candle_count }}</td>
+                            <td>
+                                <button class="btn btn-danger btn-small" onclick="removeTicker('{{ ticker.symbol }}')">
+                                    Remove
+                                </button>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+
+            <div style="padding: 1rem; border-top: 1px solid var(--sqowe-light-grey);">
+                <button class="btn btn-danger" onclick="removeSelectedTickers()">
+                    Remove Selected
+                </button>
+            </div>
+            {% else %}
+            <p style="padding: 1rem; color: var(--sqowe-light-grey);">No tickers tracked yet. Add some above to get started.</p>
+            {% endif %}
+        </div>
+    </div>
+</section>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+function toggleSelectAll(checkbox) {
+    const checkboxes = document.querySelectorAll('.ticker-checkbox');
+    checkboxes.forEach(cb => cb.checked = checkbox.checked);
+}
+
+async function addTickers(event) {
+    event.preventDefault();
+
+    const input = document.getElementById('newTickers');
+    const tickersStr = input.value.trim();
+
+    if (!tickersStr) return;
+
+    // Parse comma-separated tickers
+    const tickers = tickersStr.split(',').map(t => t.trim().toUpperCase()).filter(t => t);
+
+    try {
+        const response = await fetch('/api/tickers/add', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({tickers})
+        });
+
+        const data = await response.json();
+
+        if (data.success) {
+            showAlert(`Successfully added ${tickers.length} ticker(s)`, 'success');
+            input.value = '';
+            setTimeout(() => location.reload(), 1000);
+        } else {
+            showAlert('Failed to add tickers: ' + (data.error || 'Unknown error'), 'danger');
+        }
+    } catch (error) {
+        showAlert('Request failed: ' + error.message, 'danger');
+    }
+}
+
+async function removeTicker(ticker) {
+    if (!confirm(`Remove ticker ${ticker}?`)) return;
+
+    try {
+        const response = await fetch('/api/tickers/remove', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({tickers: [ticker]})
+        });
+
+        const data = await response.json();
+
+        if (data.success) {
+            showAlert(`Removed ${ticker}`, 'success');
+            setTimeout(() => location.reload(), 1000);
+        } else {
+            showAlert('Failed to remove ticker: ' + (data.error || 'Unknown error'), 'danger');
+        }
+    } catch (error) {
+        showAlert('Request failed: ' + error.message, 'danger');
+    }
+}
+
+async function removeSelectedTickers() {
+    const checkboxes = document.querySelectorAll('.ticker-checkbox:checked');
+    const tickers = Array.from(checkboxes).map(cb => cb.value);
+
+    if (tickers.length === 0) {
+        showAlert('No tickers selected', 'warning');
+        return;
+    }
+
+    if (!confirm(`Remove ${tickers.length} ticker(s)?`)) return;
+
+    try {
+        const response = await fetch('/api/tickers/remove', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({tickers})
+        });
+
+        const data = await response.json();
+
+        if (data.success) {
+            showAlert(`Removed ${tickers.length} ticker(s)`, 'success');
+            setTimeout(() => location.reload(), 1000);
+        } else {
+            showAlert('Failed to remove tickers: ' + (data.error || 'Unknown error'), 'danger');
+        }
+    } catch (error) {
+        showAlert('Request failed: ' + error.message, 'danger');
+    }
+}
+</script>
+{% endblock %}

@@ -1,0 +1,194 @@
+{% extends "base.html" %}
+
+{% block title %}Configuration{% endblock %}
+
+{% block content %}
+<section class="section">
+    <div class="container">
+        <div class="section-header">
+            <h1>Configuration Management</h1>
+            <p>Update service configuration in real-time</p>
+        </div>
+
+        {% if config %}
+        <!-- Configuration Form -->
+        <div class="card">
+            <div class="card-header">
+                <h3 class="card-title">Service Configuration</h3>
+            </div>
+            <form id="configForm" onsubmit="updateConfig(event)">
+                <div class="grid grid-2">
+                    <div class="form-group">
+                        <label for="candle_interval_minutes" class="form-label">Candle Interval (minutes)</label>
+                        <select id="candle_interval_minutes" name="candle_interval_minutes" class="form-select">
+                            <option value="1" {% if config.candle_interval_minutes == 1 %}selected{% endif %}>1 minute</option>
+                            <option value="5" {% if config.candle_interval_minutes == 5 %}selected{% endif %}>5 minutes</option>
+                            <option value="15" {% if config.candle_interval_minutes == 15 %}selected{% endif %}>15 minutes</option>
+                            <option value="30" {% if config.candle_interval_minutes == 30 %}selected{% endif %}>30 minutes</option>
+                            <option value="60" {% if config.candle_interval_minutes == 60 %}selected{% endif %}>60 minutes</option>
+                        </select>
+                        <p class="form-help">Time period for each candle</p>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="max_candles_stored" class="form-label">Max Candles Stored</label>
+                        <input
+                            type="number"
+                            id="max_candles_stored"
+                            name="max_candles_stored"
+                            class="form-input"
+                            value="{{ config.max_candles_stored }}"
+                            min="10"
+                            max="1000"
+                        />
+                        <p class="form-help">Maximum candles per ticker</p>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="max_tickers" class="form-label">Max Tickers</label>
+                        <input
+                            type="number"
+                            id="max_tickers"
+                            name="max_tickers"
+                            class="form-input"
+                            value="{{ config.max_tickers }}"
+                            min="1"
+                            max="100"
+                        />
+                        <p class="form-help">Maximum number of tracked tickers</p>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="ws_reconnect_delay" class="form-label">WebSocket Reconnect Delay (seconds)</label>
+                        <input
+                            type="number"
+                            id="ws_reconnect_delay"
+                            name="ws_reconnect_delay"
+                            class="form-input"
+                            value="{{ config.ws_reconnect_delay }}"
+                            min="1"
+                            max="60"
+                        />
+                        <p class="form-help">Delay before reconnecting WebSocket</p>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="ws_ping_interval" class="form-label">WebSocket Ping Interval (seconds)</label>
+                        <input
+                            type="number"
+                            id="ws_ping_interval"
+                            name="ws_ping_interval"
+                            class="form-input"
+                            value="{{ config.ws_ping_interval }}"
+                            min="10"
+                            max="120"
+                        />
+                        <p class="form-help">Keep-alive ping interval</p>
+                    </div>
+                </div>
+
+                <div style="display: flex; gap: 1rem; margin-top: 1.5rem;">
+                    <button type="submit" class="btn btn-primary">Save Configuration</button>
+                    <button type="button" class="btn btn-danger" onclick="resetConfig()">Reset to Defaults</button>
+                </div>
+            </form>
+        </div>
+
+        <!-- Configuration Source Info -->
+        {% if config._source %}
+        <div class="card" style="margin-top: 2rem;">
+            <div class="card-header">
+                <h3 class="card-title">Configuration Source</h3>
+            </div>
+            <div class="status-item">
+                <span class="status-label">Loaded From:</span>
+                <span class="status-value">
+                    {% if config._source.type == 'override' %}
+                        Runtime overrides (persisted)
+                    {% elif config._source.type == 'env' %}
+                        Environment variables (.env)
+                    {% else %}
+                        {{ config._source.type }}
+                    {% endif %}
+                </span>
+            </div>
+            {% if config._overrides %}
+            <div class="status-item">
+                <span class="status-label">Active Overrides:</span>
+                <span class="status-value">{{ config._overrides|join(', ') }}</span>
+            </div>
+            {% endif %}
+        </div>
+        {% endif %}
+
+        {% else %}
+        <div class="card">
+            <div class="card-header">
+                <h3 class="card-title">Error</h3>
+            </div>
+            <p>Unable to load configuration. Please check if the main API is running.</p>
+        </div>
+        {% endif %}
+    </div>
+</section>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+async function updateConfig(event) {
+    event.preventDefault();
+
+    const form = event.target;
+    const formData = new FormData(form);
+
+    const config = {
+        candle_interval_minutes: parseInt(formData.get('candle_interval_minutes')),
+        max_candles_stored: parseInt(formData.get('max_candles_stored')),
+        max_tickers: parseInt(formData.get('max_tickers')),
+        ws_reconnect_delay: parseInt(formData.get('ws_reconnect_delay')),
+        ws_ping_interval: parseInt(formData.get('ws_ping_interval'))
+    };
+
+    try {
+        const response = await fetch('/api/config/update', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(config)
+        });
+
+        const data = await response.json();
+
+        if (data.success) {
+            showAlert('Configuration updated successfully', 'success');
+            setTimeout(() => location.reload(), 1500);
+        } else {
+            showAlert('Failed to update configuration: ' + (data.error || 'Unknown error'), 'danger');
+        }
+    } catch (error) {
+        showAlert('Request failed: ' + error.message, 'danger');
+    }
+}
+
+async function resetConfig() {
+    if (!confirm('Reset all configuration to defaults? This will discard any custom changes.')) return;
+
+    try {
+        const response = await fetch('/api/config/reset', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'}
+        });
+
+        const data = await response.json();
+
+        if (data.success) {
+            showAlert('Configuration reset to defaults', 'success');
+            setTimeout(() => location.reload(), 1500);
+        } else {
+            showAlert('Failed to reset configuration: ' + (data.error || 'Unknown error'), 'danger');
+        }
+    } catch (error) {
+        showAlert('Request failed: ' + error.message, 'danger');
+    }
+}
+</script>
+{% endblock %}
