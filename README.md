@@ -107,9 +107,29 @@ All endpoints except `/health` require authentication via one of:
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `GET` | `/config` | Get current configuration |
+| `GET` | `/config` | Get current configuration with source information |
 | `PATCH` | `/config` | Update configuration |
 | `POST` | `/config/reset` | Reset to .env defaults |
+
+**GET /config response format:**
+```json
+{
+  "config": {
+    "candle_interval_minutes": {"value": 5, "source": "env"},
+    "max_candles_stored": {"value": 100, "source": "env"},
+    "max_tickers": {"value": 50, "source": "env"},
+    "ws_reconnect_delay": {"value": 5, "source": "env"},
+    "ws_ping_interval": {"value": 30, "source": "env"}
+  },
+  "persistence_enabled": true,
+  "has_persisted_overrides": false,
+  "timestamp": "2025-12-13T12:00:00.000Z"
+}
+```
+
+**Source values:**
+- `env` - From environment variables (.env file)
+- `override` - Runtime overrides (persisted in config.json)
 
 **Configurable fields via PATCH /config:**
 ```json
