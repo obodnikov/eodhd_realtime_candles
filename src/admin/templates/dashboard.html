@@ -81,19 +81,43 @@
                 </div>
                 <div class="status-item">
                     <span class="status-label">Interval:</span>
-                    <span class="status-value">{{ status.config.candle_interval_minutes }} minutes</span>
+                    <span class="status-value">
+                        {% if status.config.candle_interval_minutes.value is defined %}
+                            {{ status.config.candle_interval_minutes.value }} minutes ({{ status.config.candle_interval_minutes.source }})
+                        {% else %}
+                            {{ status.config.candle_interval_minutes }} minutes
+                        {% endif %}
+                    </span>
                 </div>
                 <div class="status-item">
                     <span class="status-label">Max Candles:</span>
-                    <span class="status-value">{{ status.config.max_candles_stored }}</span>
+                    <span class="status-value">
+                        {% if status.config.max_candles_stored.value is defined %}
+                            {{ status.config.max_candles_stored.value }} ({{ status.config.max_candles_stored.source }})
+                        {% else %}
+                            {{ status.config.max_candles_stored }}
+                        {% endif %}
+                    </span>
                 </div>
                 <div class="status-item">
                     <span class="status-label">Max Tickers:</span>
-                    <span class="status-value">{{ status.config.max_tickers }}</span>
+                    <span class="status-value">
+                        {% if status.config.max_tickers.value is defined %}
+                            {{ status.config.max_tickers.value }} ({{ status.config.max_tickers.source }})
+                        {% else %}
+                            {{ status.config.max_tickers }}
+                        {% endif %}
+                    </span>
                 </div>
                 <div class="status-item">
                     <span class="status-label">WS Reconnect:</span>
-                    <span class="status-value">{{ status.config.ws_reconnect_delay }} seconds</span>
+                    <span class="status-value">
+                        {% if status.config.ws_reconnect_delay.value is defined %}
+                            {{ status.config.ws_reconnect_delay.value }} seconds ({{ status.config.ws_reconnect_delay.source }})
+                        {% else %}
+                            {{ status.config.ws_reconnect_delay }} seconds
+                        {% endif %}
+                    </span>
                 </div>
             </div>
         </div>
