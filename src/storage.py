@@ -466,10 +466,10 @@ class Storage:
         candles_per_ticker = {row['ticker']: row['count'] for row in cursor.fetchall()}
 
         # Get oldest and newest candle timestamps
-        cursor.execute('SELECT MIN(timestamp_utc) FROM candles')
+        cursor.execute('SELECT MIN(timestamp) FROM candles')
         oldest_timestamp = cursor.fetchone()[0]
 
-        cursor.execute('SELECT MAX(timestamp_utc) FROM candles')
+        cursor.execute('SELECT MAX(timestamp) FROM candles')
         newest_timestamp = cursor.fetchone()[0]
 
         result = {
