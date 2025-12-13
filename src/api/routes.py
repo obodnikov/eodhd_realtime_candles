@@ -46,6 +46,7 @@ class APIRoutes:
         self.app.router.add_delete('/tickers', self.remove_tickers)
         
         # Candle Data
+        self.app.router.add_get('/candles/all', self.get_all_candles)
         self.app.router.add_get('/candles/{ticker}', self.get_candles)
         self.app.router.add_get('/candles/{ticker}/latest', self.get_latest_candle)
         self.app.router.add_post('/candles/multi', self.get_multi_candles)
@@ -354,19 +355,102 @@ class APIRoutes:
     # Candle Data
     # =========================================================================
     
+    async def get_all_candles(self, request: web.Request) -> web.Response:
+        """GET /candles/all - Get candles for ALL tracked tickers (requires confirmation)."""
+        # Check for confirmation parameter
+        confirm = request.query.get('confirm', '').lower()
+        if confirm != 'true':
+            return web.json_response({
+                'error': 'Confirmation required',
+                'detail': 'Add ?confirm=true to confirm retrieving candles for all tickers',
+                'warning': 'This operation may return large amounts of data'
+            }, status=400)
+
+        # Check for max_tickers parameter (mandatory)
+        max_tickers_param = request.query.get('max_tickers')
+        if not max_tickers_param:
+            return web.json_response({
+                'error': 'max_tickers parameter required',
+                'detail': 'Add ?max_tickers=N to specify the maximum number of tickers to retrieve',
+                'example': '/candles/all?confirm=true&max_tickers=50'
+            }, status=400)
+
+        try:
+            max_tickers = int(max_tickers_param)
+            if max_tickers < 1:
+                raise ValueError("max_tickers must be >= 1")
+        except (ValueError, TypeError):
+            return web.json_response({
+                'error': 'Invalid max_tickers parameter',
+                'detail': 'max_tickers must be a positive integer >= 1'
+            }, status=400)
+
+        # Parse optional query parameters
+        count = int(request.query.get('count', '10'))
+        include_current = request.query.get('include_current', 'true').lower() == 'true'
+        from_timestamp = request.query.get('from_timestamp')
+        to_timestamp = request.query.get('to_timestamp')
+
+        # Validate count
+        count = min(max(count, 1), self.config_manager.config.max_candles_stored)
+
+        # Get all tracked tickers
+        all_tickers = self.storage.get_tickers()
+        ticker_count = len(all_tickers)
+
+        # Check if ticker count exceeds max_tickers limit
+        if ticker_count > max_tickers:
+            return web.json_response({
+                'error': 'Too many tickers',
+                'detail': f'Found {ticker_count} tracked tickers, but max_tickers limit is {max_tickers}',
+                'current_ticker_count': ticker_count,
+                'max_tickers_limit': max_tickers,
+                'suggestion': f'Increase max_tickers parameter to at least {ticker_count}'
+            }, status=400)
+
+        # Collect all candles in a flat list
+        all_candles = []
+        interval_minutes = self.config_manager.config.candle_interval_minutes
+
+        for ticker_obj in all_tickers:
+            ticker = ticker_obj.ticker
+            candles = self.storage.get_candles(
+                ticker=ticker,
+                count=count,
+                include_current=include_current,
+                interval_minutes=interval_minutes,
+                from_timestamp=int(from_timestamp) if from_timestamp else None,
+                to_timestamp=int(to_timestamp) if to_timestamp else None
+            )
+
+            # Add ticker field to each candle and append to flat list
+            for candle in candles:
+                candle_dict = candle.to_dict()
+                candle_dict['ticker'] = ticker
+                all_candles.append(candle_dict)
+
+        return web.json_response({
+            'total_tickers': ticker_count,
+            'total_candles': len(all_candles),
+            'max_tickers_limit': max_tickers,
+            'interval': f"{interval_minutes}m",
+            'candles': all_candles,
+            'timestamp': datetime.now(timezone.utc).isoformat()
+        })
+
     async def get_candles(self, request: web.Request) -> web.Response:
         """GET /candles/{ticker} - Get candles for a ticker."""
         ticker = request.match_info['ticker'].upper()
-        
+
         # Parse query parameters
         count = int(request.query.get('count', '10'))
         include_current = request.query.get('include_current', 'true').lower() == 'true'
         from_timestamp = request.query.get('from_timestamp')
         to_timestamp = request.query.get('to_timestamp')
-        
+
         # Validate count
         count = min(max(count, 1), self.config_manager.config.max_candles_stored)
-        
+
         candles = self.storage.get_candles(
             ticker=ticker,
             count=count,
@@ -375,7 +459,7 @@ class APIRoutes:
             from_timestamp=int(from_timestamp) if from_timestamp else None,
             to_timestamp=int(to_timestamp) if to_timestamp else None
         )
-        
+
         return web.json_response({
             'ticker': ticker,
             'interval': f"{self.config_manager.config.candle_interval_minutes}m",
@@ -383,7 +467,7 @@ class APIRoutes:
             'candles': [c.to_dict() for c in candles],
             'timestamp': datetime.now(timezone.utc).isoformat()
         })
-    
+
     async def get_latest_candle(self, request: web.Request) -> web.Response:
         """GET /candles/{ticker}/latest - Get current incomplete candle."""
         ticker = request.match_info['ticker'].upper()

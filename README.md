@@ -1,4 +1,4 @@
-# EODHD Real-Time Candle Aggregator v0.4.0
+# EODHD Real-Time Candle Aggregator v0.4.1
 
 > **Converts EODHD WebSocket tick data into configurable OHLCV candles with full REST API management**
 
@@ -166,11 +166,61 @@ curl -X DELETE -H "X-API-Key: xxx" \
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
+| `GET` | `/candles/all` | Get candles for ALL tracked tickers (requires confirmation) |
 | `GET` | `/candles/{ticker}` | Get candles for ticker |
 | `GET` | `/candles/{ticker}/latest` | Get current incomplete candle |
 | `POST` | `/candles/multi` | Get candles for multiple tickers |
 | `DELETE` | `/candles/{ticker}` | Clear ticker's candle history |
 | `DELETE` | `/candles` | Clear all candle history |
+
+**Query Parameters for `/candles/all` (ALL required for safety):**
+- `confirm=true` - **Required** - Explicit confirmation to retrieve all candles
+- `max_tickers=N` - **Required** - Maximum number of tickers allowed (must be >= 1)
+- `count` - Number of candles per ticker (default: 10)
+- `include_current` - Include incomplete candle (default: true)
+- `from_timestamp` - Filter by start time (Unix timestamp)
+- `to_timestamp` - Filter by end time (Unix timestamp)
+
+**Example Request:**
+```bash
+curl -H "X-API-Key: your-api-key" \
+  "http://localhost:8080/candles/all?confirm=true&max_tickers=50&count=10"
+```
+
+**Example Response (flat list with ticker field):**
+```json
+{
+  "total_tickers": 3,
+  "total_candles": 30,
+  "max_tickers_limit": 50,
+  "interval": "5m",
+  "candles": [
+    {
+      "ticker": "AAPL",
+      "timestamp": 1733752500,
+      "datetime_utc": "2025-12-09 14:15:00 UTC",
+      "open": 245.50,
+      "high": 246.20,
+      "low": 245.30,
+      "close": 245.90,
+      "volume": 125000,
+      "tick_count": 342,
+      "is_complete": true,
+      "interval_minutes": 5
+    },
+    {
+      "ticker": "AAPL",
+      "timestamp": 1733752200,
+      ...
+    },
+    {
+      "ticker": "TSLA",
+      ...
+    }
+  ],
+  "timestamp": "2025-12-13T10:30:00.000Z"
+}
+```
 
 **Query Parameters for `/candles/{ticker}`:**
 - `count` - Number of candles (default: 10)
@@ -305,6 +355,12 @@ docker-compose up -d
 ---
 
 ## Changelog
+
+### v0.4.1 (2025-12-13)
+- **New Endpoint**: Added `GET /candles/all` to retrieve candles for ALL tracked tickers
+  - Requires `confirm=true` and `max_tickers=N` parameters for safety
+  - Returns flat list with ticker field included in each candle
+  - Supports same filters as single ticker endpoint (count, timestamps, include_current)
 
 ### v0.4.0 (2025-12-13)
 - **Admin Web UI**: Added Flask-based admin panel with sqowe branding
