@@ -18,12 +18,17 @@ logger = logging.getLogger(__name__)
 def create_app() -> Flask:
     """Create and configure the Flask application."""
 
-    # Get configuration from environment
-    api_url = os.getenv('ADMIN_API_URL', 'http://localhost:8765')
-    api_key = os.getenv('API_KEY', '')
-    admin_host = os.getenv('ADMIN_HOST', '127.0.0.1')
+    # Get configuration from environment (strip whitespace)
+    api_url = os.getenv('ADMIN_API_URL', 'http://localhost:8765').strip()
+    api_key = os.getenv('API_KEY', '').strip()
+    admin_host = os.getenv('ADMIN_HOST', '127.0.0.1').strip()
     admin_port = int(os.getenv('ADMIN_PORT', '5000'))
-    session_secret = os.getenv('ADMIN_SESSION_SECRET', secrets.token_hex(32))
+    session_secret = os.getenv('ADMIN_SESSION_SECRET', '').strip() or secrets.token_hex(32)
+
+    # Validate host
+    if not admin_host:
+        admin_host = '127.0.0.1'
+        logger.warning("ADMIN_HOST is empty, defaulting to 127.0.0.1")
 
     if not api_key:
         logger.warning("No API_KEY configured - authentication will not work properly")
@@ -285,8 +290,9 @@ def create_app() -> Flask:
 
 
 def main():
-    """Run the Flask development server."""
+    """Run the Flask production server."""
     from dotenv import load_dotenv
+    from waitress import serve
 
     # Load environment variables
     env_path = Path(__file__).parent.parent.parent / '.env'
@@ -309,11 +315,19 @@ def main():
     logger.info("=" * 60)
     logger.info("EODHD Candle Aggregator - Admin UI")
     logger.info("=" * 60)
-    logger.info(f"Admin UI: http://{host}:{port}")
+    logger.info(f"Admin UI listening on {host}:{port}")
     logger.info(f"Main API: {app.config['API_URL']}")
+    logger.info(f"Debug - Host: '{host}' (len={len(host)}) Port: {port}")
     logger.info("=" * 60)
 
-    app.run(host=host, port=port, debug=False)
+    # Use Waitress for production-ready WSGI server
+    try:
+        serve(app, host=host, port=port, threads=4)
+    except Exception as e:
+        logger.error(f"Failed to start Waitress server: {e}")
+        logger.error(f"Host value: '{host}' (repr: {repr(host)})")
+        logger.error(f"Port value: {port}")
+        raise
 
 
 if __name__ == '__main__':
