@@ -20,74 +20,79 @@
                 <div class="grid grid-2">
                     <div class="form-group">
                         <label for="candle_interval_minutes" class="form-label">Candle Interval (minutes)</label>
+                        {% set interval_value = config.candle_interval_minutes.value if config.candle_interval_minutes.value is defined else config.candle_interval_minutes %}
                         <select id="candle_interval_minutes" name="candle_interval_minutes" class="form-select">
-                            <option value="1" {% if config.candle_interval_minutes == 1 %}selected{% endif %}>1 minute</option>
-                            <option value="5" {% if config.candle_interval_minutes == 5 %}selected{% endif %}>5 minutes</option>
-                            <option value="15" {% if config.candle_interval_minutes == 15 %}selected{% endif %}>15 minutes</option>
-                            <option value="30" {% if config.candle_interval_minutes == 30 %}selected{% endif %}>30 minutes</option>
-                            <option value="60" {% if config.candle_interval_minutes == 60 %}selected{% endif %}>60 minutes</option>
+                            <option value="1" {% if interval_value == 1 %}selected{% endif %}>1 minute</option>
+                            <option value="5" {% if interval_value == 5 %}selected{% endif %}>5 minutes</option>
+                            <option value="15" {% if interval_value == 15 %}selected{% endif %}>15 minutes</option>
+                            <option value="30" {% if interval_value == 30 %}selected{% endif %}>30 minutes</option>
+                            <option value="60" {% if interval_value == 60 %}selected{% endif %}>60 minutes</option>
                         </select>
                         <p class="form-help">Time period for each candle</p>
                     </div>
 
                     <div class="form-group">
                         <label for="max_candles_stored" class="form-label">Max Candles Stored</label>
+                        {% set max_candles_value = config.max_candles_stored.value if config.max_candles_stored.value is defined else config.max_candles_stored %}
                         <input
                             type="number"
                             id="max_candles_stored"
                             name="max_candles_stored"
                             class="form-input"
-                            value="{{ config.max_candles_stored }}"
-                            placeholder="{{ config.max_candles_stored }}"
+                            value="{{ max_candles_value }}"
+                            placeholder="{{ max_candles_value }}"
                             min="10"
                             max="1000"
                         />
-                        <p class="form-help">Maximum candles per ticker (current: {{ config.max_candles_stored }})</p>
+                        <p class="form-help">Maximum candles per ticker (current: {{ max_candles_value }})</p>
                     </div>
 
                     <div class="form-group">
                         <label for="max_tickers" class="form-label">Max Tickers</label>
+                        {% set max_tickers_value = config.max_tickers.value if config.max_tickers.value is defined else config.max_tickers %}
                         <input
                             type="number"
                             id="max_tickers"
                             name="max_tickers"
                             class="form-input"
-                            value="{{ config.max_tickers }}"
-                            placeholder="{{ config.max_tickers }}"
+                            value="{{ max_tickers_value }}"
+                            placeholder="{{ max_tickers_value }}"
                             min="1"
                             max="100"
                         />
-                        <p class="form-help">Maximum number of tracked tickers (current: {{ config.max_tickers }})</p>
+                        <p class="form-help">Maximum number of tracked tickers (current: {{ max_tickers_value }})</p>
                     </div>
 
                     <div class="form-group">
                         <label for="ws_reconnect_delay" class="form-label">WebSocket Reconnect Delay (seconds)</label>
+                        {% set reconnect_delay_value = config.ws_reconnect_delay.value if config.ws_reconnect_delay.value is defined else config.ws_reconnect_delay %}
                         <input
                             type="number"
                             id="ws_reconnect_delay"
                             name="ws_reconnect_delay"
                             class="form-input"
-                            value="{{ config.ws_reconnect_delay }}"
-                            placeholder="{{ config.ws_reconnect_delay }}"
+                            value="{{ reconnect_delay_value }}"
+                            placeholder="{{ reconnect_delay_value }}"
                             min="1"
                             max="60"
                         />
-                        <p class="form-help">Delay before reconnecting WebSocket (current: {{ config.ws_reconnect_delay }}s)</p>
+                        <p class="form-help">Delay before reconnecting WebSocket (current: {{ reconnect_delay_value }}s)</p>
                     </div>
 
                     <div class="form-group">
                         <label for="ws_ping_interval" class="form-label">WebSocket Ping Interval (seconds)</label>
+                        {% set ping_interval_value = config.ws_ping_interval.value if config.ws_ping_interval.value is defined else config.ws_ping_interval %}
                         <input
                             type="number"
                             id="ws_ping_interval"
                             name="ws_ping_interval"
                             class="form-input"
-                            value="{{ config.ws_ping_interval }}"
-                            placeholder="{{ config.ws_ping_interval }}"
+                            value="{{ ping_interval_value }}"
+                            placeholder="{{ ping_interval_value }}"
                             min="10"
                             max="120"
                         />
-                        <p class="form-help">Keep-alive ping interval (current: {{ config.ws_ping_interval }}s)</p>
+                        <p class="form-help">Keep-alive ping interval (current: {{ ping_interval_value }}s)</p>
                     </div>
                 </div>
 
