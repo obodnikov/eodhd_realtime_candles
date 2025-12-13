@@ -38,10 +38,11 @@
                             name="max_candles_stored"
                             class="form-input"
                             value="{{ config.max_candles_stored }}"
+                            placeholder="{{ config.max_candles_stored }}"
                             min="10"
                             max="1000"
                         />
-                        <p class="form-help">Maximum candles per ticker</p>
+                        <p class="form-help">Maximum candles per ticker (current: {{ config.max_candles_stored }})</p>
                     </div>
 
                     <div class="form-group">
@@ -52,10 +53,11 @@
                             name="max_tickers"
                             class="form-input"
                             value="{{ config.max_tickers }}"
+                            placeholder="{{ config.max_tickers }}"
                             min="1"
                             max="100"
                         />
-                        <p class="form-help">Maximum number of tracked tickers</p>
+                        <p class="form-help">Maximum number of tracked tickers (current: {{ config.max_tickers }})</p>
                     </div>
 
                     <div class="form-group">
@@ -66,10 +68,11 @@
                             name="ws_reconnect_delay"
                             class="form-input"
                             value="{{ config.ws_reconnect_delay }}"
+                            placeholder="{{ config.ws_reconnect_delay }}"
                             min="1"
                             max="60"
                         />
-                        <p class="form-help">Delay before reconnecting WebSocket</p>
+                        <p class="form-help">Delay before reconnecting WebSocket (current: {{ config.ws_reconnect_delay }}s)</p>
                     </div>
 
                     <div class="form-group">
@@ -80,10 +83,11 @@
                             name="ws_ping_interval"
                             class="form-input"
                             value="{{ config.ws_ping_interval }}"
+                            placeholder="{{ config.ws_ping_interval }}"
                             min="10"
                             max="120"
                         />
-                        <p class="form-help">Keep-alive ping interval</p>
+                        <p class="form-help">Keep-alive ping interval (current: {{ config.ws_ping_interval }}s)</p>
                     </div>
                 </div>
 

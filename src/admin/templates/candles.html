@@ -60,7 +60,7 @@
                         </tr>
                     </thead>
                     <tbody>
-                        {% for candle in candle_data.candles %}
+                        {% for candle in candle_data.candles|reverse %}
                         <tr class="{% if not candle.is_complete %}candle-incomplete{% endif %}">
                             <td>{{ candle.datetime_utc }}</td>
                             <td>{{ candle.open|number }}</td>

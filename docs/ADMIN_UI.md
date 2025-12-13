@@ -49,7 +49,6 @@ Configure the admin UI using these environment variables in your `.env` file:
 | `ADMIN_ENABLED` | `true` | Enable/disable the admin web interface |
 | `ADMIN_HOST` | `127.0.0.1` | Host to bind the admin UI (see Security section) |
 | `ADMIN_PORT` | `5000` | Port for the admin UI |
-| `ADMIN_SESSION_SECRET` | (auto-generated) | Secret key for session encryption |
 | `API_KEY` | (required) | Same API key used for main REST API |
 
 ### Example Configuration
@@ -62,7 +61,6 @@ API_KEY=your_secret_api_key_here
 ADMIN_ENABLED=true
 ADMIN_HOST=127.0.0.1  # Localhost only (secure)
 ADMIN_PORT=5000
-ADMIN_SESSION_SECRET=  # Auto-generated if empty
 ```
 
 ---
