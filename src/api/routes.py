@@ -52,6 +52,7 @@ class APIRoutes:
         self.app.router.add_post('/candles/multi', self.get_multi_candles)
         self.app.router.add_delete('/candles/{ticker}', self.clear_ticker_candles)
         self.app.router.add_delete('/candles', self.clear_all_candles)
+        self.app.router.add_post('/candles/cleanup', self.cleanup_orphaned_candles)
     
     # =========================================================================
     # Helper methods
@@ -304,7 +305,7 @@ class APIRoutes:
                 return web.json_response({
                     'error': 'Confirmation required',
                     'detail': 'Add ?confirm=true to confirm deletion of all tickers',
-                    'warning': 'This will remove all tracked tickers (candle data will be preserved)'
+                    'warning': 'This will remove all tracked tickers and their candle data'
                 }, status=400)
 
             # Proceed with deleting all tickers
@@ -318,9 +319,8 @@ class APIRoutes:
                 self.candle_engine.remove_ticker(ticker)
 
             return web.json_response({
-                'message': 'All tickers removed',
+                'message': 'All tickers and their candle data removed',
                 'count': count,
-                'candles_preserved': True,
                 'current_count': 0,
                 'timestamp': datetime.now(timezone.utc).isoformat()
             })
@@ -539,8 +539,50 @@ class APIRoutes:
     async def clear_all_candles(self, request: web.Request) -> web.Response:
         """DELETE /candles - Clear all candle history."""
         self.storage.clear_candles()
-        
+
         return web.json_response({
             'message': 'Cleared all candles',
             'timestamp': datetime.now(timezone.utc).isoformat()
         })
+
+    async def cleanup_orphaned_candles(self, request: web.Request) -> web.Response:
+        """
+        POST /candles/cleanup - Remove candles for tickers that are no longer tracked.
+
+        Performance Notes:
+        - This operation performs a DELETE with a subquery
+        - Uses BEGIN IMMEDIATE transaction for consistency
+        - For large datasets (>100k orphaned candles), operation may take several seconds
+        - Database is locked during cleanup to prevent corruption
+        - Consider running during low-traffic periods for large cleanups
+
+        Returns:
+            200: Cleanup successful with count of deleted records
+            500: Cleanup failed (database error, lock timeout, etc.)
+        """
+        import time
+        start_time = time.time()
+
+        try:
+            logger.info("Starting orphaned candles cleanup")
+            deleted = self.storage.cleanup_orphaned_candles()
+            duration = time.time() - start_time
+
+            logger.info(f"Cleanup completed: {deleted} records deleted in {duration:.2f}s")
+
+            return web.json_response({
+                'message': 'Orphaned candles cleaned up',
+                'deleted_count': deleted,
+                'duration_seconds': round(duration, 2),
+                'timestamp': datetime.now(timezone.utc).isoformat()
+            })
+
+        except Exception as e:
+            duration = time.time() - start_time
+            logger.error(f"Cleanup failed after {duration:.2f}s: {e}")
+            return web.json_response({
+                'error': 'Cleanup operation failed',
+                'detail': str(e),
+                'duration_seconds': round(duration, 2),
+                'timestamp': datetime.now(timezone.utc).isoformat()
+            }, status=500)

@@ -148,9 +148,9 @@ All endpoints except `/health` require authentication via one of:
 |--------|----------|-------------|
 | `GET` | `/tickers` | List all tracked tickers |
 | `POST` | `/tickers` | Add ticker(s) |
-| `DELETE` | `/tickers/{ticker}` | Remove single ticker |
-| `DELETE` | `/tickers` (with body) | Remove multiple tickers |
-| `DELETE` | `/tickers?confirm=true` (no body) | Remove ALL tickers (requires config) |
+| `DELETE` | `/tickers/{ticker}` | Remove single ticker **and its candles** |
+| `DELETE` | `/tickers` (with body) | Remove multiple tickers **and their candles** |
+| `DELETE` | `/tickers?confirm=true` (no body) | Remove ALL tickers **and all candles** (requires config) |
 
 **Examples:**
 ```bash
@@ -179,8 +179,10 @@ curl -X DELETE -H "X-API-Key: xxx" \
 - Removing all tickers is **disabled by default** for safety
 - Set `ALLOW_DELETE_ALL_TICKERS=true` in `.env` to enable
 - Requires `?confirm=true` query parameter to prevent accidental deletion
-- Candle data is **preserved** when tickers are removed
-- Re-adding a ticker will restore access to its preserved candles
+- **⚠️ BREAKING CHANGE (v0.4.3)**: When a ticker is removed (single or batch), its candle data is **also deleted**
+  - Previously: Single ticker deletion removed candles ✓, but batch deletion (`DELETE /tickers?confirm=true`) preserved candles ✗
+  - Now: **All ticker deletion operations consistently remove candles** ✓
+  - Migration: Use `POST /candles/cleanup` to clean up any orphaned candles from legacy data
 
 #### Candle Data
 
@@ -192,6 +194,15 @@ curl -X DELETE -H "X-API-Key: xxx" \
 | `POST` | `/candles/multi` | Get candles for multiple tickers |
 | `DELETE` | `/candles/{ticker}` | Clear ticker's candle history |
 | `DELETE` | `/candles` | Clear all candle history |
+| `POST` | `/candles/cleanup` | Remove orphaned candles (for tickers no longer tracked) |
+
+**Cleanup Endpoint Details:**
+
+The `/candles/cleanup` endpoint removes orphaned candle data:
+- **Performance**: Uses atomic transaction with database lock for consistency
+- **Duration**: Typically <1s for normal datasets; may take several seconds for >100k orphans
+- **Recommendation**: Run during low-traffic periods for large cleanups
+- **Response includes**: `deleted_count` and `duration_seconds` for monitoring
 
 **Query Parameters for `/candles/all` (ALL required for safety):**
 - `confirm=true` - **Required** - Explicit confirmation to retrieve all candles
@@ -374,6 +385,15 @@ docker-compose up -d
 ---
 
 ## Changelog
+
+### v0.4.3 (2025-12-26)
+- **Bug Fix**: Fixed `delete_all_tickers()` to consistently delete candle data
+  - **⚠️ BREAKING CHANGE**: `DELETE /tickers?confirm=true` now deletes candles (previously preserved them)
+  - This brings batch ticker deletion in line with single ticker deletion behavior
+  - Migration: Use new `POST /candles/cleanup` endpoint to remove orphaned candles from legacy data
+- **New Endpoint**: Added `POST /candles/cleanup` to remove orphaned candles
+- **Documentation**: Added comprehensive breaking change notice and migration guide
+- **Tooling**: Added `scripts/cleanup_orphaned_candles.sh` for automated cleanup
 
 ### v0.4.2 (2025-12-13)
 - **Admin UI Improvements**: Enhanced admin dashboard user experience

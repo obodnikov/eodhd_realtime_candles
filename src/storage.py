@@ -275,7 +275,7 @@ class Storage:
 
     def delete_all_tickers(self) -> int:
         """
-        Remove all tickers from tracking (preserves candle data).
+        Remove all tickers from tracking and delete their candle data.
         Returns count of removed tickers.
         """
         conn = self._get_connection()
@@ -285,12 +285,56 @@ class Storage:
         cursor.execute('SELECT COUNT(*) FROM tickers')
         count = cursor.fetchone()[0]
 
-        # Delete all tickers (candles are preserved)
+        # Delete all candles first
+        cursor.execute('DELETE FROM candles')
+
+        # Delete all tickers
         cursor.execute('DELETE FROM tickers')
 
         conn.commit()
-        logger.info(f"Deleted all {count} tickers (candle data preserved)")
+        logger.info(f"Deleted all {count} tickers and their candle data")
         return count
+
+    def cleanup_orphaned_candles(self) -> int:
+        """
+        Remove candles for tickers that are no longer tracked.
+
+        This operation is atomic - it uses a single SQL statement with a subquery
+        to ensure consistency even under concurrent ticker additions/removals.
+        The NOT IN subquery is evaluated atomically within the DELETE statement,
+        preventing race conditions.
+
+        Returns count of deleted candle records.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        try:
+            # Use IMMEDIATE transaction to lock the database for writing
+            # This prevents concurrent modifications during cleanup
+            cursor.execute('BEGIN IMMEDIATE')
+
+            # Delete candles where ticker doesn't exist in tickers table
+            # The subquery is evaluated atomically within this transaction
+            cursor.execute('''
+                DELETE FROM candles
+                WHERE ticker NOT IN (SELECT symbol FROM tickers)
+            ''')
+
+            deleted = cursor.rowcount
+            conn.commit()
+
+            if deleted > 0:
+                logger.info(f"Cleaned up {deleted} orphaned candles")
+            else:
+                logger.debug("No orphaned candles found")
+
+            return deleted
+
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Failed to cleanup orphaned candles: {e}")
+            raise
 
     # =========================================================================
     # Candle Management
