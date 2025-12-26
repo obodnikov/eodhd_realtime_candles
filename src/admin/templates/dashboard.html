@@ -133,20 +133,20 @@
                     <thead>
                         <tr>
                             <th>Ticker</th>
-                            <th>Open</th>
-                            <th>High</th>
-                            <th>Low</th>
-                            <th>Close</th>
-                            <th>Volume</th>
+                            <th>Current Price</th>
+                            <th>Range (L-H)</th>
                             <th>Ticks</th>
                             <th>Started</th>
                         </tr>
                     </thead>
                     <tbody>
-                        {% for ticker in status.active_candles %}
+                        {% for candle in status.active_candles %}
                         <tr>
-                            <td><strong>{{ ticker }}</strong></td>
-                            <td colspan="7" class="text-muted">Building candle...</td>
+                            <td><strong>{{ candle.ticker }}</strong></td>
+                            <td>${{ "%.2f"|format(candle.current_price) }}</td>
+                            <td class="text-muted">${{ "%.2f"|format(candle.low) }} - ${{ "%.2f"|format(candle.high) }}</td>
+                            <td><span class="badge badge-info">{{ candle.ticks }}</span></td>
+                            <td class="text-muted">{{ candle.started_ago }}</td>
                         </tr>
                         {% endfor %}
                     </tbody>

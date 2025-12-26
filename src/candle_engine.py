@@ -255,6 +255,40 @@ class CandleEngine:
     def get_active_tickers(self) -> list:
         """Get list of tickers with active (in-progress) candles."""
         return list(self._current_candles.keys())
+
+    def get_active_tickers_summary(self) -> list:
+        """Get lightweight summary of active candles for dashboard."""
+        summaries = []
+        current_time = datetime.now(timezone.utc).timestamp()
+
+        for ticker, candle in self._current_candles.items():
+            # Calculate how long ago the candle started
+            started_seconds_ago = int(current_time - candle.start_timestamp)
+
+            # Format time ago with appropriate units
+            if started_seconds_ago < 60:
+                started_ago = f"{started_seconds_ago}s ago"
+            elif started_seconds_ago < 3600:  # Less than 1 hour
+                started_minutes_ago = started_seconds_ago // 60
+                started_ago = f"{started_minutes_ago}m ago"
+            elif started_seconds_ago < 86400:  # Less than 1 day
+                started_hours_ago = started_seconds_ago // 3600
+                started_ago = f"{started_hours_ago}h ago"
+            else:  # 1 day or more
+                started_days_ago = started_seconds_ago // 86400
+                started_ago = f"{started_days_ago}d ago"
+
+            summaries.append({
+                'ticker': ticker,
+                'ticks': candle.tick_count,
+                'current_price': round(candle.close, 2),
+                'low': round(candle.low, 2),
+                'high': round(candle.high, 2),
+                'started': candle.start_timestamp,
+                'started_ago': started_ago
+            })
+
+        return summaries
     
     def complete_all_candles(self):
         """Force complete all current candles (for shutdown)."""

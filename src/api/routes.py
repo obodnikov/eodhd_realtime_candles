@@ -99,7 +99,7 @@ class APIRoutes:
                 include_source=True,
                 overrides=overrides
             ),
-            'active_candles': self.candle_engine.get_active_tickers(),
+            'active_candles': self.candle_engine.get_active_tickers_summary(),
             'timestamp': datetime.now(timezone.utc).isoformat()
         })
     
