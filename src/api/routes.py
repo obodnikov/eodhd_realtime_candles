@@ -413,7 +413,7 @@ class APIRoutes:
         interval_minutes = self.config_manager.config.candle_interval_minutes
 
         for ticker_obj in all_tickers:
-            ticker = ticker_obj.ticker
+            ticker = ticker_obj.symbol
             candles = self.storage.get_candles(
                 ticker=ticker,
                 count=count,
@@ -422,6 +422,9 @@ class APIRoutes:
                 from_timestamp=int(from_timestamp) if from_timestamp else None,
                 to_timestamp=int(to_timestamp) if to_timestamp else None
             )
+
+            # Update last request timestamp
+            self.storage.update_ticker_last_request(ticker)
 
             # Add ticker field to each candle and append to flat list
             for candle in candles:
@@ -459,6 +462,9 @@ class APIRoutes:
             from_timestamp=int(from_timestamp) if from_timestamp else None,
             to_timestamp=int(to_timestamp) if to_timestamp else None
         )
+        
+        # Update last request timestamp
+        self.storage.update_ticker_last_request(ticker)
 
         return web.json_response({
             'ticker': ticker,
@@ -479,6 +485,9 @@ class APIRoutes:
                 {'error': f'No active candle for {ticker}'},
                 status=404
             )
+        
+        # Update last request timestamp
+        self.storage.update_ticker_last_request(ticker)
         
         return web.json_response({
             'ticker': ticker,
@@ -518,6 +527,9 @@ class APIRoutes:
                 interval_minutes=self.config_manager.config.candle_interval_minutes
             )
             result[ticker] = [c.to_dict() for c in candles]
+            
+            # Update last request timestamp
+            self.storage.update_ticker_last_request(ticker)
         
         return web.json_response({
             'interval': f"{self.config_manager.config.candle_interval_minutes}m",

@@ -45,6 +45,7 @@ class TrackedTicker:
     last_tick_at: Optional[str]
     last_price: Optional[float]
     candle_count: int
+    last_candle_request_at: Optional[str]
     
     def to_dict(self) -> dict:
         return asdict(self)
@@ -139,9 +140,18 @@ class Storage:
                 status TEXT DEFAULT 'active',
                 last_tick_at TEXT,
                 last_price REAL,
+                last_candle_request_at TEXT,
                 updated_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        
+        # Migration: Add last_candle_request_at column if it doesn't exist
+        cursor.execute("PRAGMA table_info(tickers)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if 'last_candle_request_at' not in columns:
+            cursor.execute("ALTER TABLE tickers ADD COLUMN last_candle_request_at TEXT")
+            conn.commit()
+            logger.info("Added last_candle_request_at column to tickers table")
         
         # Runtime config table
         cursor.execute('''
@@ -209,6 +219,7 @@ class Storage:
                 t.status,
                 t.last_tick_at,
                 t.last_price,
+                t.last_candle_request_at,
                 COUNT(c.id) as candle_count
             FROM tickers t
             LEFT JOIN candles c ON t.symbol = c.ticker AND c.is_complete = 1
@@ -224,7 +235,8 @@ class Storage:
                 status=row['status'],
                 last_tick_at=row['last_tick_at'],
                 last_price=row['last_price'],
-                candle_count=row['candle_count']
+                candle_count=row['candle_count'],
+                last_candle_request_at=row['last_candle_request_at']
             ))
         
         return tickers
@@ -272,6 +284,17 @@ class Storage:
         cursor = conn.cursor()
         cursor.execute('SELECT COUNT(*) FROM tickers')
         return cursor.fetchone()[0]
+    
+    def update_ticker_last_request(self, symbol: str):
+        """Update last candle request timestamp for a ticker."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE tickers 
+            SET last_candle_request_at = ?
+            WHERE symbol = ?
+        ''', (datetime.now(timezone.utc).isoformat(), symbol.upper()))
+        conn.commit()
 
     def delete_all_tickers(self) -> int:
         """
