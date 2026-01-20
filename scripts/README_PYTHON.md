@@ -264,24 +264,35 @@ A Python script that calculates the average premarket trading volume for a given
 
 ## Features
 
-- **1-minute interval support**: Uses EODHD's 1-minute data (120-day history)
+- **1-minute interval only**: Uses EODHD's 1-minute data (up to 90 days of history)
 - **Premarket focus**: Only counts volume during 4:00 AM - 9:30 AM ET
+- **Maximum data retrieval**: Fetches up to 90 days of premarket data
 - **Environment-based API key**: Secure API key management via environment variables
 - **Command-line interface**: Simple CLI for quick calculations
 - **JSON output**: Structured response format
 - **Error handling**: Comprehensive error handling for API issues
 
+## Important Note
+
+**EODHD API Limitation**: Only 1-minute interval data includes premarket hours (4:00-9:30 AM ET). Other intervals (5m, 1h) start at market open (9:30 AM ET) and do not contain premarket data.
+
 ## Prerequisites
 
-- Python 3.6+
+- Python 3.9+ (for zoneinfo support)
 - `requests` library
+- `tzdata` library (for Windows timezone support)
 - EODHD API key
 
 ## Installation
 
 1. **Install dependencies**:
 ```bash
-pip install requests
+pip install requests tzdata
+```
+
+Or install from requirements.txt:
+```bash
+pip install -r requirements.txt
 ```
 
 2. **Set environment variable**:
@@ -300,25 +311,25 @@ source ~/.bashrc
 ### Command Line
 
 ```bash
-python premarket_volume.py <TICKER> [INTERVAL]
+python premarket_volume.py <TICKER>
 ```
 
 **Parameters**:
 - `TICKER` (required): Stock symbol with exchange (e.g., "AAPL.US", "MSFT.US")
-- `INTERVAL` (optional): Data interval, defaults to "1m"
-  - Supported: "1m", "5m", "1h"
+
+**Note**: The script automatically uses 1-minute intervals and retrieves up to 90 days of data.
 
 ### Examples
 
 ```bash
-# Basic usage with 1-minute intervals
+# Calculate premarket volume for Apple
 python premarket_volume.py AAPL.US
 
-# With specific interval
-python premarket_volume.py AAPL.US 5m
+# Calculate for Microsoft
+python premarket_volume.py MSFT.US
 
-# Different stock
-python premarket_volume.py MSFT.US 1m
+# Calculate for Tesla
+python premarket_volume.py TSLA.US
 ```
 
 ### Python Module Usage
@@ -329,8 +340,8 @@ from premarket_volume import PremarketVolumeCalculator
 # Initialize calculator
 calculator = PremarketVolumeCalculator()
 
-# Calculate premarket volume
-result = calculator.calculate_premarket_volume("AAPL.US", "1m")
+# Calculate premarket volume (automatically uses 1m interval, 90 days)
+result = calculator.calculate_premarket_volume("AAPL.US")
 print(result)
 ```
 
@@ -340,10 +351,10 @@ print(result)
 ```json
 {
   "ticker": "AAPL.US",
-  "average_premarket_volume": 12345678,
-  "trading_days_included": 85,
-  "date_range": "2025-09-15 to 2026-01-08",
-  "interval": "1m",
+  "average_premarket_volume": 590837,
+  "trading_days_included": 18,
+  "date_range": "2025-12-22 to 2026-01-16",
+  "average_interval_volume": 1837,
   "status": "success"
 }
 ```
@@ -360,16 +371,19 @@ print(result)
 ## EODHD API Details
 
 ### Data Availability
-- **1-minute data**: Last 120 days
-- **5-minute data**: Last 600 days  
-- **1-hour data**: Last 7200 days
+- **1-minute data**: Up to 120 days of historical data
+- **Premarket data**: Only available in 1-minute intervals
+- **Script retrieves**: Up to 90 days to maximize premarket data points
+
+### Premarket Data Limitation
+**Important**: EODHD API only provides premarket hours (4:00-9:30 AM ET) in 1-minute interval data. Other intervals (5m, 1h) start at market open (9:30 AM ET) and do not include premarket trading.
 
 ### Ticker Format
 - US stocks: `SYMBOL.US` (e.g., `AAPL.US`, `MSFT.US`)
 - Other exchanges: `SYMBOL.EXCHANGE` (e.g., `AAPL.MX`)
 
 ### API Consumption
-- 5 API calls per request
+- Single API call per request
 - Check your plan limits at [EODHD pricing](https://eodhd.com/pricing)
 
 ## Configuration
@@ -381,17 +395,11 @@ print(result)
 | `EODHD_API_KEY` | Yes | Your EODHD API key |
 
 ### Premarket Hours
-The script uses **4:00 AM - 9:30 AM ET** as premarket hours. To modify:
+The script uses **4:00 AM - 9:30 AM ET** as premarket hours with proper DST handling via `zoneinfo.ZoneInfo('America/New_York')`. This automatically adjusts for:
+- **EST (Eastern Standard Time)**: UTC-5 (November - March)
+- **EDT (Eastern Daylight Time)**: UTC-4 (March - November)
 
-```python
-def is_premarket_time(self, dt: datetime) -> bool:
-    et_hour = dt.hour - 5  # EST offset
-    et_time_minutes = et_hour * 60 + dt.minute
-    
-    # Modify these values:
-    # Current: 4:00 AM (240 min) to 9:30 AM (570 min) ET
-    return 240 <= et_time_minutes < 570
-```
+No manual adjustment needed for DST transitions.
 
 ## Error Handling
 
@@ -411,25 +419,29 @@ def is_premarket_time(self, dt: datetime) -> bool:
 
 **"No premarket data found"**
 - Stock may not have premarket trading
-- Try different interval or date range
+- Verify ticker is correct and actively traded
+- Note: Only 1-minute data includes premarket hours
 
 ## Class Structure
 
 ### PremarketVolumeCalculator
 
 **Methods**:
-- `__init__()`: Initialize with API key from environment
-- `get_timestamps(days_back=120)`: Generate Unix timestamps for date range
-- `fetch_intraday_data(ticker, interval)`: Fetch data from EODHD API
-- `is_premarket_time(dt)`: Check if datetime is in premarket hours
-- `calculate_premarket_volume(ticker, interval)`: Main calculation method
+- `__init__()`: Initialize with API key from environment (sets 1m interval, 90 days)
+- `get_timestamps()`: Generate Unix timestamps for 90-day range
+- `fetch_intraday_data(ticker)`: Fetch 1m data from EODHD API
+- `is_premarket_time(dt)`: Check if datetime is in premarket hours (4:00-9:30 AM ET)
+- `calculate_premarket_volume(ticker)`: Main calculation method
 
 ## Customization Examples
 
 ### Different Time Range
 ```python
-# Get last 60 days instead of 120
-from_unix, to_unix = calculator.get_timestamps(days_back=60)
+# Modify days_back in __init__ method
+class PremarketVolumeCalculator:
+    def __init__(self):
+        # ...
+        self.days_back = 60  # Change from 90 to 60 days
 ```
 
 ### Custom Time Zone Handling
@@ -458,6 +470,23 @@ print(json.dumps(results, indent=2))
 
 ## Testing
 
+### Run Unit Tests
+```bash
+# Run all tests
+python -m pytest tests/test_premarket_volume.py -v
+
+# Or using unittest
+python tests/test_premarket_volume.py
+```
+
+### Test Coverage
+The test suite covers:
+- Premarket time detection (EST and EDT)
+- DST transition handling
+- Volume calculation logic
+- API error handling
+- Edge cases (missing data, invalid tickers)
+
 ### Test with Demo API Key
 EODHD provides a demo API key for testing:
 
@@ -477,10 +506,10 @@ python premarket_volume.py AAPL.US | jq '.status'
 
 ## Performance Notes
 
-- **1-minute intervals**: More precise but limited to 120 days
-- **5-minute intervals**: Good balance of precision and history (600 days)
+- **1-minute intervals**: Only interval with premarket data (4:00-9:30 AM ET)
+- **90-day window**: Maximizes premarket data points while staying within API limits
 - **API limits**: Consider caching results for repeated queries
-- **Timezone**: Script uses approximate EST conversion (doesn't handle DST)
+- **Timezone**: Script uses `zoneinfo.ZoneInfo('America/New_York')` for accurate DST handling
 
 ## License
 

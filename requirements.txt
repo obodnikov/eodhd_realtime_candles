@@ -20,6 +20,9 @@ waitress>=2.1.2
 # HTTP client for API communication
 requests>=2.31.0
 
+# Timezone support for Windows compatibility
+tzdata>=2023.3
+
 # No additional dependencies needed - using Python standard library for:
 # - sqlite3 (database)
 # - asyncio (async runtime)
