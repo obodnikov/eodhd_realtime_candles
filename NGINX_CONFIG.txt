@@ -27,6 +27,11 @@ location /eodhd/admin/ {
     sub_filter 'src="/' 'src="/eodhd/admin/';
     sub_filter 'action="/' 'action="/eodhd/admin/';
     sub_filter 'url(/' 'url(/eodhd/admin/';
+
+    # Rewrite fetch() calls in inline JavaScript
+    sub_filter "fetch('/" "fetch('/eodhd/admin/";
+    sub_filter 'fetch("/' 'fetch("/eodhd/admin/';
+
     sub_filter_once off;
     # Note: text/html is already included by default, only add CSS and JS
     sub_filter_types text/css application/javascript;
