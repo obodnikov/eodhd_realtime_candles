@@ -8,9 +8,16 @@ import os
 import sys
 import json
 import requests
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    # Fallback for Python < 3.9 or systems without tzdata
+    raise ImportError(
+        "zoneinfo not available. Please install tzdata: pip install tzdata"
+    )
 
 
 class PremarketVolumeCalculator:
@@ -20,22 +27,24 @@ class PremarketVolumeCalculator:
             raise ValueError("EODHD_API_KEY environment variable is required")
         
         self.base_url = "https://eodhd.com/api/intraday"
-        self.valid_intervals = ["1m", "5m", "1h"]
+        # Only 1m interval provides premarket data (4:00-9:30 AM ET)
+        self.interval = "1m"
+        self.days_back = 90  # Maximum historical data for 1m interval
     
-    def get_timestamps(self, days_back: int = 120) -> tuple:
-        """Generate Unix timestamps for the date range."""
+    def get_timestamps(self) -> tuple:
+        """Generate Unix timestamps for the date range (90 days)."""
         now = datetime.now()
-        from_date = now - timedelta(days=days_back)
+        from_date = now - timedelta(days=self.days_back)
         return int(from_date.timestamp()), int(now.timestamp())
     
-    def fetch_intraday_data(self, ticker: str, interval: str = "1m") -> List[Dict]:
+    def fetch_intraday_data(self, ticker: str) -> List[Dict]:
         """Fetch intraday data from EODHD API."""
         from_unix, to_unix = self.get_timestamps()
         
         params = {
             'api_token': self.api_key,
             'fmt': 'json',
-            'interval': interval,
+            'interval': self.interval,
             'from': from_unix,
             'to': to_unix
         }
@@ -50,27 +59,26 @@ class PremarketVolumeCalculator:
             raise Exception(f"API request failed: {str(e)}")
     
     def is_premarket_time(self, dt: datetime) -> bool:
-        """Check if datetime falls within premarket hours (4:00-9:30 AM ET)."""
+        """Check if datetime falls within premarket hours (4:00-9:30 AM ET).
+        
+        Uses America/New_York timezone to properly handle DST transitions.
+        """
         if dt.tzinfo is None:
             raise ValueError("Datetime must be timezone-aware")
         
-        et = dt.astimezone(ZoneInfo("America/New_York"))
+        # Convert to ET (handles both EST and EDT automatically)
+        et_tz = ZoneInfo("America/New_York")
+        et = dt.astimezone(et_tz)
+        
         minutes = et.hour * 60 + et.minute
         
+        # 4:00 AM = 240 minutes, 9:30 AM = 570 minutes
         return 240 <= minutes < 570
     
-    def calculate_premarket_volume(self, ticker: str, interval: str = "1m") -> Dict:
-        """Calculate average premarket volume for the ticker."""
-        # Validate interval
-        if interval not in self.valid_intervals:
-            return {
-                'ticker': ticker,
-                'error': f'Invalid interval. Supported intervals: {", ".join(self.valid_intervals)}',
-                'status': 'error'
-            }
-        
+    def calculate_premarket_volume(self, ticker: str) -> Dict:
+        """Calculate average premarket volume for the ticker using 1m interval."""
         try:
-            data = self.fetch_intraday_data(ticker, interval)
+            data = self.fetch_intraday_data(ticker)
             
             if not isinstance(data, list) or len(data) == 0:
                 return {
@@ -87,9 +95,11 @@ class PremarketVolumeCalculator:
                 if not item.get('datetime') or not item.get('volume'):
                     continue
                 
-                dt = datetime.fromisoformat(item['datetime'].replace('Z', '+00:00'))
+                # Parse datetime - API returns UTC time without timezone indicator
+                dt = datetime.fromisoformat(item['datetime'])
+                # Always set to UTC since API gmtoffset is 0
                 if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+                    dt = dt.replace(tzinfo=timezone.utc)
                 
                 if self.is_premarket_time(dt):
                     date_key = dt.date().isoformat()
@@ -103,7 +113,7 @@ class PremarketVolumeCalculator:
             if not daily_volumes:
                 return {
                     'ticker': ticker,
-                    'error': 'No premarket data found',
+                    'error': 'No premarket data found. Note: EODHD API only provides premarket data (4:00-9:30 AM ET) for 1-minute intervals. Other intervals (5m, 1h) start at market open (9:30 AM ET).',
                     'status': 'error'
                 }
             
@@ -121,7 +131,6 @@ class PremarketVolumeCalculator:
                 'trading_days_included': trading_days,
                 'date_range': date_range,
                 'average_interval_volume': average_volume_interval,
-                'interval': interval,
                 'status': 'success'
             }
             
@@ -135,16 +144,17 @@ class PremarketVolumeCalculator:
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python premarket_volume.py <TICKER> [INTERVAL]")
-        print("Example: python premarket_volume.py AAPL.US 1m")
+        print("Usage: python premarket_volume.py <TICKER>")
+        print("Example: python premarket_volume.py AAPL.US")
+        print("\nNote: Only 1-minute interval data includes premarket hours (4:00-9:30 AM ET).")
+        print("      Retrieves up to 90 days of historical data.")
         sys.exit(1)
     
     ticker = sys.argv[1]
-    interval = sys.argv[2] if len(sys.argv) > 2 else "1m"
     
     try:
         calculator = PremarketVolumeCalculator()
-        result = calculator.calculate_premarket_volume(ticker, interval)
+        result = calculator.calculate_premarket_volume(ticker)
         print(json.dumps(result, indent=2))
     except Exception as e:
         error_result = {

@@ -8,6 +8,7 @@ Collection of Python utility scripts for managing and analyzing EODHD data.
 
 1. **manage_tickers.py** - Smart ticker management with automatic capacity handling
 2. **premarket_volume.py** - Premarket volume calculator using EODHD API
+3. **premarket_pivots.py** - Premarket pivot point calculator with support/resistance levels
 
 ---
 
@@ -264,24 +265,35 @@ A Python script that calculates the average premarket trading volume for a given
 
 ## Features
 
-- **1-minute interval support**: Uses EODHD's 1-minute data (120-day history)
+- **1-minute interval only**: Uses EODHD's 1-minute data (up to 90 days of history)
 - **Premarket focus**: Only counts volume during 4:00 AM - 9:30 AM ET
+- **Maximum data retrieval**: Fetches up to 90 days of premarket data
 - **Environment-based API key**: Secure API key management via environment variables
 - **Command-line interface**: Simple CLI for quick calculations
 - **JSON output**: Structured response format
 - **Error handling**: Comprehensive error handling for API issues
 
+## Important Note
+
+**EODHD API Limitation**: Only 1-minute interval data includes premarket hours (4:00-9:30 AM ET). Other intervals (5m, 1h) start at market open (9:30 AM ET) and do not contain premarket data.
+
 ## Prerequisites
 
-- Python 3.6+
+- Python 3.9+ (for zoneinfo support)
 - `requests` library
+- `tzdata` library (for Windows timezone support)
 - EODHD API key
 
 ## Installation
 
 1. **Install dependencies**:
 ```bash
-pip install requests
+pip install requests tzdata
+```
+
+Or install from requirements.txt:
+```bash
+pip install -r requirements.txt
 ```
 
 2. **Set environment variable**:
@@ -300,25 +312,25 @@ source ~/.bashrc
 ### Command Line
 
 ```bash
-python premarket_volume.py <TICKER> [INTERVAL]
+python premarket_volume.py <TICKER>
 ```
 
 **Parameters**:
 - `TICKER` (required): Stock symbol with exchange (e.g., "AAPL.US", "MSFT.US")
-- `INTERVAL` (optional): Data interval, defaults to "1m"
-  - Supported: "1m", "5m", "1h"
+
+**Note**: The script automatically uses 1-minute intervals and retrieves up to 90 days of data.
 
 ### Examples
 
 ```bash
-# Basic usage with 1-minute intervals
+# Calculate premarket volume for Apple
 python premarket_volume.py AAPL.US
 
-# With specific interval
-python premarket_volume.py AAPL.US 5m
+# Calculate for Microsoft
+python premarket_volume.py MSFT.US
 
-# Different stock
-python premarket_volume.py MSFT.US 1m
+# Calculate for Tesla
+python premarket_volume.py TSLA.US
 ```
 
 ### Python Module Usage
@@ -329,8 +341,8 @@ from premarket_volume import PremarketVolumeCalculator
 # Initialize calculator
 calculator = PremarketVolumeCalculator()
 
-# Calculate premarket volume
-result = calculator.calculate_premarket_volume("AAPL.US", "1m")
+# Calculate premarket volume (automatically uses 1m interval, 90 days)
+result = calculator.calculate_premarket_volume("AAPL.US")
 print(result)
 ```
 
@@ -340,10 +352,10 @@ print(result)
 ```json
 {
   "ticker": "AAPL.US",
-  "average_premarket_volume": 12345678,
-  "trading_days_included": 85,
-  "date_range": "2025-09-15 to 2026-01-08",
-  "interval": "1m",
+  "average_premarket_volume": 590837,
+  "trading_days_included": 18,
+  "date_range": "2025-12-22 to 2026-01-16",
+  "average_interval_volume": 1837,
   "status": "success"
 }
 ```
@@ -360,16 +372,19 @@ print(result)
 ## EODHD API Details
 
 ### Data Availability
-- **1-minute data**: Last 120 days
-- **5-minute data**: Last 600 days  
-- **1-hour data**: Last 7200 days
+- **1-minute data**: Up to 120 days of historical data
+- **Premarket data**: Only available in 1-minute intervals
+- **Script retrieves**: Up to 90 days to maximize premarket data points
+
+### Premarket Data Limitation
+**Important**: EODHD API only provides premarket hours (4:00-9:30 AM ET) in 1-minute interval data. Other intervals (5m, 1h) start at market open (9:30 AM ET) and do not include premarket trading.
 
 ### Ticker Format
 - US stocks: `SYMBOL.US` (e.g., `AAPL.US`, `MSFT.US`)
 - Other exchanges: `SYMBOL.EXCHANGE` (e.g., `AAPL.MX`)
 
 ### API Consumption
-- 5 API calls per request
+- Single API call per request
 - Check your plan limits at [EODHD pricing](https://eodhd.com/pricing)
 
 ## Configuration
@@ -381,17 +396,11 @@ print(result)
 | `EODHD_API_KEY` | Yes | Your EODHD API key |
 
 ### Premarket Hours
-The script uses **4:00 AM - 9:30 AM ET** as premarket hours. To modify:
+The script uses **4:00 AM - 9:30 AM ET** as premarket hours with proper DST handling via `zoneinfo.ZoneInfo('America/New_York')`. This automatically adjusts for:
+- **EST (Eastern Standard Time)**: UTC-5 (November - March)
+- **EDT (Eastern Daylight Time)**: UTC-4 (March - November)
 
-```python
-def is_premarket_time(self, dt: datetime) -> bool:
-    et_hour = dt.hour - 5  # EST offset
-    et_time_minutes = et_hour * 60 + dt.minute
-    
-    # Modify these values:
-    # Current: 4:00 AM (240 min) to 9:30 AM (570 min) ET
-    return 240 <= et_time_minutes < 570
-```
+No manual adjustment needed for DST transitions.
 
 ## Error Handling
 
@@ -411,25 +420,29 @@ def is_premarket_time(self, dt: datetime) -> bool:
 
 **"No premarket data found"**
 - Stock may not have premarket trading
-- Try different interval or date range
+- Verify ticker is correct and actively traded
+- Note: Only 1-minute data includes premarket hours
 
 ## Class Structure
 
 ### PremarketVolumeCalculator
 
 **Methods**:
-- `__init__()`: Initialize with API key from environment
-- `get_timestamps(days_back=120)`: Generate Unix timestamps for date range
-- `fetch_intraday_data(ticker, interval)`: Fetch data from EODHD API
-- `is_premarket_time(dt)`: Check if datetime is in premarket hours
-- `calculate_premarket_volume(ticker, interval)`: Main calculation method
+- `__init__()`: Initialize with API key from environment (sets 1m interval, 90 days)
+- `get_timestamps()`: Generate Unix timestamps for 90-day range
+- `fetch_intraday_data(ticker)`: Fetch 1m data from EODHD API
+- `is_premarket_time(dt)`: Check if datetime is in premarket hours (4:00-9:30 AM ET)
+- `calculate_premarket_volume(ticker)`: Main calculation method
 
 ## Customization Examples
 
 ### Different Time Range
 ```python
-# Get last 60 days instead of 120
-from_unix, to_unix = calculator.get_timestamps(days_back=60)
+# Modify days_back in __init__ method
+class PremarketVolumeCalculator:
+    def __init__(self):
+        # ...
+        self.days_back = 60  # Change from 90 to 60 days
 ```
 
 ### Custom Time Zone Handling
@@ -458,6 +471,23 @@ print(json.dumps(results, indent=2))
 
 ## Testing
 
+### Run Unit Tests
+```bash
+# Run all tests
+python -m pytest tests/test_premarket_volume.py -v
+
+# Or using unittest
+python tests/test_premarket_volume.py
+```
+
+### Test Coverage
+The test suite covers:
+- Premarket time detection (EST and EDT)
+- DST transition handling
+- Volume calculation logic
+- API error handling
+- Edge cases (missing data, invalid tickers)
+
 ### Test with Demo API Key
 EODHD provides a demo API key for testing:
 
@@ -477,10 +507,346 @@ python premarket_volume.py AAPL.US | jq '.status'
 
 ## Performance Notes
 
-- **1-minute intervals**: More precise but limited to 120 days
-- **5-minute intervals**: Good balance of precision and history (600 days)
+- **1-minute intervals**: Only interval with premarket data (4:00-9:30 AM ET)
+- **90-day window**: Maximizes premarket data points while staying within API limits
 - **API limits**: Consider caching results for repeated queries
-- **Timezone**: Script uses approximate EST conversion (doesn't handle DST)
+- **Timezone**: Script uses `zoneinfo.ZoneInfo('America/New_York')` for accurate DST handling
+
+## License
+
+This script is provided as-is for educational and commercial use.
+
+
+---
+
+# 3. Premarket Pivot Points Calculator
+
+**File**: `premarket_pivots.py`
+
+A comprehensive trading analysis script that calculates pivot points (support and resistance levels) using both historical and premarket data. Combines data from Yahoo Finance and your EODHD Real-Time Candles API for complete market analysis.
+
+## Features
+
+- **Dual data sources**: Yahoo Finance (historical/premarket) + EODHD API (real-time)
+- **Pivot point methods**: Classic and Fibonacci pivot calculations
+- **Premarket analysis**: Optional premarket OHLC data integration
+- **Real-time prices**: Current prices from EODHD WebSocket feed
+- **Smart fallbacks**: Graceful handling of missing data
+- **Warning system**: Clear messages for tickers not tracked in EODHD
+- **Formatted output**: Human-readable tables with tabulate or pandas
+
+## Prerequisites
+
+- Python 3.9+
+- `yfinance` library
+- `pandas` library
+- `requests` library
+- `tabulate` library (optional, for better formatting)
+- Running EODHD Real-Time Candles API
+- Valid API_KEY configured
+
+## Installation
+
+Dependencies are already in `requirements.txt`:
+```bash
+pip install -r requirements.txt
+```
+
+## Usage
+
+### Basic Usage
+
+```bash
+# Calculate pivot points for tickers (using previous day data)
+python scripts/premarket_pivots.py --tickers AAPL MSFT TSLA
+
+# Use premarket data for pivot calculations
+python scripts/premarket_pivots.py --premarket --tickers AAPL MSFT
+
+# Use Fibonacci pivots instead of classic
+python scripts/premarket_pivots.py --premarket --method fib --tickers AAPL
+
+# Use New York timezone for date calculations
+python scripts/premarket_pivots.py --premarket --ny-time --tickers AAPL
+```
+
+### Command-Line Options
+
+| Option | Description |
+|--------|-------------|
+| `--tickers` | List of ticker symbols (required) |
+| `--premarket` | Use premarket data for pivot calculations (optional) |
+| `--method` | Pivot method: `classic` or `fib` (default: classic) |
+| `--ny-time` | Use NY timezone for date calculations (optional) |
+
+## Output Format
+
+### Standard Output
+
+```
+ticker interval current_price  candle_count  prev_high  prev_low  prev_close  avg_3m_volume  pm_high  pm_low  pm_close  pm_volume      P     R1     S1     R2     S2    R3     S3
+AAPL   5m       252.30         342           251.88     251.01    251.62      15234567.0     253.88   251.01  252.30    0.0        252.26 253.51 251.01 254.76 249.76 256.01 248.51
+TSLA   5m       425.90         289           424.87     421.72    424.00      8765432.0      437.50   421.72  426.00    0.0        428.41 435.10 421.72 441.79 415.03 448.48 408.34
+```
+
+### Column Descriptions
+
+**Ticker Info:**
+- `ticker`: Stock symbol
+- `interval`: Candle interval from EODHD (e.g., "5m")
+- `current_price`: Real-time price from EODHD API
+- `candle_count`: Number of candles received from EODHD
+
+**Previous Day Data (from Yahoo Finance):**
+- `prev_high`: Previous session high
+- `prev_low`: Previous session low
+- `prev_close`: Previous session close
+- `avg_3m_volume`: Average volume over 60 days (~3 months)
+
+**Premarket Data (if --premarket flag used):**
+- `pm_high`: Premarket high (4:00-9:29 AM ET)
+- `pm_low`: Premarket low
+- `pm_close`: Premarket close (last price before 9:30 AM)
+- `pm_volume`: Premarket volume (may be 0 in free feeds)
+
+**Pivot Levels:**
+- `P`: Central pivot point
+- `R1`, `R2`, `R3`: Resistance levels (where price may struggle to break above)
+- `S1`, `S2`, `S3`: Support levels (where price may find buying interest)
+
+## Pivot Point Formulas
+
+### Classic Pivots (default)
+
+```
+P = (High + Low + Close) / 3
+R1 = 2*P - Low
+S1 = 2*P - High
+R2 = P + (High - Low)
+S2 = P - (High - Low)
+R3 = High + 2*(P - Low)
+S3 = Low - 2*(High - P)
+```
+
+### Fibonacci Pivots (--method fib)
+
+```
+P = (High + Low + Close) / 3
+R1 = P + 0.382 * (High - Low)
+S1 = P - 0.382 * (High - Low)
+R2 = P + 0.618 * (High - Low)
+S2 = P - 0.618 * (High - Low)
+R3 = P + (High - Low)
+S3 = P - (High - Low)
+```
+
+## Data Sources
+
+### Yahoo Finance (yfinance)
+- **Historical data**: 30 days of daily OHLC
+- **Premarket data**: 1-minute bars from 4:00-9:29 AM ET
+- **Average volume**: Calculated from 60-day history
+- **Delay**: < 3 seconds (near real-time for NASDAQ stocks)
+
+### EODHD API (via NGINX proxy)
+- **Real-time prices**: From WebSocket feed (< 50ms latency)
+- **Candle counts**: Number of candles received
+- **Interval**: Global candle interval setting
+- **Endpoint**: `https://n8n.sqowe.com/eodhd/tickers`
+
+## Error Handling
+
+### Missing Tickers Warning
+
+If a ticker is not tracked in EODHD, you'll see:
+
+```
+================================================================================
+[WARNING] The following tickers are NOT tracked in EODHD system:
+  • SNDK
+
+To add these tickers, use:
+  python scripts/manage_tickers.py SNDK
+
+Or with force flag to auto-remove old tickers if capacity reached:
+  python scripts/manage_tickers.py --force SNDK
+================================================================================
+```
+
+### Smart Fallbacks
+
+The script handles missing data gracefully:
+
+1. **interval = None**: Uses global config from `/config` endpoint
+2. **current_price = None**: Tries latest candle → premarket close → previous close
+3. **candle_count = 0**: Shows warning with instructions to add ticker
+
+### API Unavailable
+
+If EODHD API is unavailable:
+```
+[WARN] n8n unavailable: Connection refused
+```
+
+Script continues with Yahoo Finance data only (no real-time prices).
+
+## Use Cases
+
+### 1. Pre-Market Trading Preparation
+
+```bash
+# Get premarket pivot levels before market open
+python scripts/premarket_pivots.py --premarket --ny-time --tickers AAPL TSLA NVDA
+```
+
+**Use for:**
+- Identifying key support/resistance levels
+- Planning entry/exit points
+- Setting stop-loss orders
+
+### 2. Day Trading Setup
+
+```bash
+# Get current levels with real-time prices
+python scripts/premarket_pivots.py --tickers AAPL MSFT GOOGL
+```
+
+**Use for:**
+- Monitoring price relative to pivot levels
+- Identifying breakout/breakdown opportunities
+- Confirming trend direction
+
+### 3. Multi-Ticker Analysis
+
+```bash
+# Analyze multiple tickers at once
+python scripts/premarket_pivots.py --premarket --tickers AAPL MSFT GOOGL TSLA NVDA AMD AMZN META
+```
+
+**Use for:**
+- Comparing relative strength across stocks
+- Finding best trading opportunities
+- Portfolio-wide analysis
+
+### 4. Fibonacci Pivot Strategy
+
+```bash
+# Use Fibonacci retracement levels
+python scripts/premarket_pivots.py --premarket --method fib --tickers SPY QQQ
+```
+
+**Use for:**
+- Fibonacci-based trading strategies
+- More precise support/resistance levels
+- Advanced technical analysis
+
+## Configuration
+
+### Environment Variables
+
+The script uses the EODHD API through NGINX proxy. Configuration is in the script:
+
+```python
+N8N_EODHD_API_KEY = "your_api_key_here"
+N8N_EODHD_TICKERS_URL = "https://n8n.sqowe.com/eodhd/tickers"
+```
+
+### NGINX Proxy
+
+The script accesses your EODHD API via NGINX reverse proxy:
+- `https://n8n.sqowe.com/eodhd/*` → `http://172.28.0.200:8765/*`
+
+## Examples
+
+### Example 1: Basic Pivot Analysis
+
+```bash
+python scripts/premarket_pivots.py --tickers AAPL
+```
+
+**Output:**
+```
+ticker interval current_price  candle_count  prev_high  prev_low  prev_close  ...  P      R1     S1
+AAPL   5m       252.30         342           251.88     251.01    251.62      ...  251.50 252.00 251.00
+```
+
+### Example 2: Premarket with Multiple Tickers
+
+```bash
+python scripts/premarket_pivots.py --premarket --tickers AAPL TSLA NVDA
+```
+
+**Output includes premarket columns:**
+```
+ticker  ...  pm_high  pm_low  pm_close  pm_volume  P      R1     S1
+AAPL    ...  253.88   251.01  252.30    0.0        252.40 253.79 250.01
+TSLA    ...  437.50   421.72  426.00    0.0        428.41 435.10 421.72
+NVDA    ...  145.20   142.50  144.80    0.0        144.17 145.84 142.50
+```
+
+### Example 3: Fibonacci Pivots
+
+```bash
+python scripts/premarket_pivots.py --premarket --method fib --tickers SPY
+```
+
+**Output uses Fibonacci ratios:**
+```
+ticker  ...  P      R1     S1     R2     S2
+SPY     ...  450.50 451.62 449.38 452.29 448.71
+```
+
+## Trading Interpretation
+
+### Bullish Signals
+- Price above pivot point (P)
+- Breaking above R1 with volume
+- Holding above S1 on pullbacks
+
+### Bearish Signals
+- Price below pivot point (P)
+- Breaking below S1 with volume
+- Rejecting at R1 resistance
+
+### Key Levels
+- **P (Pivot)**: Trend indicator - above = bullish, below = bearish
+- **R1/S1**: First targets for breakouts/breakdowns
+- **R2/S2**: Strong resistance/support zones
+- **R3/S3**: Extreme levels, rarely reached
+
+## Performance Notes
+
+- **Yahoo Finance**: < 3 seconds delay for premarket data
+- **EODHD API**: < 50ms latency for real-time prices
+- **Script execution**: ~2-5 seconds for 5-10 tickers
+- **API calls**: 1 config call + 1 ticker call + N candle calls (only if needed)
+
+## Troubleshooting
+
+### "No tickers provided"
+- Add `--tickers` flag with at least one ticker
+
+### "n8n unavailable"
+- Check EODHD API is running: `docker ps`
+- Verify NGINX proxy is configured
+- Check API_KEY is correct
+
+### "No data returned or invalid ticker"
+- Verify ticker format (no exchange suffix needed)
+- Check ticker exists and is actively traded
+- Try with a known ticker like AAPL
+
+### Missing premarket data
+- Premarket data only available during/after premarket hours (4:00-9:30 AM ET)
+- Some tickers may not have premarket trading
+- Yahoo Finance free feed may have limitations
+
+## Related Scripts
+
+- **manage_tickers.py**: Add/remove tickers from EODHD system
+- **premarket_volume.py**: Calculate premarket volume statistics
+- **test_yfinance_premarket.py**: Test premarket data fetching
+- **test_yfinance_delay.py**: Measure data delay
 
 ## License
 

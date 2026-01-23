@@ -91,3 +91,4 @@ package-lock.json
 
 #AmazonQ exceptions
 .amazonq/
+.code_review/

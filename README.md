@@ -1,4 +1,4 @@
-# EODHD Real-Time Candle Aggregator v0.4.2
+# EODHD Real-Time Candle Aggregator v0.4.3
 
 > **Converts EODHD WebSocket tick data into configurable OHLCV candles with full REST API management**
 
@@ -386,7 +386,15 @@ docker-compose up -d
 
 ## Changelog
 
-### v0.4.3 (2025-12-26)
+### v0.4.3 (2026-01-20)
+- **Premarket Volume Script Enhancement**: Updated `scripts/premarket_volume.py`
+  - Removed interval parameter (now hardcoded to 1m - only interval with premarket data)
+  - Increased data retrieval from 30 to 90 days for maximum premarket data points
+  - Improved error messages explaining EODHD API premarket data limitations
+  - Updated documentation to clarify that only 1-minute intervals include premarket hours (4:00-9:30 AM ET)
+  - Simplified CLI usage: `python premarket_volume.py AAPL.US` (no interval parameter needed)
+
+### v0.4.2 (2025-12-26)
 - **Bug Fix**: Fixed `delete_all_tickers()` to consistently delete candle data
   - **⚠️ BREAKING CHANGE**: `DELETE /tickers?confirm=true` now deletes candles (previously preserved them)
   - This brings batch ticker deletion in line with single ticker deletion behavior
