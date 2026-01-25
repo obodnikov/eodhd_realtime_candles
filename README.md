@@ -147,6 +147,7 @@ All endpoints except `/health` require authentication via one of:
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `GET` | `/tickers` | List all tracked tickers |
+| `GET` | `/tickers/{ticker}` | Get single ticker information |
 | `POST` | `/tickers` | Add ticker(s) |
 | `DELETE` | `/tickers/{ticker}` | Remove single ticker **and its candles** |
 | `DELETE` | `/tickers` (with body) | Remove multiple tickers **and their candles** |
@@ -156,6 +157,9 @@ All endpoints except `/health` require authentication via one of:
 ```bash
 # List tickers
 curl -H "X-API-Key: xxx" http://localhost:8765/tickers
+
+# Get single ticker info
+curl -H "X-API-Key: xxx" http://localhost:8765/tickers/AAPL
 
 # Add tickers
 curl -X POST -H "X-API-Key: xxx" -H "Content-Type: application/json" \
