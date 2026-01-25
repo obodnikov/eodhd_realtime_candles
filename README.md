@@ -1,4 +1,4 @@
-# EODHD Real-Time Candle Aggregator v0.4.3
+# EODHD Real-Time Candle Aggregator v0.4.4
 
 > **Converts EODHD WebSocket tick data into configurable OHLCV candles with full REST API management**
 
