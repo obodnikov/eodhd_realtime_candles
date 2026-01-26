@@ -1,7 +1,7 @@
 # ARCHITECTURE.md
 
-**Version**: 0.4.4
-**Last Updated**: 2026-01-25
+**Version**: 0.4.5
+**Last Updated**: 2026-01-26
 **Project**: EODHD Real-Time Candle Aggregator
 
 ---
@@ -87,6 +87,7 @@ eodhd_realtime_candles/
 │   ├── config.py                 # Configuration management + persistence
 │   ├── storage.py                # SQLite database layer (WAL mode)
 │   ├── candle_engine.py          # Tick → OHLCV aggregation logic
+│   ├── candle_aggregator.py      # On-demand candle interval aggregation
 │   ├── websocket_manager.py      # EODHD WebSocket client
 │   ├── api/                      # REST API layer
 │   │   ├── routes.py             # All HTTP endpoints
@@ -99,9 +100,10 @@ eodhd_realtime_candles/
 │       └── static/               # CSS, JS, images (sqowe branding)
 │
 ├── tests/                        # pytest test suite
-│   ├── test_storage_cleanup.py  # Database cleanup tests
-│   ├── test_candle_engine.py    # Aggregation logic tests
-│   └── test_api_cleanup.py      # API endpoint tests
+│   ├── test_storage_cleanup.py   # Database cleanup tests
+│   ├── test_candle_engine.py     # Aggregation logic tests
+│   ├── test_candle_aggregator.py # Interval aggregation tests
+│   └── test_api_cleanup.py       # API endpoint tests
 │
 ├── docs/                         # Documentation (NOT in root)
 │   ├── chats/                    # Conversation history (context for AI)
@@ -172,9 +174,10 @@ eodhd_realtime_candles/
 | Component | File | Responsibility | Status |
 |-----------|------|----------------|--------|
 | **CandleEngine** | `candle_engine.py` | Tick aggregation into OHLCV candles | ✅ Stable |
+| **CandleAggregator** | `candle_aggregator.py` | On-demand interval aggregation | ✅ Stable |
 | **Storage** | `storage.py` | SQLite operations (WAL mode, thread-local) | ✅ Stable |
 | **WebSocketManager** | `websocket_manager.py` | EODHD feed connection + reconnection | ✅ Stable |
-| **APIRoutes** | `api/routes.py` | REST endpoints (19 routes) | 🔄 Semi-Stable |
+| **APIRoutes** | `api/routes.py` | REST endpoints (20 routes) | 🔄 Semi-Stable |
 | **ConfigManager** | `config.py` | Runtime config with persistence | ✅ Stable |
 
 **Key Endpoints:**
@@ -183,6 +186,7 @@ eodhd_realtime_candles/
 - `/tickers` - Add/remove/list tracked symbols
 - `/tickers/{ticker}` - Get single ticker information (v0.4.4)
 - `/candles/{ticker}` - Query OHLCV data
+- `/candles/{ticker}/{minutes}` - Aggregated candles at custom interval (v0.4.5)
 - `/candles/cleanup` - Remove orphaned candles (v0.4.3)
 - `/config` - Runtime configuration management
 
@@ -344,6 +348,7 @@ Map of components to stability levels:
 |-----------|--------|-------------|-------|
 | **Core Engine** | | | |
 | `candle_engine.py` | ✅ Stable | LOW | Aggregation logic is production-tested |
+| `candle_aggregator.py` | ✅ Stable | LOW | On-demand interval aggregation (v0.4.5) |
 | `storage.py` | ✅ Stable | LOW | SQLite layer with WAL mode optimizations |
 | `websocket_manager.py` | ✅ Stable | LOW | Reconnection logic is reliable |
 | **API Layer** | | | |
@@ -363,7 +368,7 @@ Map of components to stability levels:
 | `supervisord.conf` | ✅ Stable | LOW | Process management is stable |
 | **Planned Features** | | | |
 | Prometheus metrics | 🔮 Planned | N/A | See ROADMAP.md v1.1 |
-| Multi-interval support | 🔮 Planned | N/A | See ROADMAP.md v2.0 |
+| Multi-interval support | ✅ Implemented | LOW | v0.4.5 - GET /candles/{ticker}/{minutes} |
 | Technical indicators | 🔮 Planned | N/A | See ROADMAP.md v2.0 |
 
 **DO NOT CHANGE without explicit approval:**
