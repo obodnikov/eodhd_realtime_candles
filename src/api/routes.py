@@ -41,6 +41,7 @@ class APIRoutes:
         
         # Ticker Management
         self.app.router.add_get('/tickers', self.list_tickers)
+        self.app.router.add_get('/tickers/{ticker}', self.get_ticker)
         self.app.router.add_post('/tickers', self.add_tickers)
         self.app.router.add_delete('/tickers/{ticker}', self.remove_ticker)
         self.app.router.add_delete('/tickers', self.remove_tickers)
@@ -179,7 +180,7 @@ class APIRoutes:
         """GET /tickers - List all tracked tickers."""
         tickers = self.storage.get_tickers()
         max_tickers = self.config_manager.config.max_tickers
-        
+
         return web.json_response({
             'count': len(tickers),
             'max_allowed': max_tickers,
@@ -187,7 +188,25 @@ class APIRoutes:
             'tickers': [t.to_dict() for t in tickers],
             'timestamp': datetime.now(timezone.utc).isoformat()
         })
-    
+
+    async def get_ticker(self, request: web.Request) -> web.Response:
+        """GET /tickers/{ticker} - Get single ticker information."""
+        ticker = request.match_info['ticker'].upper()
+
+        if not self.storage.ticker_exists(ticker):
+            return web.json_response(
+                {'error': f'Ticker not found: {ticker}'},
+                status=404
+            )
+
+        # Get ticker info from storage
+        ticker_info = self.storage.get_ticker(ticker)
+
+        return web.json_response({
+            'ticker': ticker_info.to_dict(),
+            'timestamp': datetime.now(timezone.utc).isoformat()
+        })
+
     async def add_tickers(self, request: web.Request) -> web.Response:
         """POST /tickers - Add ticker(s) to track."""
         try:

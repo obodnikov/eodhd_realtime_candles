@@ -277,7 +277,41 @@ class Storage:
         cursor = conn.cursor()
         cursor.execute('SELECT 1 FROM tickers WHERE symbol = ?', (symbol.upper(),))
         return cursor.fetchone() is not None
-    
+
+    def get_ticker(self, symbol: str) -> Optional[TrackedTicker]:
+        """Get single ticker with metadata."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            SELECT
+                t.symbol,
+                t.added_at,
+                t.status,
+                t.last_tick_at,
+                t.last_price,
+                t.last_candle_request_at,
+                COUNT(c.id) as candle_count
+            FROM tickers t
+            LEFT JOIN candles c ON t.symbol = c.ticker AND c.is_complete = 1
+            WHERE t.symbol = ?
+            GROUP BY t.symbol
+        ''', (symbol.upper(),))
+
+        row = cursor.fetchone()
+        if not row:
+            return None
+
+        return TrackedTicker(
+            symbol=row['symbol'],
+            added_at=row['added_at'],
+            status=row['status'],
+            last_tick_at=row['last_tick_at'],
+            last_price=row['last_price'],
+            candle_count=row['candle_count'],
+            last_candle_request_at=row['last_candle_request_at']
+        )
+
     def get_ticker_count(self) -> int:
         """Get count of tracked tickers."""
         conn = self._get_connection()

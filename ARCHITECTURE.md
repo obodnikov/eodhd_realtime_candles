@@ -1,7 +1,7 @@
 # ARCHITECTURE.md
 
-**Version**: 0.4.2 (pending 0.4.3)  
-**Last Updated**: 2025-12-26  
+**Version**: 0.4.4
+**Last Updated**: 2026-01-25
 **Project**: EODHD Real-Time Candle Aggregator
 
 ---
@@ -174,13 +174,14 @@ eodhd_realtime_candles/
 | **CandleEngine** | `candle_engine.py` | Tick aggregation into OHLCV candles | ✅ Stable |
 | **Storage** | `storage.py` | SQLite operations (WAL mode, thread-local) | ✅ Stable |
 | **WebSocketManager** | `websocket_manager.py` | EODHD feed connection + reconnection | ✅ Stable |
-| **APIRoutes** | `api/routes.py` | REST endpoints (18 routes) | 🔄 Semi-Stable |
+| **APIRoutes** | `api/routes.py` | REST endpoints (19 routes) | 🔄 Semi-Stable |
 | **ConfigManager** | `config.py` | Runtime config with persistence | ✅ Stable |
 
 **Key Endpoints:**
 - `/health` - No auth, no DB access (per AI_SQLite.md rule)
 - `/status` - Cached stats (5s TTL to prevent DB blocking)
 - `/tickers` - Add/remove/list tracked symbols
+- `/tickers/{ticker}` - Get single ticker information (v0.4.4)
 - `/candles/{ticker}` - Query OHLCV data
 - `/candles/cleanup` - Remove orphaned candles (v0.4.3)
 - `/config` - Runtime configuration management
