@@ -318,6 +318,91 @@ class Storage:
         cursor = conn.cursor()
         cursor.execute('SELECT COUNT(*) FROM tickers')
         return cursor.fetchone()[0]
+
+    def get_ticker_intervals(self, ticker: str) -> List[int]:
+        """
+        Get unique interval_minutes values for a ticker's completed candles.
+        
+        Returns sorted list of intervals (ascending).
+        Used to determine valid aggregation options.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT DISTINCT interval_minutes
+            FROM candles
+            WHERE ticker = ? AND is_complete = 1
+            ORDER BY interval_minutes ASC
+        ''', (ticker.upper(),))
+        return [row[0] for row in cursor.fetchall()]
+
+    def get_candles_for_aggregation(
+        self,
+        ticker: str,
+        base_interval: int,
+        count: Optional[int] = None,
+        from_timestamp: Optional[int] = None,
+        to_timestamp: Optional[int] = None
+    ) -> List['Candle']:
+        """
+        Get completed candles for aggregation.
+        
+        Only returns completed candles with the specified base interval.
+        Results are sorted by timestamp ASC for proper aggregation.
+        
+        Args:
+            ticker: Ticker symbol
+            base_interval: Base interval to filter by
+            count: Max number of BASE candles to fetch (before aggregation)
+            from_timestamp: Optional start timestamp filter
+            to_timestamp: Optional end timestamp filter
+            
+        Returns:
+            List of Candle objects sorted by timestamp ASC
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        query = '''
+            SELECT * FROM candles
+            WHERE ticker = ? AND is_complete = 1 AND interval_minutes = ?
+        '''
+        params: List[Any] = [ticker.upper(), base_interval]
+
+        if from_timestamp:
+            query += ' AND timestamp >= ?'
+            params.append(from_timestamp)
+
+        if to_timestamp:
+            query += ' AND timestamp <= ?'
+            params.append(to_timestamp)
+
+        query += ' ORDER BY timestamp DESC'
+
+        if count:
+            query += ' LIMIT ?'
+            params.append(count)
+
+        cursor.execute(query, params)
+
+        candles = []
+        for row in cursor.fetchall():
+            candles.append(Candle(
+                ticker=row['ticker'],
+                timestamp=row['timestamp'],
+                datetime_utc=row['datetime_utc'],
+                open=row['open'],
+                high=row['high'],
+                low=row['low'],
+                close=row['close'],
+                volume=row['volume'],
+                tick_count=row['tick_count'],
+                is_complete=bool(row['is_complete']),
+                interval_minutes=row['interval_minutes']
+            ))
+
+        # Return in chronological order for aggregation
+        return list(reversed(candles))
     
     def update_ticker_last_request(self, symbol: str):
         """Update last candle request timestamp for a ticker."""
