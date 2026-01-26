@@ -1,4 +1,4 @@
-# EODHD Real-Time Candle Aggregator v0.4.4
+# EODHD Real-Time Candle Aggregator v0.4.5
 
 > **Converts EODHD WebSocket tick data into configurable OHLCV candles with full REST API management**
 
@@ -195,10 +195,93 @@ curl -X DELETE -H "X-API-Key: xxx" \
 | `GET` | `/candles/all` | Get candles for ALL tracked tickers (requires confirmation) |
 | `GET` | `/candles/{ticker}` | Get candles for ticker |
 | `GET` | `/candles/{ticker}/latest` | Get current incomplete candle |
+| `GET` | `/candles/{ticker}/{minutes}` | Get aggregated candles at custom interval |
 | `POST` | `/candles/multi` | Get candles for multiple tickers |
 | `DELETE` | `/candles/{ticker}` | Clear ticker's candle history |
 | `DELETE` | `/candles` | Clear all candle history |
 | `POST` | `/candles/cleanup` | Remove orphaned candles (for tickers no longer tracked) |
+
+**Aggregated Candles Endpoint (`/candles/{ticker}/{minutes}`):**
+
+Aggregates stored candles into larger intervals on-the-fly.
+
+**Rules:**
+- Requested interval must be >= largest stored interval for the ticker
+- Requested interval must be divisible by largest stored interval
+- Only completed candles are used (no incomplete/current candles)
+- Gaps in data are tracked with `has_gaps` flag
+
+**Query Parameters:**
+- `count` - Number of aggregated candles to return (default: 10)
+- `from_timestamp` - Filter by start time (Unix timestamp)
+- `to_timestamp` - Filter by end time (Unix timestamp)
+
+**Example Request:**
+```bash
+# Get 15-minute candles (aggregated from 5-minute base)
+curl -H "X-API-Key: your-api-key" \
+  "http://localhost:8765/candles/AAPL/15?count=10"
+```
+
+**Example Response:**
+```json
+{
+  "ticker": "AAPL",
+  "requested_interval": "15m",
+  "base_interval": "5m",
+  "aggregation_factor": 3,
+  "count": 10,
+  "candles": [
+    {
+      "ticker": "AAPL",
+      "timestamp": 1733752500,
+      "datetime_utc": "2025-12-09 14:15:00 UTC",
+      "open": 245.50,
+      "high": 246.80,
+      "low": 245.10,
+      "close": 246.20,
+      "volume": 375000,
+      "tick_count": 1026,
+      "interval_minutes": 15,
+      "expected_candles": 3,
+      "actual_candles": 3,
+      "has_gaps": false
+    },
+    {
+      "ticker": "AAPL",
+      "timestamp": 1733751600,
+      "datetime_utc": "2025-12-09 14:00:00 UTC",
+      "open": 244.80,
+      "high": 245.60,
+      "low": 244.50,
+      "close": 245.50,
+      "volume": 280000,
+      "tick_count": 812,
+      "interval_minutes": 15,
+      "expected_candles": 3,
+      "actual_candles": 2,
+      "has_gaps": true
+    }
+  ],
+  "timestamp": "2025-12-09T14:30:00.000Z"
+}
+```
+
+**Validation Error Example:**
+```bash
+# Request 12-minute candles when base is 5 minutes (invalid: 12 % 5 != 0)
+curl -H "X-API-Key: your-api-key" \
+  "http://localhost:8765/candles/AAPL/12"
+```
+```json
+{
+  "error": "Invalid aggregation request",
+  "detail": "Requested interval (12m) is not divisible by largest stored interval (5m). Valid options: [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60]",
+  "ticker": "AAPL",
+  "stored_intervals": [5],
+  "requested_minutes": 12
+}
+```
 
 **Cleanup Endpoint Details:**
 
@@ -357,6 +440,7 @@ eodhd_realtime_candles/
 │   ├── config.py            # Configuration
 │   ├── storage.py           # SQLite database
 │   ├── candle_engine.py     # Aggregation logic
+│   ├── candle_aggregator.py # On-demand candle aggregation
 │   ├── websocket_manager.py # EODHD WebSocket
 │   └── api/
 │       ├── __init__.py

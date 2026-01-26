@@ -48,8 +48,9 @@ class APIRoutes:
         
         # Candle Data
         self.app.router.add_get('/candles/all', self.get_all_candles)
-        self.app.router.add_get('/candles/{ticker}', self.get_candles)
         self.app.router.add_get('/candles/{ticker}/latest', self.get_latest_candle)
+        self.app.router.add_get('/candles/{ticker}/{minutes}', self.get_aggregated_candles)
+        self.app.router.add_get('/candles/{ticker}', self.get_candles)
         self.app.router.add_post('/candles/multi', self.get_multi_candles)
         self.app.router.add_delete('/candles/{ticker}', self.clear_ticker_candles)
         self.app.router.add_delete('/candles', self.clear_all_candles)
@@ -511,6 +512,143 @@ class APIRoutes:
         return web.json_response({
             'ticker': ticker,
             'candle': candle,
+            'timestamp': datetime.now(timezone.utc).isoformat()
+        })
+
+    async def get_aggregated_candles(self, request: web.Request) -> web.Response:
+        """
+        GET /candles/{ticker}/{minutes} - Get aggregated candles.
+        
+        Aggregates stored candles into larger intervals.
+        
+        Rules:
+        - Requested interval must be >= largest stored interval
+        - Requested interval must be divisible by largest stored interval
+        - Only completed candles are used for aggregation
+        - Gaps are tracked with has_gaps flag and actual_candles count
+        
+        Query Parameters:
+        - count: Number of aggregated candles to return (default: 10)
+        - from_timestamp: Optional start timestamp filter
+        - to_timestamp: Optional end timestamp filter
+        """
+        from ..candle_aggregator import CandleAggregator
+
+        ticker = request.match_info['ticker'].upper()
+        
+        # Parse and validate minutes parameter
+        try:
+            requested_minutes = int(request.match_info['minutes'])
+            if requested_minutes < 1:
+                raise ValueError("Minutes must be positive")
+        except (ValueError, TypeError):
+            return web.json_response({
+                'error': 'Invalid minutes parameter',
+                'detail': 'Minutes must be a positive integer'
+            }, status=400)
+
+        # Get stored intervals for this ticker
+        stored_intervals = self.storage.get_ticker_intervals(ticker)
+
+        # Validate aggregation request
+        is_valid, base_interval, error_msg = CandleAggregator.validate_request(
+            stored_intervals, requested_minutes
+        )
+
+        if not is_valid:
+            return web.json_response({
+                'error': 'Invalid aggregation request',
+                'detail': error_msg,
+                'ticker': ticker,
+                'stored_intervals': stored_intervals,
+                'requested_minutes': requested_minutes
+            }, status=400)
+
+        # Parse query parameters
+        try:
+            count = int(request.query.get('count', '10'))
+        except (ValueError, TypeError):
+            return web.json_response({
+                'error': 'Invalid count parameter',
+                'detail': 'count must be a positive integer'
+            }, status=400)
+
+        from_timestamp_str = request.query.get('from_timestamp')
+        to_timestamp_str = request.query.get('to_timestamp')
+
+        # Parse and validate timestamp parameters
+        from_timestamp_val = None
+        to_timestamp_val = None
+
+        if from_timestamp_str:
+            try:
+                from_timestamp_val = int(from_timestamp_str)
+            except (ValueError, TypeError):
+                return web.json_response({
+                    'error': 'Invalid from_timestamp parameter',
+                    'detail': 'from_timestamp must be a Unix timestamp (integer)'
+                }, status=400)
+
+        if to_timestamp_str:
+            try:
+                to_timestamp_val = int(to_timestamp_str)
+            except (ValueError, TypeError):
+                return web.json_response({
+                    'error': 'Invalid to_timestamp parameter',
+                    'detail': 'to_timestamp must be a Unix timestamp (integer)'
+                }, status=400)
+
+        # Validate count
+        count = min(max(count, 1), self.config_manager.config.max_candles_stored)
+
+        # Calculate how many base candles we need to fetch
+        # We need more base candles to produce 'count' aggregated candles
+        aggregation_factor = requested_minutes // base_interval
+        base_candles_needed = count * aggregation_factor + aggregation_factor  # Extra for partial periods
+
+        # Fetch base candles
+        base_candles = self.storage.get_candles_for_aggregation(
+            ticker=ticker,
+            base_interval=base_interval,
+            count=base_candles_needed,
+            from_timestamp=from_timestamp_val,
+            to_timestamp=to_timestamp_val
+        )
+
+        if not base_candles:
+            return web.json_response({
+                'ticker': ticker,
+                'requested_interval': f"{requested_minutes}m",
+                'base_interval': f"{base_interval}m",
+                'aggregation_factor': aggregation_factor,
+                'count': 0,
+                'candles': [],
+                'message': 'No completed candles found for aggregation',
+                'timestamp': datetime.now(timezone.utc).isoformat()
+            })
+
+        # Aggregate candles
+        aggregated = CandleAggregator.aggregate(
+            candles=base_candles,
+            target_minutes=requested_minutes,
+            base_interval=base_interval,
+            ticker=ticker
+        )
+
+        # Limit to requested count (take most recent)
+        if len(aggregated) > count:
+            aggregated = aggregated[-count:]
+
+        # Update last request timestamp
+        self.storage.update_ticker_last_request(ticker)
+
+        return web.json_response({
+            'ticker': ticker,
+            'requested_interval': f"{requested_minutes}m",
+            'base_interval': f"{base_interval}m",
+            'aggregation_factor': aggregation_factor,
+            'count': len(aggregated),
+            'candles': [c.to_dict() for c in aggregated],
             'timestamp': datetime.now(timezone.utc).isoformat()
         })
     

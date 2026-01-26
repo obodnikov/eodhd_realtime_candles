@@ -96,3 +96,4 @@ package-lock.json
 #Claude
 .claude/
 .claude-plugins/
+.code_review/last-review-path.txt
