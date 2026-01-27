@@ -9,6 +9,8 @@ Collection of Python utility scripts for managing and analyzing EODHD data.
 1. **manage_tickers.py** - Smart ticker management with automatic capacity handling
 2. **premarket_volume.py** - Premarket volume calculator using EODHD API
 3. **premarket_pivots.py** - Premarket pivot point calculator with support/resistance levels
+4. **cumulative_volume_from_premarket.py** - Cumulative volume from 4:00 AM ET to current time
+4. **cumulative_volume_from_premarket.py** - Cumulative volume from 4:00 AM ET to current time
 
 ---
 
@@ -847,6 +849,267 @@ SPY     ...  450.50 451.62 449.38 452.29 448.71
 - **premarket_volume.py**: Calculate premarket volume statistics
 - **test_yfinance_premarket.py**: Test premarket data fetching
 - **test_yfinance_delay.py**: Measure data delay
+
+## License
+
+This script is provided as-is for educational and commercial use.
+
+
+---
+
+# 4. Cumulative Volume from Premarket Start
+
+**File**: `cumulative_volume_from_premarket.py`
+
+Calculates the cumulative total of all shares traded from 4:00 AM ET through the current moment, including the current incomplete candle. Uses the project's REST API (`GET /candles/{ticker}`) to fetch candle data.
+
+## Features
+
+- **Real-time cumulative volume**: Sum of all volume from 4:00 AM ET to now
+- **Includes current candle**: Counts volume from incomplete/in-progress candles
+- **Session awareness**: Reports current market session (premarket/market/after_hours/closed)
+- **Proper timezone handling**: Uses `zoneinfo` for accurate ET/DST calculations
+- **REST API integration**: Uses project's candle API instead of direct EODHD calls
+
+## Prerequisites
+
+- Python 3.9+ (for zoneinfo support)
+- `requests` library
+- `tzdata` library (for Windows timezone support)
+- Running EODHD Real-Time Candles API
+- Valid API_KEY configured
+
+## Installation
+
+Dependencies are already in `requirements.txt`:
+```bash
+pip install -r requirements.txt
+```
+
+Set environment variable:
+```bash
+export API_KEY="your_api_key_here"
+```
+
+## Usage
+
+### Command Line
+
+```bash
+python scripts/cumulative_volume_from_premarket.py <TICKER> [--host <API_URL>] [--market <SESSION>]
+```
+
+### Command-Line Options
+
+| Option | Description |
+|--------|-------------|
+| `ticker` | Stock ticker symbol (required, e.g., AAPL, MSFT) |
+| `--host` | REST API host URL (default: http://localhost:8765) |
+| `--market` | Session start point: `premarket` (4:00 AM ET), `market` (9:30 AM ET), `after_hours` (4:00 PM ET). Default: `premarket` |
+| `--count` | Maximum number of candles to retrieve (default: 1000) |
+
+### Examples
+
+```bash
+# Get cumulative volume from premarket (4:00 AM ET) - default
+python scripts/cumulative_volume_from_premarket.py AAPL
+
+# Get cumulative volume from market open (9:30 AM ET)
+python scripts/cumulative_volume_from_premarket.py AAPL --market market
+
+# Get cumulative volume from after-hours start (4:00 PM ET)
+python scripts/cumulative_volume_from_premarket.py AAPL --market after_hours
+
+# Get cumulative volume with custom host
+python scripts/cumulative_volume_from_premarket.py AAPL --host http://localhost:8765 --market market
+
+# Get cumulative volume via NGINX proxy
+python scripts/cumulative_volume_from_premarket.py TSLA --host https://n8n.sqowe.com/eodhd
+```
+
+### Python Module Usage
+
+```python
+from cumulative_volume_from_premarket import CumulativeVolumeCalculator
+
+calculator = CumulativeVolumeCalculator(host="http://localhost:8765")
+result = calculator.calculate_cumulative_volume("AAPL")
+print(result)
+```
+
+## Output Format
+
+### Success Response
+```json
+{
+  "ticker": "AAPL",
+  "market": "premarket",
+  "cumulative_volume": 12345678,
+  "candles_included": 45,
+  "start_time": "2026-01-27 04:00:00 ET",
+  "last_candle_time": "2026-01-27 10:15:00 ET",
+  "current_session": "market",
+  "current_time_et": "2026-01-27 10:16:32 ET",
+  "status": "success"
+}
+```
+
+### No Data Response (before session starts)
+```json
+{
+  "ticker": "AAPL",
+  "market": "market",
+  "cumulative_volume": 0,
+  "candles_included": 0,
+  "start_time": "2026-01-27 09:30:00 ET",
+  "last_candle_time": null,
+  "current_session": "premarket",
+  "message": "No candles found from 09:30 ET. Session may not have started yet.",
+  "status": "success"
+}
+```
+
+### Error Response
+```json
+{
+  "ticker": "INVALID",
+  "error": "No candles returned. Ticker may not be tracked.",
+  "status": "error"
+}
+```
+
+## Session Start Times
+
+| `--market` Value | Start Time (ET) | Description |
+|------------------|-----------------|-------------|
+| `premarket` | 4:00 AM | Pre-market trading start (default) |
+| `market` | 9:30 AM | Regular market open |
+| `after_hours` | 4:00 PM | After-hours trading start |
+
+## Session Types
+
+| Session | Time (ET) | Description |
+|---------|-----------|-------------|
+| `closed` | Before 4:00 AM | No trading |
+| `premarket` | 4:00 AM - 9:30 AM | Pre-market trading |
+| `market` | 9:30 AM - 4:00 PM | Regular market hours |
+| `after_hours` | 4:00 PM - 8:00 PM | After-hours trading |
+| `closed` | After 8:00 PM | No trading |
+
+## Timezone Handling
+
+The script uses `zoneinfo.ZoneInfo('America/New_York')` for accurate timezone handling:
+
+- **EST (Eastern Standard Time)**: UTC-5 (November - March)
+- **EDT (Eastern Daylight Time)**: UTC-4 (March - November)
+
+DST transitions are handled automatically - no manual adjustment needed.
+
+## Configuration
+
+### Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `API_KEY` | Yes | API key for REST API authentication |
+
+### API Endpoint Used
+
+The script calls `GET /candles/{ticker}` with:
+- `count=1000` - Maximum candles to retrieve
+- `include_current=true` - Include incomplete candle
+
+## Use Cases
+
+### 1. Real-Time Volume Monitoring
+
+```bash
+# Check current cumulative volume from premarket
+python scripts/cumulative_volume_from_premarket.py AAPL --host http://localhost:8765
+
+# Check volume since market open only
+python scripts/cumulative_volume_from_premarket.py AAPL --market market
+```
+
+### 2. Volume Analysis for Day Trading
+
+```bash
+# Compare volume across multiple tickers (PowerShell)
+foreach ($ticker in @("AAPL", "MSFT", "TSLA")) {
+  python scripts/cumulative_volume_from_premarket.py $ticker
+}
+
+# Bash version
+for ticker in AAPL MSFT TSLA; do
+  python scripts/cumulative_volume_from_premarket.py $ticker
+done
+```
+
+### 3. Integration with Trading Systems
+
+```python
+import json
+from cumulative_volume_from_premarket import CumulativeVolumeCalculator
+
+calculator = CumulativeVolumeCalculator(host="http://localhost:8765")
+
+# Get volume from premarket
+result = calculator.calculate_cumulative_volume("AAPL", market="premarket")
+
+# Get volume from market open only
+result = calculator.calculate_cumulative_volume("AAPL", market="market")
+
+if result['status'] == 'success':
+    volume = result['cumulative_volume']
+    # Use volume in trading logic
+```
+
+## Error Handling
+
+### Common Errors
+
+**"API_KEY environment variable is required"**
+- Set the environment variable with your API key
+
+**"No candles returned. Ticker may not be tracked."**
+- Verify ticker is added to the system via `GET /tickers`
+- Use `manage_tickers.py` to add the ticker
+
+**"API request failed"**
+- Check API is running: `curl http://localhost:8765/health`
+- Verify API_KEY is correct
+- Check network connectivity to host
+
+## Class Structure
+
+### CumulativeVolumeCalculator
+
+**Constructor:**
+- `__init__(host, api_key=None)`: Initialize with API host and optional key
+
+**Constants:**
+- `PREMARKET_START = 240` (4:00 AM in minutes)
+- `MARKET_OPEN = 570` (9:30 AM)
+- `MARKET_CLOSE = 960` (4:00 PM)
+- `AFTER_HOURS_END = 1200` (8:00 PM)
+
+**Methods:**
+- `get_current_session(now_et)`: Determine current market session
+- `get_session_start_timestamp(now_et, market)`: Get Unix timestamp for session start
+- `fetch_candles(ticker)`: Fetch candles from REST API
+- `calculate_cumulative_volume(ticker, market)`: Main calculation method
+
+## Performance Notes
+
+- **Single API call**: Fetches up to 1000 candles per request
+- **Efficient filtering**: Only processes candles from 4:00 AM ET onwards
+- **Includes current candle**: Real-time volume including incomplete candle
+
+## Related Scripts
+
+- **premarket_volume.py**: Calculate average premarket volume (historical, uses EODHD directly)
+- **premarket_pivots.py**: Calculate pivot points with premarket data
+- **manage_tickers.py**: Add/remove tickers from EODHD system
 
 ## License
 
