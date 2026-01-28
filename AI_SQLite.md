@@ -54,7 +54,58 @@ class Storage:
 
 ---
 
-## 3. Expensive Operations
+## 3. Async Handler Rule (CRITICAL)
+
+**ALL SQLite operations in async HTTP handlers MUST run in a thread pool.**
+
+SQLite operations are synchronous and will block the asyncio event loop, causing:
+- Request timeouts
+- WebSocket disconnections
+- Degraded throughput under load
+
+### DON'T:
+```python
+# BAD - Blocks the event loop!
+async def get_candles(self, request):
+    candles = self.storage.get_candles(ticker, count)  # BLOCKING!
+    return web.json_response({'candles': candles})
+```
+
+### DO:
+```python
+# GOOD - Runs in thread pool, event loop stays responsive
+import asyncio
+
+async def get_candles(self, request):
+    candles = await asyncio.to_thread(
+        self.storage.get_candles,
+        ticker,
+        count
+    )
+    return web.json_response({'candles': candles})
+```
+
+### Pattern for multiple DB calls:
+```python
+async def handler(self, request):
+    # Run each DB operation in thread pool
+    exists = await asyncio.to_thread(self.storage.ticker_exists, ticker)
+    if not exists:
+        return web.json_response({'error': 'Not found'}, status=404)
+    
+    data = await asyncio.to_thread(self.storage.get_data, ticker)
+    return web.json_response({'data': data})
+```
+
+### Why `asyncio.to_thread()`:
+- Available in Python 3.9+ (use `loop.run_in_executor()` for older versions)
+- Automatically uses the default thread pool executor
+- Keeps the event loop free to handle other requests and WebSocket messages
+- Essential for maintaining responsiveness under high load
+
+---
+
+## 4. Expensive Operations
 
 ### Operations that block the event loop:
 - `DELETE` with subqueries or large result sets
@@ -65,7 +116,7 @@ class Storage:
 
 ### Rules:
 
-1. **Never run expensive queries in HTTP request handlers**
+1. **Never run expensive queries in HTTP request handlers synchronously**
 2. **Cache expensive query results** with TTL (e.g., 5 seconds)
 3. **Batch large deletions** (LIMIT 500-1000 per batch)
 4. **Schedule cleanup operations** on timer, not per-request
@@ -88,7 +139,7 @@ def get_stats(self) -> dict:
 
 ---
 
-## 4. Cleanup Operations
+## 5. Cleanup Operations
 
 ### DON'T:
 ```python
@@ -110,13 +161,17 @@ async def _cleanup_task(self):
     while True:
         await asyncio.sleep(30)
         for ticker in self._pending_cleanup:
-            self.storage.cleanup_old_candles(ticker, self.max_candles)
+            await asyncio.to_thread(
+                self.storage.cleanup_old_candles, 
+                ticker, 
+                self.max_candles
+            )
         self._pending_cleanup.clear()
 ```
 
 ---
 
-## 5. Query Patterns
+## 6. Query Patterns
 
 ### Avoid:
 ```sql
@@ -134,13 +189,13 @@ DELETE FROM candles WHERE id NOT IN (
 -- GOOD: Use index, limit results
 SELECT COUNT(*) FROM candles WHERE ticker = ? LIMIT 1000;
 
--- GOOD: Batch deletion
+-- GOOD: Batch deletion with timestamp cutoff
 DELETE FROM candles WHERE ticker = ? AND timestamp < ? LIMIT 500;
 ```
 
 ---
 
-## 6. Index Requirements
+## 7. Index Requirements
 
 Always ensure indexes exist for:
 - Columns used in WHERE clauses
@@ -150,11 +205,15 @@ Always ensure indexes exist for:
 ```sql
 CREATE INDEX IF NOT EXISTS idx_candles_ticker_timestamp
 ON candles(ticker, timestamp DESC);
+
+-- Composite index for filtered queries
+CREATE INDEX IF NOT EXISTS idx_candles_ticker_complete_timestamp 
+ON candles(ticker, is_complete, timestamp DESC);
 ```
 
 ---
 
-## 7. Health Endpoint Rule
+## 8. Health Endpoint Rule
 
 **`/health` must NEVER touch the database.**
 
@@ -171,7 +230,7 @@ async def health(self, request):
 
 ---
 
-## 8. Monitoring & Debugging
+## 9. Monitoring & Debugging
 
 Add timing logs for database operations:
 
@@ -188,7 +247,7 @@ def cleanup_old_candles(self, ticker: str, max_candles: int):
 
 ---
 
-## 9. WAL Mode File Handling
+## 10. WAL Mode File Handling
 
 When using WAL mode, SQLite creates additional files:
 - `database.db-wal` (write-ahead log)
@@ -204,13 +263,14 @@ volumes:
 
 ---
 
-## 10. Summary Checklist
+## 11. Summary Checklist
 
 Before merging any SQLite-related code:
 
 - [ ] WAL mode enabled?
 - [ ] busy_timeout configured?
 - [ ] Thread-local connections used?
+- [ ] **All DB calls in async handlers wrapped with `asyncio.to_thread()`?**
 - [ ] No expensive queries in request handlers?
 - [ ] Expensive results cached with TTL?
 - [ ] Cleanup operations batched/scheduled?

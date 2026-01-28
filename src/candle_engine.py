@@ -5,7 +5,7 @@ Converts tick data into OHLCV candles at configurable intervals.
 
 import logging
 from datetime import datetime, timezone
-from typing import Dict, Optional, Callable
+from typing import Dict, Optional, Callable, Set
 from dataclasses import dataclass
 
 from .storage import Storage, Candle
@@ -42,6 +42,10 @@ class CandleEngine:
         
         # Current candles being built: ticker -> CurrentCandle
         self._current_candles: Dict[str, CurrentCandle] = {}
+        
+        # Pending cleanup queue - tickers that need old candles removed
+        # Cleanup runs on a timer, not per-candle completion (performance)
+        self._pending_cleanup: Set[str] = set()
         
         # Callback for candle completion (for WebSocket notifications)
         self._on_candle_complete: Optional[Callable[[Candle], None]] = None
@@ -107,8 +111,9 @@ class CandleEngine:
         # Save to storage
         self.storage.save_candle(completed)
         
-        # Cleanup old candles
-        self.storage.cleanup_old_candles(ticker, self.max_candles)
+        # Queue cleanup instead of running immediately (performance optimization)
+        # Cleanup will be processed by background task
+        self._pending_cleanup.add(ticker)
         
         # Remove from current candles
         del self._current_candles[ticker]
@@ -294,3 +299,11 @@ class CandleEngine:
         """Force complete all current candles (for shutdown)."""
         for ticker in list(self._current_candles.keys()):
             self._complete_current_candle(ticker, force=True)
+
+    def get_pending_cleanup(self) -> Set[str]:
+        """Get set of tickers pending cleanup."""
+        return self._pending_cleanup.copy()
+
+    def clear_pending_cleanup(self):
+        """Clear the pending cleanup queue after processing."""
+        self._pending_cleanup.clear()
