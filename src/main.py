@@ -92,6 +92,55 @@ async def create_app(config: Config) -> web.Application:
     return app
 
 
+async def cleanup_task(app: web.Application):
+    """
+    Background task that processes pending candle cleanup.
+    
+    Runs every 30 seconds to batch cleanup operations instead of
+    running them on every candle completion (performance optimization).
+    """
+    logger = logging.getLogger(__name__)
+    storage: Storage = app['storage']
+    candle_engine: CandleEngine = app['candle_engine']
+    
+    logger.info("Background cleanup task started (30s interval)")
+    
+    while True:
+        try:
+            await asyncio.sleep(30)
+            
+            # Get pending tickers and clear the queue
+            pending = candle_engine.get_pending_cleanup()
+            if not pending:
+                continue
+            
+            candle_engine.clear_pending_cleanup()
+            
+            # Process cleanup for each ticker in thread pool
+            max_candles = candle_engine.max_candles
+            cleaned_count = 0
+            
+            for ticker in pending:
+                try:
+                    await asyncio.to_thread(
+                        storage.cleanup_old_candles,
+                        ticker,
+                        max_candles
+                    )
+                    cleaned_count += 1
+                except Exception as e:
+                    logger.warning(f"Cleanup failed for {ticker}: {e}")
+            
+            if cleaned_count > 0:
+                logger.debug(f"Batch cleanup completed for {cleaned_count} tickers")
+                
+        except asyncio.CancelledError:
+            logger.info("Background cleanup task cancelled")
+            break
+        except Exception as e:
+            logger.error(f"Error in cleanup task: {e}")
+
+
 async def on_startup(app: web.Application):
     """Initialize services on startup."""
     logger = logging.getLogger(__name__)
@@ -119,6 +168,9 @@ async def on_startup(app: web.Application):
     if existing_tickers:
         await ws_manager.subscribe(set(existing_tickers))
     
+    # Start background cleanup task
+    app['cleanup_task'] = asyncio.create_task(cleanup_task(app))
+    
     logger.info("Service started successfully")
 
 
@@ -128,11 +180,32 @@ async def on_shutdown(app: web.Application):
     
     ws_manager: WebSocketManager = app['ws_manager']
     candle_engine: CandleEngine = app['candle_engine']
+    storage: Storage = app['storage']
     
     logger.info("Shutting down...")
     
+    # Cancel background cleanup task
+    if 'cleanup_task' in app:
+        app['cleanup_task'].cancel()
+        try:
+            await app['cleanup_task']
+        except asyncio.CancelledError:
+            pass
+    
     # Complete any in-progress candles
     candle_engine.complete_all_candles()
+    
+    # Process any remaining pending cleanups before shutdown
+    pending = candle_engine.get_pending_cleanup()
+    if pending:
+        logger.info(f"Processing {len(pending)} pending cleanups before shutdown")
+        max_candles = candle_engine.max_candles
+        for ticker in pending:
+            try:
+                storage.cleanup_old_candles(ticker, max_candles)
+            except Exception as e:
+                logger.warning(f"Shutdown cleanup failed for {ticker}: {e}")
+        candle_engine.clear_pending_cleanup()
     
     # Stop WebSocket
     await ws_manager.stop()
