@@ -2,6 +2,7 @@
 REST API route handlers.
 """
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
@@ -91,7 +92,8 @@ class APIRoutes:
     async def status(self, request: web.Request) -> web.Response:
         """GET /status - Detailed system status."""
         ws_status = self.ws_manager.get_status()
-        db_stats = self.storage.get_stats()
+        # Run DB operation in thread pool to avoid blocking event loop
+        db_stats = await asyncio.to_thread(self.storage.get_stats)
         overrides = self.config_manager.get_overrides()
 
         return web.json_response({
@@ -179,7 +181,8 @@ class APIRoutes:
     
     async def list_tickers(self, request: web.Request) -> web.Response:
         """GET /tickers - List all tracked tickers."""
-        tickers = self.storage.get_tickers()
+        # Run DB operation in thread pool to avoid blocking event loop
+        tickers = await asyncio.to_thread(self.storage.get_tickers)
         max_tickers = self.config_manager.config.max_tickers
 
         return web.json_response({
@@ -194,14 +197,16 @@ class APIRoutes:
         """GET /tickers/{ticker} - Get single ticker information."""
         ticker = request.match_info['ticker'].upper()
 
-        if not self.storage.ticker_exists(ticker):
+        # Run DB operations in thread pool to avoid blocking event loop
+        exists = await asyncio.to_thread(self.storage.ticker_exists, ticker)
+        if not exists:
             return web.json_response(
                 {'error': f'Ticker not found: {ticker}'},
                 status=404
             )
 
         # Get ticker info from storage
-        ticker_info = self.storage.get_ticker(ticker)
+        ticker_info = await asyncio.to_thread(self.storage.get_ticker, ticker)
 
         return web.json_response({
             'ticker': ticker_info.to_dict(),
@@ -233,8 +238,8 @@ class APIRoutes:
         invalid = [t for t in tickers if not t.isalpha() or len(t) > 5]
         tickers = [t for t in tickers if t not in invalid]
         
-        # Check max tickers limit
-        current_count = self.storage.get_ticker_count()
+        # Check max tickers limit (run in thread pool)
+        current_count = await asyncio.to_thread(self.storage.get_ticker_count)
         max_tickers = self.config_manager.config.max_tickers
         available = max_tickers - current_count
         
@@ -247,12 +252,13 @@ class APIRoutes:
                 'available_slots': available
             }, status=400)
         
-        # Add tickers
+        # Add tickers (run in thread pool)
         added = []
         already_exists = []
         
         for ticker in tickers:
-            if self.storage.add_ticker(ticker):
+            result = await asyncio.to_thread(self.storage.add_ticker, ticker)
+            if result:
                 added.append(ticker)
             else:
                 already_exists.append(ticker)
@@ -261,11 +267,12 @@ class APIRoutes:
         if added:
             await self.ws_manager.subscribe(set(added))
         
+        final_count = await asyncio.to_thread(self.storage.get_ticker_count)
         return web.json_response({
             'added': added,
             'already_exists': already_exists,
             'invalid': invalid,
-            'current_count': self.storage.get_ticker_count(),
+            'current_count': final_count,
             'timestamp': datetime.now(timezone.utc).isoformat()
         })
     
@@ -273,7 +280,9 @@ class APIRoutes:
         """DELETE /tickers/{ticker} - Remove a single ticker."""
         ticker = request.match_info['ticker'].upper()
         
-        if not self.storage.ticker_exists(ticker):
+        # Run DB operation in thread pool
+        exists = await asyncio.to_thread(self.storage.ticker_exists, ticker)
+        if not exists:
             return web.json_response(
                 {'error': f'Ticker not found: {ticker}'},
                 status=404
@@ -285,12 +294,13 @@ class APIRoutes:
         # Remove from candle engine
         self.candle_engine.remove_ticker(ticker)
         
-        # Remove from storage (including candles)
-        self.storage.remove_ticker(ticker)
+        # Remove from storage (including candles) - run in thread pool
+        await asyncio.to_thread(self.storage.remove_ticker, ticker)
         
+        current_count = await asyncio.to_thread(self.storage.get_ticker_count)
         return web.json_response({
             'removed': ticker,
-            'current_count': self.storage.get_ticker_count(),
+            'current_count': current_count,
             'timestamp': datetime.now(timezone.utc).isoformat()
         })
     
@@ -328,8 +338,8 @@ class APIRoutes:
                     'warning': 'This will remove all tracked tickers and their candle data'
                 }, status=400)
 
-            # Proceed with deleting all tickers
-            count = self.storage.delete_all_tickers()
+            # Proceed with deleting all tickers (run in thread pool)
+            count = await asyncio.to_thread(self.storage.delete_all_tickers)
 
             # Clear WebSocket subscriptions
             await self.ws_manager.clear_subscriptions()
@@ -356,18 +366,20 @@ class APIRoutes:
         not_found = []
 
         for ticker in tickers:
-            if self.storage.ticker_exists(ticker):
+            exists = await asyncio.to_thread(self.storage.ticker_exists, ticker)
+            if exists:
                 await self.ws_manager.unsubscribe({ticker})
                 self.candle_engine.remove_ticker(ticker)
-                self.storage.remove_ticker(ticker)
+                await asyncio.to_thread(self.storage.remove_ticker, ticker)
                 removed.append(ticker)
             else:
                 not_found.append(ticker)
 
+        current_count = await asyncio.to_thread(self.storage.get_ticker_count)
         return web.json_response({
             'removed': removed,
             'not_found': not_found,
-            'current_count': self.storage.get_ticker_count(),
+            'current_count': current_count,
             'timestamp': datetime.now(timezone.utc).isoformat()
         })
     
@@ -414,8 +426,8 @@ class APIRoutes:
         # Validate count
         count = min(max(count, 1), self.config_manager.config.max_candles_stored)
 
-        # Get all tracked tickers
-        all_tickers = self.storage.get_tickers()
+        # Get all tracked tickers (run in thread pool)
+        all_tickers = await asyncio.to_thread(self.storage.get_tickers)
         ticker_count = len(all_tickers)
 
         # Check if ticker count exceeds max_tickers limit
@@ -434,17 +446,19 @@ class APIRoutes:
 
         for ticker_obj in all_tickers:
             ticker = ticker_obj.symbol
-            candles = self.storage.get_candles(
-                ticker=ticker,
-                count=count,
-                include_current=include_current,
-                interval_minutes=interval_minutes,
-                from_timestamp=int(from_timestamp) if from_timestamp else None,
-                to_timestamp=int(to_timestamp) if to_timestamp else None
+            # Run DB operations in thread pool
+            candles = await asyncio.to_thread(
+                self.storage.get_candles,
+                ticker,
+                count,
+                include_current,
+                interval_minutes,
+                int(from_timestamp) if from_timestamp else None,
+                int(to_timestamp) if to_timestamp else None
             )
 
             # Update last request timestamp
-            self.storage.update_ticker_last_request(ticker)
+            await asyncio.to_thread(self.storage.update_ticker_last_request, ticker)
 
             # Add ticker field to each candle and append to flat list
             for candle in candles:
@@ -474,17 +488,19 @@ class APIRoutes:
         # Validate count
         count = min(max(count, 1), self.config_manager.config.max_candles_stored)
 
-        candles = self.storage.get_candles(
-            ticker=ticker,
-            count=count,
-            include_current=include_current,
-            interval_minutes=self.config_manager.config.candle_interval_minutes,
-            from_timestamp=int(from_timestamp) if from_timestamp else None,
-            to_timestamp=int(to_timestamp) if to_timestamp else None
+        # Run DB operation in thread pool to avoid blocking event loop
+        candles = await asyncio.to_thread(
+            self.storage.get_candles,
+            ticker,
+            count,
+            include_current,
+            self.config_manager.config.candle_interval_minutes,
+            int(from_timestamp) if from_timestamp else None,
+            int(to_timestamp) if to_timestamp else None
         )
         
         # Update last request timestamp
-        self.storage.update_ticker_last_request(ticker)
+        await asyncio.to_thread(self.storage.update_ticker_last_request, ticker)
 
         return web.json_response({
             'ticker': ticker,
@@ -506,8 +522,8 @@ class APIRoutes:
                 status=404
             )
         
-        # Update last request timestamp
-        self.storage.update_ticker_last_request(ticker)
+        # Update last request timestamp (run in thread pool)
+        await asyncio.to_thread(self.storage.update_ticker_last_request, ticker)
         
         return web.json_response({
             'ticker': ticker,
@@ -547,8 +563,8 @@ class APIRoutes:
                 'detail': 'Minutes must be a positive integer'
             }, status=400)
 
-        # Get stored intervals for this ticker
-        stored_intervals = self.storage.get_ticker_intervals(ticker)
+        # Get stored intervals for this ticker (run in thread pool)
+        stored_intervals = await asyncio.to_thread(self.storage.get_ticker_intervals, ticker)
 
         # Validate aggregation request
         is_valid, base_interval, error_msg = CandleAggregator.validate_request(
@@ -606,13 +622,14 @@ class APIRoutes:
         aggregation_factor = requested_minutes // base_interval
         base_candles_needed = count * aggregation_factor + aggregation_factor  # Extra for partial periods
 
-        # Fetch base candles
-        base_candles = self.storage.get_candles_for_aggregation(
-            ticker=ticker,
-            base_interval=base_interval,
-            count=base_candles_needed,
-            from_timestamp=from_timestamp_val,
-            to_timestamp=to_timestamp_val
+        # Fetch base candles (run in thread pool)
+        base_candles = await asyncio.to_thread(
+            self.storage.get_candles_for_aggregation,
+            ticker,
+            base_interval,
+            base_candles_needed,
+            from_timestamp_val,
+            to_timestamp_val
         )
 
         if not base_candles:
@@ -639,8 +656,8 @@ class APIRoutes:
         if len(aggregated) > count:
             aggregated = aggregated[-count:]
 
-        # Update last request timestamp
-        self.storage.update_ticker_last_request(ticker)
+        # Update last request timestamp (run in thread pool)
+        await asyncio.to_thread(self.storage.update_ticker_last_request, ticker)
 
         return web.json_response({
             'ticker': ticker,
@@ -675,21 +692,24 @@ class APIRoutes:
         count = min(max(count, 1), self.config_manager.config.max_candles_stored)
         
         result = {}
+        interval_minutes = self.config_manager.config.candle_interval_minutes
         for ticker in tickers:
             ticker = ticker.upper()
-            candles = self.storage.get_candles(
-                ticker=ticker,
-                count=count,
-                include_current=include_current,
-                interval_minutes=self.config_manager.config.candle_interval_minutes
+            # Run DB operation in thread pool
+            candles = await asyncio.to_thread(
+                self.storage.get_candles,
+                ticker,
+                count,
+                include_current,
+                interval_minutes
             )
             result[ticker] = [c.to_dict() for c in candles]
             
             # Update last request timestamp
-            self.storage.update_ticker_last_request(ticker)
+            await asyncio.to_thread(self.storage.update_ticker_last_request, ticker)
         
         return web.json_response({
-            'interval': f"{self.config_manager.config.candle_interval_minutes}m",
+            'interval': f"{interval_minutes}m",
             'data': result,
             'timestamp': datetime.now(timezone.utc).isoformat()
         })
@@ -698,7 +718,8 @@ class APIRoutes:
         """DELETE /candles/{ticker} - Clear candle history for a ticker."""
         ticker = request.match_info['ticker'].upper()
         
-        self.storage.clear_candles(ticker)
+        # Run DB operation in thread pool
+        await asyncio.to_thread(self.storage.clear_candles, ticker)
         
         return web.json_response({
             'message': f'Cleared candles for {ticker}',
@@ -707,7 +728,8 @@ class APIRoutes:
     
     async def clear_all_candles(self, request: web.Request) -> web.Response:
         """DELETE /candles - Clear all candle history."""
-        self.storage.clear_candles()
+        # Run DB operation in thread pool
+        await asyncio.to_thread(self.storage.clear_candles)
 
         return web.json_response({
             'message': 'Cleared all candles',
@@ -734,7 +756,8 @@ class APIRoutes:
 
         try:
             logger.info("Starting orphaned candles cleanup")
-            deleted = self.storage.cleanup_orphaned_candles()
+            # Run DB operation in thread pool to avoid blocking event loop
+            deleted = await asyncio.to_thread(self.storage.cleanup_orphaned_candles)
             duration = time.time() - start_time
 
             logger.info(f"Cleanup completed: {deleted} records deleted in {duration:.2f}s")
