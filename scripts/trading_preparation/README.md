@@ -26,15 +26,18 @@ This script analyzes stock price data using EMA (Exponential Moving Average) cro
 
 ## State Detection
 
-The script classifies market state based on EMA alignment:
+The script classifies market state based on EMA alignment. The `State` field in output represents the current trend condition:
 
 | State | Condition | Interpretation |
 |-------|-----------|----------------|
-| DOWN | 10/30 DOWN, 3/10 DOWN | Bearish alignment, avoid longs |
-| BASE | 10/30 DOWN, 3/10 UP | Building base, potential reversal |
-| TREND_START | 10/30 UP, not stable | Early trend, higher risk entry |
-| TREND | 10/30 UP stable, 3/10 UP, 1/3 UP | Confirmed uptrend, optimal entry |
-| PULLBACK | 10/30 UP stable, lower TFs DOWN | Retracement in uptrend |
+| DOWN | 10/30 DOWN, 3/10 DOWN | Bearish alignment - all timeframes pointing down, avoid longs |
+| BASE | 10/30 DOWN, 3/10 UP | Building base - higher TF still down but short-term showing strength, potential reversal forming |
+| TREND_START | 10/30 UP, not stable | Early trend - hourly EMA crossed up but not yet stable, higher risk entry |
+| TREND | 10/30 UP stable, 3/10 UP, 1/3 UP | Confirmed uptrend - all timeframes aligned bullish with stability, optimal entry zone |
+| PULLBACK | 10/30 UP stable, lower TFs DOWN | Retracement within uptrend - hourly trend intact but 15m/1m showing weakness, potential dip-buy |
+| UNKNOWN | None of the above | Undefined state - mixed signals that don't fit clear patterns |
+
+The state is calculated per row, so you can observe transitions throughout the trading session.
 
 ## Intraday Score (0-10)
 
