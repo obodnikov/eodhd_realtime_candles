@@ -78,6 +78,14 @@ UTC_TZ = ZoneInfo("UTC")
 PREMARKET_START = time(4, 0)
 RTH_START = time(9, 30)
 RTH_END = time(16, 0)
+AFTER_HOURS_END = time(20, 0)
+
+# Session start times mapping for --market parameter
+SESSION_START_TIMES = {
+    'premarket': (4, 0),      # 4:00 AM ET
+    'market': (9, 30),        # 9:30 AM ET
+    'after_hours': (16, 0),   # 4:00 PM ET
+}
 
 
 # =============================================================================
@@ -181,6 +189,32 @@ def latest_0400_start_ts_unix_utc(now_dt: Optional[datetime] = None) -> int:
     if now_dt < start:
         start = start - timedelta(days=1)
     return int(start.astimezone(UTC_TZ).timestamp())
+
+
+def get_session_start_timestamp(now_et: datetime, market: str) -> int:
+    """Get Unix timestamp for session start time.
+    
+    If current time is before the requested session start, uses yesterday's
+    session start to get the most recent completed session data.
+    
+    Args:
+        now_et: Current time in ET (NY timezone)
+        market: Session type ('premarket', 'market', 'after_hours')
+        
+    Returns:
+        Unix timestamp for session start
+    """
+    if market not in SESSION_START_TIMES:
+        raise ValueError(f"Invalid market: {market}. Must be one of {list(SESSION_START_TIMES.keys())}")
+    
+    hour, minute = SESSION_START_TIMES[market]
+    start_et = now_et.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    
+    # If current time is before session start, use yesterday's session
+    if now_et < start_et:
+        start_et = start_et - timedelta(days=1)
+    
+    return int(start_et.astimezone(UTC_TZ).timestamp())
 
 
 # =============================================================================
@@ -636,7 +670,7 @@ def compute_1m_1_3_crossover_df(
 def compute_cumulative_volume(
     candles_client: EODHDCandlesClient,
     ticker: str,
-    session_start_ts: int
+    market: str = 'premarket'
 ) -> int:
     """
     Calculate cumulative volume from session start.
@@ -644,14 +678,19 @@ def compute_cumulative_volume(
     Args:
         candles_client: EODHD API client
         ticker: Stock ticker symbol
-        session_start_ts: Unix timestamp for session start (4:00 AM NY)
+        market: Session start point ('premarket', 'market', 'after_hours')
     
     Returns:
         Cumulative volume as integer, 0 on failure.
     
     Note:
         Only includes complete candles (is_complete=True) to ensure accuracy.
+        If current time is before session start, uses yesterday's session.
     """
+    # Get session start timestamp based on market parameter
+    ny_now = now_ny()
+    session_start_ts = get_session_start_timestamp(ny_now, market)
+    
     try:
         payload = candles_client.fetch_base_candles(
             ticker=ticker,
@@ -859,6 +898,9 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Hold threshold for 1/3 EMA (1m)")
     p.add_argument("--tail", type=int, default=25,
                    help="Number of 1m rows to display")
+    p.add_argument("--market", choices=['premarket', 'market', 'after_hours'],
+                   default='premarket',
+                   help="Session start for VolumeDay: premarket (4:00 AM), market (9:30 AM), after_hours (4:00 PM)")
     p.add_argument("--out", default=None,
                    help="Output file path (.json or .csv)")
     p.add_argument("--debug", action="store_true",
@@ -959,12 +1001,13 @@ def main() -> None:
         raise SystemExit(f"Critical data missing: 1-minute candles for {ticker}")
 
     # ==========================================================================
-    # 5. Cumulative Volume
+    # 5. Cumulative Volume - Calculate session start for per-row cumsum
     # ==========================================================================
     ny_now = now_ny()
-    session_start_ts = latest_0400_start_ts_unix_utc(ny_now)
-    cumulative_volume = compute_cumulative_volume(candles_client, ticker, session_start_ts)
-    logger.info(f"Cumulative volume from 4:00 AM: {cumulative_volume:,}")
+    hour, minute = SESSION_START_TIMES[args.market]
+    session_label = f"{hour}:{minute:02d} {'AM' if hour < 12 else 'PM'}"
+    session_start_ts = get_session_start_timestamp(ny_now, args.market)
+    session_start_dt = datetime.fromtimestamp(session_start_ts, tz=UTC_TZ).astimezone(NY_TZ)
 
     # ==========================================================================
     # 6. Volume Stats (Yahoo Finance)
@@ -990,8 +1033,17 @@ def main() -> None:
     # Add market session
     df_1m["Session"] = [market_session(ts.to_pydatetime()) for ts in df_1m.index.tz_convert(NY_TZ)]
 
-    # Add cumulative volume
-    df_1m["VolumeDay"] = cumulative_volume
+    # Add cumulative volume (running sum from session start)
+    # Initialize VolumeDay to 0
+    df_1m["VolumeDay"] = 0
+    # Calculate cumsum only for rows >= session start
+    mask = df_1m.index >= session_start_dt
+    if mask.any():
+        df_1m.loc[mask, "VolumeDay"] = df_1m.loc[mask, "Volume"].cumsum()
+    
+    # Get total cumulative volume for header display
+    cumulative_volume = int(df_1m["VolumeDay"].iloc[-1]) if not df_1m.empty else 0
+    logger.info(f"Cumulative volume from {session_label}: {cumulative_volume:,}")
 
     # Add last price
     df_1m["LastPrice"] = last_price
