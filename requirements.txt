@@ -23,6 +23,13 @@ requests>=2.31.0
 # Timezone support for Windows compatibility
 tzdata>=2023.3
 
+# === Scripts ===
+# Pretty table output
+prettytable>=3.9.0
+
+# Yahoo Finance data
+yfinance>=0.2.0
+
 # No additional dependencies needed - using Python standard library for:
 # - sqlite3 (database)
 # - asyncio (async runtime)

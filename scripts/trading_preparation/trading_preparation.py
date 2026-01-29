@@ -31,6 +31,7 @@ import pandas as pd
 import requests
 import yfinance as yf
 from dotenv import load_dotenv
+from prettytable import PrettyTable
 from zoneinfo import ZoneInfo
 
 
@@ -1048,17 +1049,47 @@ def main() -> None:
     ]
     cols = [c for c in cols if c in df_1m.columns]
 
-    print(f"\n{'='*80}")
-    print(f"MULTI-TIMEFRAME EMA ANALYSIS: {ticker}")
-    print(f"{'='*80}")
-    print(f"30/50 (Daily):  {signals_30_50['trend_30_50']:>6} | Hold: {signals_30_50['hold_30_50']} | Stable: {signals_30_50['stable_30_50']}")
-    print(f"10/30 (Hourly): {signals_10_30['trend_10_30']:>6} | Hold: {signals_10_30['hold_10_30']} | Stable: {signals_10_30['stable_10_30']}")
-    print(f"3/10  (15m):    {signals_3_10['trend_3_10']:>6} | Hold: {signals_3_10['hold_3_10']} | Stable: {signals_3_10['stable_3_10']}")
-    avg3m_str = f"{avg3m:,.0f}" if avg3m else "N/A"
-    print(f"Cumulative Vol: {cumulative_volume:,} | Avg 3M: {avg3m_str}")
-    print(f"{'='*80}\n")
+    # Summary header table
+    summary_table = PrettyTable()
+    summary_table.field_names = ["Timeframe", "Trend", "Hold", "Stable"]
+    summary_table.align = "l"
+    summary_table.add_row(["30/50 (Daily)", signals_30_50['trend_30_50'], signals_30_50['hold_30_50'], signals_30_50['stable_30_50']])
+    summary_table.add_row(["10/30 (Hourly)", signals_10_30['trend_10_30'], signals_10_30['hold_10_30'], signals_10_30['stable_10_30']])
+    summary_table.add_row(["3/10 (15m)", signals_3_10['trend_3_10'], signals_3_10['hold_3_10'], signals_3_10['stable_3_10']])
 
-    print(df_1m[cols].tail(max(1, args.tail)).to_string(index=False))
+    avg3m_str = f"{avg3m:,.0f}" if avg3m else "N/A"
+    
+    print(f"\n{'='*60}")
+    print(f"  MULTI-TIMEFRAME EMA ANALYSIS: {ticker}")
+    print(f"{'='*60}")
+    print(summary_table)
+    print(f"\nCumulative Vol: {cumulative_volume:,} | Avg 3M: {avg3m_str}")
+    print(f"{'='*60}\n")
+
+    # Data table
+    data_table = PrettyTable()
+    data_table.field_names = cols
+    data_table.align = "r"
+    data_table.align["NY_Time"] = "l"
+    data_table.align["Session"] = "c"
+    data_table.align["State"] = "l"
+    
+    tail_df = df_1m[cols].tail(max(1, args.tail))
+    for _, row in tail_df.iterrows():
+        formatted_row = []
+        for col in cols:
+            val = row[col]
+            if col in ["Open", "High", "Low", "Close"]:
+                formatted_row.append(f"{val:.2f}" if pd.notna(val) else "N/A")
+            elif col in ["Volume", "VolumeDay"]:
+                formatted_row.append(f"{int(val):,}" if pd.notna(val) else "N/A")
+            elif isinstance(val, bool):
+                formatted_row.append("Yes" if val else "No")
+            else:
+                formatted_row.append(str(val) if pd.notna(val) else "N/A")
+        data_table.add_row(formatted_row)
+    
+    print(data_table)
 
     # Save output if requested
     if args.out:
