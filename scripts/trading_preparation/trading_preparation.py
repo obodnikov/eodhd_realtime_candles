@@ -217,6 +217,8 @@ def fetch_yf_daily_ohlcv(ticker: str, count: int = 60) -> pd.DataFrame:
         Logs warning on network/API errors but returns empty DataFrame.
     """
     period = "6mo" if count <= 60 else "1y"
+    logger.debug(f"Fetching daily data: ticker={ticker}, period={period}, interval=1d")
+    
     try:
         df = yf.download(
             tickers=ticker,
@@ -227,21 +229,32 @@ def fetch_yf_daily_ohlcv(ticker: str, count: int = 60) -> pd.DataFrame:
             threads=False,
         )
     except requests.RequestException as e:
-        logger.warning(f"Network error fetching daily data: {e}")
+        logger.warning(f"Network error fetching daily data for {ticker}: {e}")
         return pd.DataFrame()
-    except yf.YFException as e:
-        logger.warning(f"Yahoo Finance error fetching daily data: {e}")
+    except Exception as e:
+        logger.warning(f"Yahoo Finance error fetching daily data for {ticker}: {e}")
         return pd.DataFrame()
 
     if df is None or df.empty:
-        logger.warning("No daily data returned from Yahoo Finance")
+        logger.warning(
+            f"No daily data returned from Yahoo Finance for {ticker}. "
+            f"Requested period={period}. Ticker may be new/invalid or have no trading history."
+        )
         return pd.DataFrame()
+
+    logger.debug(f"Yahoo Finance returned {len(df)} daily rows for {ticker}")
 
     if isinstance(df.columns, pd.MultiIndex):
         df = df.droplevel(0, axis=1)
 
     keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
     df = df[keep].dropna(how="any")
+    
+    if len(df) < 50:
+        logger.warning(
+            f"Insufficient daily data for {ticker}: got {len(df)} rows, need at least 50 for EMA50. "
+            f"Ticker may be a recent IPO or have limited trading history."
+        )
 
     idx = pd.to_datetime(df.index)
     if getattr(idx, "tz", None) is None:
@@ -249,6 +262,8 @@ def fetch_yf_daily_ohlcv(ticker: str, count: int = 60) -> pd.DataFrame:
     else:
         idx = idx.tz_convert(NY_TZ)
     df.index = idx
+    
+    logger.debug(f"Returning {len(df.tail(max(count, 60)))} daily candles for {ticker}")
     return df.tail(max(count, 60))
 
 
@@ -265,25 +280,33 @@ def fetch_yf_hourly_ohlcv(ticker: str, count: int = 100) -> pd.DataFrame:
     
     Note: Uses 30d period to ensure sufficient data for EMA30 calculation.
     """
+    period = "30d"
+    logger.debug(f"Fetching hourly data: ticker={ticker}, period={period}, interval=1h")
+    
     try:
         df = yf.download(
             tickers=ticker,
-            period="30d",  # Extended to ensure enough candles for EMA30
+            period=period,
             interval="1h",
             auto_adjust=False,
             progress=False,
             threads=False,
         )
     except requests.RequestException as e:
-        logger.warning(f"Network error fetching hourly data: {e}")
+        logger.warning(f"Network error fetching hourly data for {ticker}: {e}")
         return pd.DataFrame()
-    except yf.YFException as e:
-        logger.warning(f"Yahoo Finance error fetching hourly data: {e}")
+    except Exception as e:
+        logger.warning(f"Yahoo Finance error fetching hourly data for {ticker}: {e}")
         return pd.DataFrame()
 
     if df is None or df.empty:
-        logger.warning("No hourly data returned from Yahoo Finance")
+        logger.warning(
+            f"No hourly data returned from Yahoo Finance for {ticker}. "
+            f"Requested period={period}. Ticker may be new/invalid or have no trading history."
+        )
         return pd.DataFrame()
+
+    logger.debug(f"Yahoo Finance returned {len(df)} hourly rows for {ticker}")
 
     if isinstance(df.columns, pd.MultiIndex):
         df = df.droplevel(0, axis=1)
@@ -293,7 +316,10 @@ def fetch_yf_hourly_ohlcv(ticker: str, count: int = 100) -> pd.DataFrame:
 
     # Validate minimum data for EMA30
     if len(df) < 30:
-        logger.warning(f"Insufficient hourly data: got {len(df)} candles, need at least 30 for EMA30")
+        logger.warning(
+            f"Insufficient hourly data for {ticker}: got {len(df)} candles, need at least 30 for EMA30. "
+            f"Ticker may be a recent IPO or have limited trading history."
+        )
 
     idx = pd.to_datetime(df.index)
     if getattr(idx, "tz", None) is None:
@@ -301,6 +327,8 @@ def fetch_yf_hourly_ohlcv(ticker: str, count: int = 100) -> pd.DataFrame:
     else:
         idx = idx.tz_convert(NY_TZ)
     df.index = idx
+    
+    logger.debug(f"Returning {len(df.tail(max(count, 40)))} hourly candles for {ticker}")
     return df.tail(max(count, 40))
 
 
