@@ -11,7 +11,7 @@ This script analyzes stock price data using EMA (Exponential Moving Average) cro
 - Multi-timeframe EMA crossover analysis (30/50, 10/30, 3/10, 1/3)
 - Market state detection (DOWN, BASE, TREND_START, TREND, PULLBACK)
 - Intraday score (0-10) based on EMA stability
-- Cumulative volume tracking from 4:00 AM NY (premarket start)
+- Running cumulative volume (VolumeDay) with configurable session start
 - Market session detection (PRE, RTH, EXT, CLOSED)
 - Multiple output formats (console, JSON, CSV)
 
@@ -92,6 +92,19 @@ python trading_preparation.py --ticker TSLA \
     --tail 50
 ```
 
+### With Custom Session Start (--market)
+
+```bash
+# Default: premarket (4:00 AM ET)
+python trading_preparation.py --ticker AAPL
+
+# From market open (9:30 AM ET)
+python trading_preparation.py --ticker AAPL --market market
+
+# From after hours (4:00 PM ET)
+python trading_preparation.py --ticker AAPL --market after_hours
+```
+
 ### Save Output to File
 
 ```bash
@@ -120,6 +133,7 @@ python trading_preparation.py --ticker AAPL --debug
 | `--hold-3-10` | 2 | Candles for 3/10 EMA stability |
 | `--hold-1-3` | 1 | Candles for 1/3 EMA stability |
 | `--tail` | 25 | Number of 1m rows to display |
+| `--market` | `premarket` | Session start for VolumeDay: `premarket` (4:00 AM), `market` (9:30 AM), `after_hours` (4:00 PM) |
 | `--out` | None | Output file path (.json or .csv) |
 | `--debug` | False | Enable debug logging |
 
@@ -139,7 +153,10 @@ Cumulative Vol: 12,345,678 | Avg 3M: 45,000,000
 
 NY_Time           LastPrice  Open    High    Low     Close   Volume   VolumeDay  Session  State  Score  TrendSummary
 2026-01-29 10:15  185.50     185.20  185.60  185.10  185.50  50000    12345678   RTH      TREND  10/10  30/50:UP[OK] | 10/30:UP[OK] | 3/10:UP[OK] | 1/3:UP[OK]
+2026-01-29 10:16  185.55     185.50  185.60  185.45  185.55  25000    12370678   RTH      TREND  10/10  30/50:UP[OK] | 10/30:UP[OK] | 3/10:UP[OK] | 1/3:UP[OK]
 ```
+
+Note: `VolumeDay` is a running cumulative sum - each row shows total volume accumulated from session start up to that candle.
 
 ### JSON Output
 
