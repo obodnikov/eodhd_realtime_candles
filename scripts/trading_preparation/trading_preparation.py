@@ -21,7 +21,9 @@ import argparse
 import json
 import logging
 import os
+import random
 import re
+import time as time_module
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
 from pathlib import Path
@@ -89,6 +91,44 @@ SESSION_START_TIMES = {
 
 
 # =============================================================================
+# Retry Decorator
+# =============================================================================
+
+def retry_with_backoff(max_attempts: int = 3, base_delay: float = 0.5, max_delay: float = 1.5):
+    """
+    Decorator to retry API calls with exponential backoff and random jitter.
+    
+    Args:
+        max_attempts: Maximum number of retry attempts (default: 3)
+        base_delay: Base delay in seconds (default: 0.5)
+        max_delay: Maximum delay in seconds (default: 1.5)
+    """
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    return func(*args, **kwargs)
+                except requests.RequestException as e:
+                    if attempt == max_attempts:
+                        logger.warning(f"{func.__name__} failed after {max_attempts} attempts: {e}")
+                        raise
+                    
+                    # Calculate delay with exponential backoff and random jitter
+                    delay = min(base_delay * (2 ** (attempt - 1)), max_delay)
+                    jitter = random.uniform(0, delay * 0.3)  # Add up to 30% jitter
+                    total_delay = delay + jitter
+                    
+                    logger.info(f"{func.__name__} attempt {attempt}/{max_attempts} failed: {e}. Retrying in {total_delay:.2f}s...")
+                    time_module.sleep(total_delay)
+            
+            # Should never reach here, but just in case
+            raise RuntimeError(f"{func.__name__} exhausted all retry attempts")
+        
+        return wrapper
+    return decorator
+
+
+# =============================================================================
 # API Clients
 # =============================================================================
 
@@ -100,6 +140,7 @@ class EODHDTickersClient:
         self.api_key = api_key
         self.timeout = timeout
 
+    @retry_with_backoff(max_attempts=3, base_delay=0.5, max_delay=1.5)
     def fetch(self, ticker: str) -> Dict[str, Any]:
         """Fetch ticker information including last_price."""
         url = f"{self.base_url}/eodhd/tickers/{ticker}"
@@ -118,6 +159,7 @@ class EODHDCandlesClient:
         self.api_key = api_key
         self.timeout = timeout
 
+    @retry_with_backoff(max_attempts=3, base_delay=0.5, max_delay=1.5)
     def fetch_aggregated(
         self,
         ticker: str,
@@ -142,6 +184,7 @@ class EODHDCandlesClient:
         resp.raise_for_status()
         return resp.json()
 
+    @retry_with_backoff(max_attempts=3, base_delay=0.5, max_delay=1.5)
     def fetch_base_candles(
         self,
         ticker: str,
