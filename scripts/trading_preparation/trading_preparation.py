@@ -243,12 +243,16 @@ def fetch_yf_daily_ohlcv(ticker: str, count: int = 60) -> pd.DataFrame:
         return pd.DataFrame()
 
     logger.debug(f"Yahoo Finance returned {len(df)} daily rows for {ticker}")
+    logger.debug(f"Columns before processing: {list(df.columns)}")
 
     if isinstance(df.columns, pd.MultiIndex):
-        df = df.droplevel(0, axis=1)
+        df = df.droplevel(1, axis=1)
+        logger.debug(f"Columns after droplevel: {list(df.columns)}")
 
     keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+    logger.debug(f"Columns to keep: {keep}")
     df = df[keep].dropna(how="any")
+    logger.debug(f"After dropna: {len(df)} rows")
     
     if len(df) < 50:
         logger.warning(
@@ -256,12 +260,18 @@ def fetch_yf_daily_ohlcv(ticker: str, count: int = 60) -> pd.DataFrame:
             f"Ticker may be a recent IPO or have limited trading history."
         )
 
+    if len(df) == 0:
+        logger.error(f"All rows dropped after dropna for {ticker}")
+        return pd.DataFrame()
+
     idx = pd.to_datetime(df.index)
+    logger.debug(f"Index timezone before conversion: {getattr(idx, 'tz', None)}")
     if getattr(idx, "tz", None) is None:
         idx = idx.tz_localize(NY_TZ)
     else:
         idx = idx.tz_convert(NY_TZ)
     df.index = idx
+    logger.debug(f"Index timezone after conversion: {getattr(df.index, 'tz', None)}")
     
     logger.debug(f"Returning {len(df.tail(max(count, 60)))} daily candles for {ticker}")
     return df.tail(max(count, 60))
@@ -309,7 +319,7 @@ def fetch_yf_hourly_ohlcv(ticker: str, count: int = 100) -> pd.DataFrame:
     logger.debug(f"Yahoo Finance returned {len(df)} hourly rows for {ticker}")
 
     if isinstance(df.columns, pd.MultiIndex):
-        df = df.droplevel(0, axis=1)
+        df = df.droplevel(1, axis=1)
 
     keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
     df = df[keep].dropna(how="any")
@@ -1031,8 +1041,10 @@ def main() -> None:
     # 8. Output
     # ==========================================================================
     cols = [
-        "NY_Time", "LastPrice", "Open", "High", "Low", "Close", "Volume",
-        "VolumeDay", "Session", "State", "Score", "TrendSummary",
+        "NY_Time", "Open", "High", "Low", "Close", "Volume",
+        "VolumeDay", "Session", "State", "Score",
+        "stable_30_50", "stable_10_30", "stable_3_10", "stable_1_3",
+        "TrendSummary",
     ]
     cols = [c for c in cols if c in df_1m.columns]
 
@@ -1042,7 +1054,8 @@ def main() -> None:
     print(f"30/50 (Daily):  {signals_30_50['trend_30_50']:>6} | Hold: {signals_30_50['hold_30_50']} | Stable: {signals_30_50['stable_30_50']}")
     print(f"10/30 (Hourly): {signals_10_30['trend_10_30']:>6} | Hold: {signals_10_30['hold_10_30']} | Stable: {signals_10_30['stable_10_30']}")
     print(f"3/10  (15m):    {signals_3_10['trend_3_10']:>6} | Hold: {signals_3_10['hold_3_10']} | Stable: {signals_3_10['stable_3_10']}")
-    print(f"Cumulative Vol: {cumulative_volume:,} | Avg 3M: {avg3m:,.0f if avg3m else 'N/A'}")
+    avg3m_str = f"{avg3m:,.0f}" if avg3m else "N/A"
+    print(f"Cumulative Vol: {cumulative_volume:,} | Avg 3M: {avg3m_str}")
     print(f"{'='*80}\n")
 
     print(df_1m[cols].tail(max(1, args.tail)).to_string(index=False))
