@@ -98,6 +98,56 @@ async def cleanup_task(storage: Storage, candle_engine: CandleEngine):
             logger.error(f"Error in cleanup task: {e}")
 
 
+async def websocket_status_task(storage: Storage, ws_manager: WebSocketManager):
+    """
+    Background task that periodically writes WebSocket status to database.
+    
+    Runs every 10 seconds to share WebSocket worker status with API workers.
+    This enables API workers to show real WebSocket status in /status endpoint.
+    
+    Optimized to only write to database if status has actually changed.
+    Compares all relevant fields including lists and timestamps.
+    """
+    logger = logging.getLogger(__name__)
+    logger.info("WebSocket status update task started (10s interval)")
+    
+    last_status = None
+    
+    while True:
+        try:
+            await asyncio.sleep(10)
+            
+            # Get current WebSocket status
+            status = ws_manager.get_status()
+            
+            # Only update if status changed (optimization)
+            # Compare all relevant fields including lists (convert to tuple for comparison)
+            status_key = (
+                status.get('connected'),
+                tuple(sorted(status.get('subscribed_tickers', []))),  # Sort for consistent comparison
+                status.get('subscribed_count'),
+                tuple(sorted(status.get('pending_subscribe', []))),   # Sort for consistent comparison
+                status.get('connection_count'),
+                status.get('tick_count'),
+                status.get('last_message')
+            )
+            
+            if last_status != status_key:
+                # Write to database (non-blocking)
+                await asyncio.to_thread(storage.update_websocket_status, status)
+                
+                logger.debug(f"Updated WebSocket status: connected={status.get('connected')}, tickers={status.get('subscribed_count')}")
+                last_status = status_key
+            else:
+                logger.debug("WebSocket status unchanged, skipping DB write")
+                
+        except asyncio.CancelledError:
+            logger.info("WebSocket status update task cancelled")
+            break
+        except Exception as e:
+            logger.error(f"Error in WebSocket status update task: {e}")
+
+
 async def run_worker(config: Config):
     """Run the WebSocket worker."""
     logger = logging.getLogger(__name__)
@@ -146,6 +196,9 @@ async def run_worker(config: Config):
     # Start background cleanup task
     cleanup_task_handle = asyncio.create_task(cleanup_task(storage, candle_engine))
     
+    # Start WebSocket status update task
+    status_task_handle = asyncio.create_task(websocket_status_task(storage, ws_manager))
+    
     logger.info("WebSocket worker running")
     
     # Setup signal handlers for graceful shutdown
@@ -165,10 +218,17 @@ async def run_worker(config: Config):
     # Cleanup
     logger.info("Shutting down...")
     
-    # Cancel background cleanup task
+    # Cancel background tasks
     cleanup_task_handle.cancel()
+    status_task_handle.cancel()
+    
     try:
         await cleanup_task_handle
+    except asyncio.CancelledError:
+        pass
+    
+    try:
+        await status_task_handle
     except asyncio.CancelledError:
         pass
     

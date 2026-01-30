@@ -162,6 +162,21 @@ class Storage:
             )
         ''')
         
+        # WebSocket status table (for multi-worker status sharing)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS websocket_status (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                connected INTEGER NOT NULL,
+                subscribed_tickers TEXT NOT NULL,
+                subscribed_count INTEGER NOT NULL,
+                pending_subscribe TEXT NOT NULL,
+                connection_count INTEGER NOT NULL,
+                tick_count INTEGER NOT NULL,
+                last_message TEXT,
+                last_update TEXT NOT NULL
+            )
+        ''')
+        
         conn.commit()
         logger.info(f"Database initialized at {self.db_path}")
     
@@ -673,6 +688,97 @@ class Storage:
         self._stats_cache_time = now
 
         return result
+    
+    # =========================================================================
+    # WebSocket Status (Multi-Worker Status Sharing)
+    # =========================================================================
+    
+    def update_websocket_status(self, status: Dict[str, Any]):
+        """
+        Update WebSocket status in database for multi-worker visibility.
+        
+        Called by WebSocket worker to share status with API workers.
+        Uses REPLACE to upsert single row (id=1).
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            REPLACE INTO websocket_status (
+                id, connected, subscribed_tickers, subscribed_count,
+                pending_subscribe, connection_count, tick_count,
+                last_message, last_update
+            ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            1 if status.get('connected') else 0,
+            json.dumps(status.get('subscribed_tickers', [])),
+            status.get('subscribed_count', 0),
+            json.dumps(status.get('pending_subscribe', [])),
+            status.get('connection_count', 0),
+            status.get('tick_count', 0),
+            status.get('last_message'),
+            datetime.now(timezone.utc).isoformat()
+        ))
+        
+        conn.commit()
+    
+    def get_websocket_status(self, stale_threshold_seconds: int = 30) -> Optional[Dict[str, Any]]:
+        """
+        Get WebSocket status from database.
+        
+        Args:
+            stale_threshold_seconds: Seconds after which status is considered stale (default: 30)
+        
+        Returns status dict with 'is_stale' flag if last update > threshold.
+        Returns None if no status has been written yet.
+        Handles JSON parsing errors and datetime parsing errors gracefully.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('SELECT * FROM websocket_status WHERE id = 1')
+        row = cursor.fetchone()
+        
+        if not row:
+            return None
+        
+        # Parse JSON fields with error handling
+        try:
+            subscribed_tickers = json.loads(row['subscribed_tickers'])
+        except (json.JSONDecodeError, TypeError) as e:
+            logger.error(f"Failed to parse subscribed_tickers JSON: {e}")
+            subscribed_tickers = []
+        
+        try:
+            pending_subscribe = json.loads(row['pending_subscribe'])
+        except (json.JSONDecodeError, TypeError) as e:
+            logger.error(f"Failed to parse pending_subscribe JSON: {e}")
+            pending_subscribe = []
+        
+        # Parse datetime with error handling
+        try:
+            last_update = datetime.fromisoformat(row['last_update'])
+            now = datetime.now(timezone.utc)
+            age_seconds = (now - last_update).total_seconds()
+            is_stale = age_seconds > stale_threshold_seconds
+        except (ValueError, TypeError) as e:
+            logger.error(f"Failed to parse last_update timestamp: {e}")
+            # If timestamp is malformed, consider it very stale
+            age_seconds = 999999
+            is_stale = True
+        
+        return {
+            'connected': bool(row['connected']),
+            'subscribed_tickers': subscribed_tickers,
+            'subscribed_count': row['subscribed_count'],
+            'pending_subscribe': pending_subscribe,
+            'connection_count': row['connection_count'],
+            'tick_count': row['tick_count'],
+            'last_message': row['last_message'],
+            'last_update': row['last_update'],
+            'is_stale': is_stale,
+            'age_seconds': age_seconds
+        }
 
 
 def _get_default_config_path() -> str:

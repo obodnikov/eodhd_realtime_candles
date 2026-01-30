@@ -94,21 +94,32 @@ class APIRoutes:
         # Check if this is a dummy WebSocketManager (API worker)
         # or a real WebSocket worker
         if self.ws_manager.is_dummy:
-            # API worker - provide database-based status
-            # Run DB operations in thread pool
-            ticker_count = await asyncio.to_thread(self.storage.get_ticker_count)
-            tickers = await asyncio.to_thread(self.storage.get_ticker_symbols)
+            # API worker - read WebSocket status from database
+            # Run DB operation in thread pool
+            stale_threshold = self.config_manager.config.ws_status_stale_seconds
+            ws_status = await asyncio.to_thread(
+                self.storage.get_websocket_status,
+                stale_threshold
+            )
             
-            ws_status = {
-                'connected': None,  # Use None to indicate status unavailable (consistent type)
-                'subscribed_tickers': tickers,
-                'subscribed_count': len(tickers),
-                'pending_subscribe': [],
-                'connection_count': 0,
-                'tick_count': 0,
-                'last_message': None,
-                'note': 'WebSocket status unavailable in API worker (check websocket_worker logs)'
-            }
+            if ws_status is None:
+                # No status written yet (WebSocket worker not started or just starting)
+                ticker_count = await asyncio.to_thread(self.storage.get_ticker_count)
+                tickers = await asyncio.to_thread(self.storage.get_ticker_symbols)
+                
+                ws_status = {
+                    'connected': False,
+                    'subscribed_tickers': tickers,
+                    'subscribed_count': len(tickers),
+                    'pending_subscribe': [],
+                    'connection_count': 0,
+                    'tick_count': 0,
+                    'last_message': None,
+                    'note': 'WebSocket worker not started yet or status not available'
+                }
+            elif ws_status.get('is_stale'):
+                # Status is stale (> threshold seconds old)
+                ws_status['note'] = f"WebSocket status is stale (last update {ws_status['age_seconds']:.0f}s ago)"
         else:
             # Real WebSocket worker - get actual status
             ws_status = self.ws_manager.get_status()
