@@ -204,10 +204,20 @@ async def run_worker(config: Config):
         ping_interval=config.ws_ping_interval
     )
     
+    # Semaphore to limit concurrent tick processing tasks
+    # Prevents unbounded task growth under high tick volume
+    tick_semaphore = asyncio.Semaphore(100)
+    
     # Create async tick handler that runs DB operations in thread pool
     async def async_process_tick(ticker: str, price: float, volume: int, timestamp_ms: int):
-        """Async wrapper for tick processing - runs DB ops in thread pool."""
-        await asyncio.to_thread(candle_engine.process_tick, ticker, price, volume, timestamp_ms)
+        """
+        Async wrapper for tick processing - runs DB ops in thread pool.
+        
+        Uses semaphore to limit concurrency and prevent unbounded task growth
+        when tick volume exceeds processing capacity.
+        """
+        async with tick_semaphore:
+            await asyncio.to_thread(candle_engine.process_tick, ticker, price, volume, timestamp_ms)
     
     # Wire up tick processing (async to avoid blocking event loop)
     ws_manager.set_on_tick(async_process_tick)
