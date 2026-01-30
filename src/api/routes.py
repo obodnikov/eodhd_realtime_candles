@@ -120,9 +120,20 @@ class APIRoutes:
             elif ws_status.get('is_stale'):
                 # Status is stale (> threshold seconds old)
                 ws_status['note'] = f"WebSocket status is stale (last update {ws_status['age_seconds']:.0f}s ago)"
+            
+            # Read active candles from database (API worker)
+            active_candles = await asyncio.to_thread(
+                self.storage.get_active_candles,
+                stale_threshold
+            )
+            
+            if active_candles is None:
+                # No active candles data or stale
+                active_candles = []
         else:
             # Real WebSocket worker - get actual status
             ws_status = self.ws_manager.get_status()
+            active_candles = self.candle_engine.get_active_tickers_summary()
         
         # Run DB operation in thread pool to avoid blocking event loop
         db_stats = await asyncio.to_thread(self.storage.get_stats)
@@ -135,7 +146,7 @@ class APIRoutes:
                 include_source=True,
                 overrides=overrides
             ),
-            'active_candles': self.candle_engine.get_active_tickers_summary(),
+            'active_candles': active_candles,
             'timestamp': datetime.now(timezone.utc).isoformat()
         })
     

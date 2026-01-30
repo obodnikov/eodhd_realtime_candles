@@ -148,6 +148,37 @@ async def websocket_status_task(storage: Storage, ws_manager: WebSocketManager):
             logger.error(f"Error in WebSocket status update task: {e}")
 
 
+async def active_candles_task(storage: Storage, candle_engine: CandleEngine):
+    """
+    Background task that periodically writes active candles to database.
+    
+    Runs every 10 seconds to share active candles from WebSocket worker with API workers.
+    This enables API workers to show real-time active candles on dashboard.
+    
+    Always writes to database (active candles change frequently).
+    """
+    logger = logging.getLogger(__name__)
+    logger.info("Active candles update task started (10s interval)")
+    
+    while True:
+        try:
+            await asyncio.sleep(10)
+            
+            # Get current active candles summary
+            active_candles = candle_engine.get_active_tickers_summary()
+            
+            # Write to database (non-blocking)
+            await asyncio.to_thread(storage.update_active_candles, active_candles)
+            
+            logger.debug(f"Updated active candles: {len(active_candles)} candles")
+                
+        except asyncio.CancelledError:
+            logger.info("Active candles update task cancelled")
+            break
+        except Exception as e:
+            logger.error(f"Error in active candles update task: {e}")
+
+
 async def run_worker(config: Config):
     """Run the WebSocket worker."""
     logger = logging.getLogger(__name__)
@@ -199,6 +230,9 @@ async def run_worker(config: Config):
     # Start WebSocket status update task
     status_task_handle = asyncio.create_task(websocket_status_task(storage, ws_manager))
     
+    # Start active candles update task
+    active_candles_task_handle = asyncio.create_task(active_candles_task(storage, candle_engine))
+    
     logger.info("WebSocket worker running")
     
     # Setup signal handlers for graceful shutdown
@@ -221,6 +255,7 @@ async def run_worker(config: Config):
     # Cancel background tasks
     cleanup_task_handle.cancel()
     status_task_handle.cancel()
+    active_candles_task_handle.cancel()
     
     try:
         await cleanup_task_handle
@@ -229,6 +264,11 @@ async def run_worker(config: Config):
     
     try:
         await status_task_handle
+    except asyncio.CancelledError:
+        pass
+    
+    try:
+        await active_candles_task_handle
     except asyncio.CancelledError:
         pass
     

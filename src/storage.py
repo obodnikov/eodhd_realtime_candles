@@ -244,6 +244,15 @@ class Storage:
             )
         ''')
         
+        # Active candles status table (for multi-worker status sharing)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS active_candles_status (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                data TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        ''')
+        
         conn.commit()
         logger.info(f"Database initialized at {self.db_path}")
     
@@ -918,6 +927,76 @@ class Storage:
             'is_stale': is_stale,
             'age_seconds': age_seconds
         }
+    
+    # =========================================================================
+    # Active Candles Status (Multi-Worker Status Sharing)
+    # =========================================================================
+    
+    def update_active_candles(self, candles: List[Dict[str, Any]]):
+        """
+        Update active candles status in database for multi-worker visibility.
+        
+        Called by WebSocket worker to share active candles with API workers.
+        Uses REPLACE to upsert single row (id=1).
+        
+        Args:
+            candles: List of active candle summaries from CandleEngine.get_active_tickers_summary()
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            REPLACE INTO active_candles_status (id, data, updated_at)
+            VALUES (1, ?, ?)
+        ''', (
+            json.dumps(candles),
+            datetime.now(timezone.utc).isoformat()
+        ))
+        
+        conn.commit()
+    
+    def get_active_candles(self, stale_threshold_seconds: int = 30) -> Optional[List[Dict[str, Any]]]:
+        """
+        Get active candles status from database.
+        
+        Args:
+            stale_threshold_seconds: Seconds after which status is considered stale (default: 30)
+        
+        Returns list of active candle summaries, or None if no data or stale.
+        Handles JSON parsing errors gracefully.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('SELECT * FROM active_candles_status WHERE id = 1')
+        row = cursor.fetchone()
+        
+        if not row:
+            return None
+        
+        # Check if data is stale
+        try:
+            updated_at = datetime.fromisoformat(row['updated_at'])
+            now = datetime.now(timezone.utc)
+            age_seconds = (now - updated_at).total_seconds()
+            
+            if age_seconds > stale_threshold_seconds:
+                logger.debug(f"Active candles data is stale ({age_seconds:.0f}s old)")
+                return None
+        except (ValueError, TypeError) as e:
+            logger.error(f"Failed to parse updated_at timestamp: {e}")
+            return None
+        
+        # Parse JSON data with error handling
+        try:
+            candles = json.loads(row['data'])
+            if not isinstance(candles, list):
+                logger.error("Active candles data is not a list")
+                return None
+            return candles
+        except (json.JSONDecodeError, TypeError) as e:
+            logger.error(f"Failed to parse active candles JSON: {e}")
+            return None
 
 
 def _get_default_config_path() -> str:
