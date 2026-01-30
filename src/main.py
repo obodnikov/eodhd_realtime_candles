@@ -73,8 +73,13 @@ async def create_app(config: Config) -> web.Application:
         ping_interval=config.ws_ping_interval
     )
     
-    # Wire up tick processing
-    ws_manager.set_on_tick(candle_engine.process_tick)
+    # Create async tick handler that runs DB operations in thread pool
+    async def async_process_tick(ticker: str, price: float, volume: int, timestamp_ms: int):
+        """Async wrapper for tick processing - runs DB ops in thread pool."""
+        await asyncio.to_thread(candle_engine.process_tick, ticker, price, volume, timestamp_ms)
+    
+    # Wire up tick processing (async to avoid blocking event loop)
+    ws_manager.set_on_tick(async_process_tick)
     
     # Store in app context
     app['config_manager'] = config_manager

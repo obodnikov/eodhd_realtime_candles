@@ -7,7 +7,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Set, Callable, Optional
+from typing import Set, Callable, Optional, Union, Awaitable
 import websockets
 from websockets.exceptions import ConnectionClosed
 
@@ -22,6 +22,7 @@ class WebSocketManager:
     - Automatic reconnection with configurable delay
     - Dynamic subscription management (add/remove tickers without restart)
     - Connection health monitoring
+    - Async tick processing to avoid blocking event loop
     """
     
     EODHD_WS_URL = "wss://ws.eodhistoricaldata.com/ws/us"
@@ -42,8 +43,8 @@ class WebSocketManager:
         self._connection_count = 0
         self._tick_count = 0
         
-        # Callback for processing ticks
-        self._on_tick: Optional[Callable[[str, float, int, int], None]] = None
+        # Callback for processing ticks (auto-detects sync vs async)
+        self._on_tick: Optional[Callable[[str, float, int, int], Union[None, Awaitable[None]]]] = None
         
         # Callback for connection status changes
         self._on_connection_change: Optional[Callable[[bool], None]] = None
@@ -60,11 +61,15 @@ class WebSocketManager:
     def url(self) -> str:
         return f"{self.EODHD_WS_URL}?api_token={self.api_key}"
     
-    def set_on_tick(self, callback: Callable[[str, float, int, int], None]):
+    def set_on_tick(self, callback: Callable[[str, float, int, int], Union[None, Awaitable[None]]]):
         """
         Set callback for tick processing.
         
         Callback signature: (ticker: str, price: float, volume: int, timestamp_ms: int)
+        
+        Supports both sync and async callbacks:
+        - Async callbacks are awaited directly (non-blocking)
+        - Sync callbacks are automatically run in thread pool to avoid blocking event loop
         """
         self._on_tick = callback
     
@@ -149,7 +154,7 @@ class WebSocketManager:
         await self._ws.send(json.dumps(msg))
         logger.debug(f"Sent unsubscribe: {tickers}")
     
-    def _process_message(self, message: str):
+    async def _process_message(self, message: str):
         """Process incoming WebSocket message."""
         try:
             data = json.loads(message)
@@ -171,7 +176,15 @@ class WebSocketManager:
                 self._last_message_time = datetime.now(timezone.utc)
                 
                 if self._on_tick:
-                    self._on_tick(ticker, price, volume, timestamp_ms)
+                    try:
+                        if asyncio.iscoroutinefunction(self._on_tick):
+                            # Async callback - await directly (already non-blocking)
+                            await self._on_tick(ticker, price, volume, timestamp_ms)
+                        else:
+                            # Sync callback - run in thread pool to avoid blocking event loop
+                            await asyncio.to_thread(self._on_tick, ticker, price, volume, timestamp_ms)
+                    except Exception as e:
+                        logger.error(f"Error in tick callback for {ticker}: {e}")
             else:
                 logger.debug(f"Unknown message format: {message[:100]}")
                 
@@ -212,7 +225,7 @@ class WebSocketManager:
                     async for message in ws:
                         if not self._running:
                             break
-                        self._process_message(message)
+                        await self._process_message(message)
                         
                         # Handle pending operations
                         if self._pending_subscribe:
