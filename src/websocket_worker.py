@@ -29,6 +29,7 @@ from dotenv import load_dotenv
 
 from .config import Config, ConfigManager
 from .storage import Storage
+from .storage_factory import create_storage, get_database_type
 from .candle_engine import CandleEngine
 from .websocket_manager import WebSocketManager
 
@@ -47,7 +48,7 @@ def setup_logging(level: str):
     logging.getLogger('websockets').setLevel(logging.WARNING)
 
 
-async def cleanup_task(storage: Storage, candle_engine: CandleEngine):
+async def cleanup_task(storage, candle_engine: CandleEngine):
     """
     Background task that processes pending candle cleanup.
     
@@ -98,7 +99,7 @@ async def cleanup_task(storage: Storage, candle_engine: CandleEngine):
             logger.error(f"Error in cleanup task: {e}")
 
 
-async def websocket_status_task(storage: Storage, ws_manager: WebSocketManager):
+async def websocket_status_task(storage, ws_manager: WebSocketManager):
     """
     Background task that periodically writes WebSocket status to database.
     
@@ -148,7 +149,7 @@ async def websocket_status_task(storage: Storage, ws_manager: WebSocketManager):
             logger.error(f"Error in WebSocket status update task: {e}")
 
 
-async def active_candles_task(storage: Storage, candle_engine: CandleEngine):
+async def active_candles_task(storage, candle_engine: CandleEngine):
     """
     Background task that periodically writes active candles to database.
     
@@ -185,7 +186,7 @@ async def run_worker(config: Config):
     
     # Initialize components
     config_manager = ConfigManager(config)
-    storage = Storage(config.database_path)
+    storage = create_storage(config)
     candle_engine = CandleEngine(
         storage=storage,
         interval_minutes=config.candle_interval_minutes,
@@ -325,7 +326,7 @@ def main():
     logger.info(f"Candle interval: {config.candle_interval_minutes} minutes")
     logger.info(f"Max tickers: {config.max_tickers}")
     logger.info(f"Max candles per ticker: {config.max_candles_stored}")
-    logger.info(f"Database: {config.database_path}")
+    logger.info(f"Database: {get_database_type()}")
     logger.info(f"Mode: WebSocket + tick processing (no HTTP server)")
     logger.info("=" * 60)
 

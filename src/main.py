@@ -24,6 +24,7 @@ from dotenv import load_dotenv
 
 from .config import Config, ConfigManager
 from .storage import Storage
+from .storage_factory import create_storage, get_database_type
 from .candle_engine import CandleEngine
 from .websocket_manager import WebSocketManager
 from .api import APIRoutes, create_auth_middleware, error_middleware, logging_middleware
@@ -61,7 +62,7 @@ async def create_app(config: Config) -> web.Application:
     
     # Initialize components
     config_manager = ConfigManager(config)
-    storage = Storage(config.database_path)
+    storage = create_storage(config)
     candle_engine = CandleEngine(
         storage=storage,
         interval_minutes=config.candle_interval_minutes,
@@ -245,7 +246,7 @@ def main():
     logger.info(f"Candle interval: {config.candle_interval_minutes} minutes")
     logger.info(f"Max tickers: {config.max_tickers}")
     logger.info(f"Max candles per ticker: {config.max_candles_stored}")
-    logger.info(f"Database: {config.database_path}")
+    logger.info(f"Database: {get_database_type()} ({config.database_path if get_database_type() == 'sqlite' else 'PostgreSQL'})")
     logger.info(f"HTTP server: {config.http_host}:{config.http_port}")
     logger.info("=" * 60)
 

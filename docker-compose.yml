@@ -27,8 +27,18 @@ services:
       - WS_RECONNECT_DELAY=${WS_RECONNECT_DELAY:-5}
       - WS_PING_INTERVAL=${WS_PING_INTERVAL:-30}
 
-      # Database path (inside container)
+      # Database configuration
+      - DATABASE_TYPE=${DATABASE_TYPE:-sqlite}
       - DATABASE_PATH=/data/candles.db
+      
+      # PostgreSQL settings (when DATABASE_TYPE=postgres)
+      - POSTGRES_HOST=${POSTGRES_HOST:-postgres}
+      - POSTGRES_PORT=${POSTGRES_PORT:-5432}
+      - POSTGRES_DB=${POSTGRES_DB:-eodhd_candles}
+      - POSTGRES_USER=${POSTGRES_USER:-eodhd_user}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-}
+      - POSTGRES_POOL_MIN=${POSTGRES_POOL_MIN:-2}
+      - POSTGRES_POOL_MAX=${POSTGRES_POOL_MAX:-10}
 
       # Logging
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
@@ -57,6 +67,56 @@ services:
 volumes:
   candle_data:
     name: eodhd_candle_data
+
+# =============================================================================
+# POSTGRESQL CONFIGURATION (Optional)
+# =============================================================================
+# To use PostgreSQL instead of SQLite:
+# 1. Set DATABASE_TYPE=postgres in your .env file
+# 2. Uncomment the postgres service below
+# 3. Set POSTGRES_PASSWORD in your .env file
+# 4. Run: docker-compose up -d
+#
+# PostgreSQL service (uncomment to enable):
+#
+#   postgres:
+#     image: postgres:16-alpine
+#     container_name: eodhd_postgres
+#     restart: unless-stopped
+#     environment:
+#       POSTGRES_DB: ${POSTGRES_DB:-eodhd_candles}
+#       POSTGRES_USER: ${POSTGRES_USER:-eodhd_user}
+#       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+#       POSTGRES_INITDB_ARGS: "-E UTF8 --locale=C"
+#     volumes:
+#       - postgres_data:/var/lib/postgresql/data
+#       - ./scripts/init_postgres.sql:/docker-entrypoint-initdb.d/init.sql
+#     ports:
+#       - "5432:5432"
+#     healthcheck:
+#       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-eodhd_user} -d ${POSTGRES_DB:-eodhd_candles}"]
+#       interval: 10s
+#       timeout: 5s
+#       retries: 5
+#     networks:
+#       - eodhd_network
+#
+# Add to volumes section:
+#   postgres_data:
+#     name: eodhd_postgres_data
+#
+# Add to eodhd-candles service:
+#   depends_on:
+#     postgres:
+#       condition: service_healthy
+#   networks:
+#     - eodhd_network
+#
+# Add networks section:
+# networks:
+#   eodhd_network:
+#     driver: bridge
+# =============================================================================
 
 # =============================================================================
 # NETWORK CONFIGURATION
