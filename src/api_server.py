@@ -76,7 +76,8 @@ async def create_app(config: Config) -> web.Application:
     ws_manager = WebSocketManager(
         api_key=config.eodhd_api_key,
         reconnect_delay=config.ws_reconnect_delay,
-        ping_interval=config.ws_ping_interval
+        ping_interval=config.ws_ping_interval,
+        is_dummy=True  # Mark as dummy to distinguish from real WebSocket worker
     )
     
     # Store in app context

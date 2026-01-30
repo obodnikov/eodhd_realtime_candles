@@ -5,7 +5,7 @@ Tests the API-only worker that handles HTTP requests without WebSocket processin
 """
 
 import pytest
-from unittest.mock import Mock, patch, AsyncMock
+from unittest.mock import patch
 from aiohttp import web
 from aiohttp.test_utils import AioHTTPTestCase, unittest_run_loop
 
@@ -22,7 +22,8 @@ class TestAPIServer(AioHTTPTestCase):
         config.eodhd_api_key = 'test_key'
         config.api_key = 'test_api_key'
         config.database_path = ':memory:'
-        return await create_app(config)
+        app = await create_app(config)
+        return app
 
     @unittest_run_loop
     async def test_health_endpoint(self):
@@ -65,6 +66,93 @@ class TestAPIServer(AioHTTPTestCase):
         ws_manager = self.app['ws_manager']
         # API worker should have dummy WebSocket manager (not connected)
         assert not ws_manager.connected
+        # Verify it's marked as dummy
+        assert ws_manager.is_dummy is True
+
+
+class TestAPIServerStatusEndpoint(AioHTTPTestCase):
+    """Test status endpoint with dummy WebSocketManager."""
+
+    async def get_application(self):
+        """Create test application."""
+        config = Config()
+        config.eodhd_api_key = 'test_key'
+        config.api_key = 'test_api_key'
+        config.database_path = ':memory:'
+        app = await create_app(config)
+        return app
+
+    @unittest_run_loop
+    async def test_status_with_dummy_websocket_manager(self):
+        """Test status endpoint returns database-based status for dummy WebSocketManager."""
+        # Add a ticker to database
+        storage = self.app['storage']
+        storage.add_ticker('AAPL')
+        
+        headers = {'X-API-Key': 'test_api_key'}
+        resp = await self.client.request("GET", "/status", headers=headers)
+        
+        assert resp.status == 200
+        data = await resp.json()
+        
+        # Verify WebSocket status structure for dummy manager
+        ws_status = data['websocket']
+        assert ws_status['connected'] is None  # None indicates unavailable
+        assert 'AAPL' in ws_status['subscribed_tickers']
+        assert ws_status['subscribed_count'] == 1
+        assert 'note' in ws_status
+        assert 'API worker' in ws_status['note']
+
+    @unittest_run_loop
+    async def test_status_with_no_tickers(self):
+        """Test status endpoint with dummy WebSocketManager and no tickers."""
+        headers = {'X-API-Key': 'test_api_key'}
+        resp = await self.client.request("GET", "/status", headers=headers)
+        
+        assert resp.status == 200
+        data = await resp.json()
+        
+        # Verify WebSocket status with no tickers
+        ws_status = data['websocket']
+        assert ws_status['connected'] is None
+        assert ws_status['subscribed_tickers'] == []
+        assert ws_status['subscribed_count'] == 0
+
+    @unittest_run_loop
+    async def test_status_type_consistency(self):
+        """Test status endpoint returns consistent types for connected field."""
+        headers = {'X-API-Key': 'test_api_key'}
+        resp = await self.client.request("GET", "/status", headers=headers)
+        
+        assert resp.status == 200
+        data = await resp.json()
+        
+        # Verify connected field is None (not string 'unknown')
+        ws_status = data['websocket']
+        assert ws_status['connected'] is None
+        assert not isinstance(ws_status['connected'], str)
+
+    @unittest_run_loop
+    async def test_status_with_real_websocket_manager(self):
+        """Test status endpoint with real (non-dummy) WebSocketManager."""
+        from src.websocket_manager import WebSocketManager
+        
+        # Replace dummy with real WebSocketManager (not started)
+        self.app['ws_manager'] = WebSocketManager(
+            api_key='test_key',
+            is_dummy=False  # Real manager
+        )
+        
+        headers = {'X-API-Key': 'test_api_key'}
+        resp = await self.client.request("GET", "/status", headers=headers)
+        
+        assert resp.status == 200
+        data = await resp.json()
+        
+        # Verify WebSocket status from real manager
+        ws_status = data['websocket']
+        assert ws_status['connected'] is False  # Boolean, not None
+        assert 'note' not in ws_status  # No note for real manager
 
 
 class TestAPIServerConfiguration:
@@ -86,48 +174,26 @@ class TestAPIServerConfiguration:
         # This test verifies the mocking works
         assert mock_config is not None
 
-    @pytest.mark.asyncio
-    async def test_create_app_with_no_auth(self):
-        """Test app creation without API key."""
-        config = Config()
-        config.eodhd_api_key = 'test_key'
-        config.api_key = None  # No auth
-        config.database_path = ':memory:'
-        
-        # Create app without auth middleware
-        app = await create_app(config)
-        
-        # Verify app was created
-        assert app is not None
-        assert isinstance(app, web.Application)
-        
-        # Verify middleware count (no auth middleware)
-        assert len(app.middlewares) == 2  # error + logging only
-        
-        # Verify components are initialized
-        assert 'config_manager' in app
-        assert 'storage' in app
-        assert 'candle_engine' in app
-        assert 'ws_manager' in app
 
-
-class TestAPIServerMiddleware:
+class TestAPIServerMiddleware(AioHTTPTestCase):
     """Test middleware configuration."""
 
-    @pytest.mark.asyncio
-    async def test_auth_middleware_added_when_api_key_set(self):
-        """Test auth middleware is added when API key is configured."""
+    async def get_application(self):
+        """Create test application with auth."""
         config = Config()
         config.eodhd_api_key = 'test_key'
         config.api_key = 'test_api_key'
         config.database_path = ':memory:'
-        
         app = await create_app(config)
-        
-        # Check middleware is present
-        assert len(app.middlewares) >= 3  # auth + error + logging
+        return app
 
-    @pytest.mark.asyncio
+    @unittest_run_loop
+    async def test_auth_middleware_added_when_api_key_set(self):
+        """Test auth middleware is added when API key is configured."""
+        # Check middleware is present
+        assert len(self.app.middlewares) >= 3  # auth + error + logging
+
+    @unittest_run_loop
     async def test_no_auth_middleware_when_no_api_key(self):
         """Test auth middleware is not added when no API key."""
         config = Config()

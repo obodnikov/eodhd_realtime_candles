@@ -27,10 +27,11 @@ class WebSocketManager:
     
     EODHD_WS_URL = "wss://ws.eodhistoricaldata.com/ws/us"
     
-    def __init__(self, api_key: str, reconnect_delay: int = 5, ping_interval: int = 30):
+    def __init__(self, api_key: str, reconnect_delay: int = 5, ping_interval: int = 30, is_dummy: bool = False):
         self.api_key = api_key
         self.reconnect_delay = reconnect_delay
         self.ping_interval = ping_interval
+        self.is_dummy = is_dummy  # Flag to identify dummy instances in API workers
         
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._subscribed_tickers: Set[str] = set()

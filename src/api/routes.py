@@ -91,7 +91,28 @@ class APIRoutes:
     
     async def status(self, request: web.Request) -> web.Response:
         """GET /status - Detailed system status."""
-        ws_status = self.ws_manager.get_status()
+        # Check if this is a dummy WebSocketManager (API worker)
+        # or a real WebSocket worker
+        if self.ws_manager.is_dummy:
+            # API worker - provide database-based status
+            # Run DB operations in thread pool
+            ticker_count = await asyncio.to_thread(self.storage.get_ticker_count)
+            tickers = await asyncio.to_thread(self.storage.get_ticker_symbols)
+            
+            ws_status = {
+                'connected': None,  # Use None to indicate status unavailable (consistent type)
+                'subscribed_tickers': tickers,
+                'subscribed_count': len(tickers),
+                'pending_subscribe': [],
+                'connection_count': 0,
+                'tick_count': 0,
+                'last_message': None,
+                'note': 'WebSocket status unavailable in API worker (check websocket_worker logs)'
+            }
+        else:
+            # Real WebSocket worker - get actual status
+            ws_status = self.ws_manager.get_status()
+        
         # Run DB operation in thread pool to avoid blocking event loop
         db_stats = await asyncio.to_thread(self.storage.get_stats)
         overrides = self.config_manager.get_overrides()
