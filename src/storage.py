@@ -56,13 +56,28 @@ class Storage:
     
     # Cache TTL for get_stats() in seconds
     STATS_CACHE_TTL = 5.0
-    
-    # Retry configuration for database operations
-    MAX_RETRIES = 3
-    RETRY_BASE_DELAY = 0.05  # 50ms base delay for exponential backoff
 
-    def __init__(self, db_path: str):
+    def __init__(
+        self, 
+        db_path: str,
+        max_retries: int = 3,
+        retry_base_delay_ms: int = 50,
+        busy_timeout_ms: int = 10000
+    ):
+        """
+        Initialize SQLite storage.
+        
+        Args:
+            db_path: Path to SQLite database file
+            max_retries: Number of retry attempts on database lock (default: 3)
+            retry_base_delay_ms: Base delay in milliseconds for exponential backoff (default: 50)
+            busy_timeout_ms: SQLite busy_timeout in milliseconds (default: 10000)
+        """
         self.db_path = db_path
+        self.max_retries = max_retries
+        self.retry_base_delay = retry_base_delay_ms / 1000.0  # Convert to seconds
+        self.busy_timeout = busy_timeout_ms / 1000.0  # Convert to seconds
+        
         self._local = threading.local()
         self._stats_cache: Optional[Dict[str, Any]] = None
         self._stats_cache_time: float = 0.0
@@ -91,7 +106,7 @@ class Storage:
             operation: Callable that performs the database operation
             operation_name: Description for logging (e.g., "save candle for AAPL")
             is_critical: If True, raises exception on final failure. If False, logs and returns None.
-            max_retries: Override default MAX_RETRIES
+            max_retries: Override default max_retries
             
         Returns:
             Result of operation, or None if non-critical and failed
@@ -99,7 +114,7 @@ class Storage:
         Raises:
             Exception: If critical operation fails after all retries
         """
-        retries = max_retries if max_retries is not None else self.MAX_RETRIES
+        retries = max_retries if max_retries is not None else self.max_retries
         
         for attempt in range(retries):
             try:
@@ -107,7 +122,7 @@ class Storage:
             except sqlite3.OperationalError as e:
                 if 'locked' in str(e).lower() and attempt < retries - 1:
                     # Database locked - retry with exponential backoff
-                    wait_time = self.RETRY_BASE_DELAY * (2 ** attempt)  # 50ms, 100ms, 200ms
+                    wait_time = self.retry_base_delay * (2 ** attempt)
                     logger.warning(
                         f"Database locked during {operation_name}, "
                         f"retry {attempt + 1}/{retries} after {wait_time*1000:.0f}ms"
@@ -140,13 +155,13 @@ class Storage:
         - WAL journal mode for better read/write concurrency
         - NORMAL synchronous for fewer fsyncs (good trade-off for this use case)
         - busy_timeout to wait on locks instead of failing immediately
-        - Balanced timeout for multi-worker scenarios (10s - enough for retries but won't hang APIs)
+        - Configurable timeout for multi-worker scenarios
         """
         if not hasattr(self._local, 'connection'):
             conn = sqlite3.connect(
                 self.db_path,
                 check_same_thread=False,
-                timeout=10.0,  # Balanced timeout: enough for retries, won't hang APIs
+                timeout=self.busy_timeout,
             )
             conn.row_factory = sqlite3.Row
 
@@ -155,8 +170,8 @@ class Storage:
                 conn.execute("PRAGMA journal_mode=WAL;")
                 # Reduce fsyncs - acceptable trade-off for this use case
                 conn.execute("PRAGMA synchronous=NORMAL;")
-                # Wait up to 10 seconds if database is locked
-                conn.execute("PRAGMA busy_timeout=10000;")
+                # Wait if database is locked (configurable via busy_timeout_ms)
+                conn.execute(f"PRAGMA busy_timeout={int(self.busy_timeout * 1000)};")
                 # Cache size for better performance (10MB)
                 # Note: In memory-constrained environments, this can be reduced
                 conn.execute("PRAGMA cache_size=-10000;")

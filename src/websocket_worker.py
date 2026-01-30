@@ -185,11 +185,18 @@ async def run_worker(config: Config):
     
     # Initialize components
     config_manager = ConfigManager(config)
-    storage = Storage(config.database_path)
+    storage = Storage(
+        db_path=config.database_path,
+        max_retries=config.db_max_retries,
+        retry_base_delay_ms=config.db_retry_base_delay_ms,
+        busy_timeout_ms=config.db_busy_timeout_ms
+    )
     candle_engine = CandleEngine(
         storage=storage,
         interval_minutes=config.candle_interval_minutes,
-        max_candles=config.max_candles_stored
+        max_candles=config.max_candles_stored,
+        save_every_n_ticks=config.candle_save_every_n_ticks,
+        save_every_m_seconds=config.candle_save_every_m_seconds
     )
     ws_manager = WebSocketManager(
         api_key=config.eodhd_api_key,

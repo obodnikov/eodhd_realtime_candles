@@ -57,17 +57,32 @@ class CandleEngine:
     ephemeral current candle persistence.
     """
     
-    # Save current candle state every N ticks or M seconds (whichever comes first)
-    # These thresholds balance performance (reduce DB writes) vs. data loss risk
-    SAVE_EVERY_N_TICKS = 10
-    SAVE_EVERY_M_SECONDS = 5.0
-    
-    def __init__(self, storage: Storage, interval_minutes: int = 5, 
-                 max_candles: int = 100):
+    def __init__(
+        self, 
+        storage: Storage, 
+        interval_minutes: int = 5, 
+        max_candles: int = 100,
+        save_every_n_ticks: int = 10,
+        save_every_m_seconds: float = 5.0
+    ):
+        """
+        Initialize candle engine.
+        
+        Args:
+            storage: Storage instance for persistence
+            interval_minutes: Candle interval in minutes (1, 5, 15, 30, 60)
+            max_candles: Maximum candles to store per ticker
+            save_every_n_ticks: Save current candle every N ticks (default: 10)
+            save_every_m_seconds: Save current candle every M seconds (default: 5.0)
+        """
         self.storage = storage
         self.interval_minutes = interval_minutes
         self.interval_seconds = interval_minutes * 60
         self.max_candles = max_candles
+        
+        # Configurable save frequency thresholds
+        self.save_every_n_ticks = save_every_n_ticks
+        self.save_every_m_seconds = save_every_m_seconds
         
         # Lock for thread-safe access to shared state
         # Required because process_tick runs in thread pool (asyncio.to_thread)
@@ -84,7 +99,7 @@ class CandleEngine:
         self._on_candle_complete: Optional[Callable[[Candle], None]] = None
         
         logger.info(f"CandleEngine initialized: {interval_minutes}m interval, max {max_candles} candles")
-        logger.info(f"Tick-save frequency: every {self.SAVE_EVERY_N_TICKS} ticks or {self.SAVE_EVERY_M_SECONDS}s")
+        logger.info(f"Tick-save frequency: every {self.save_every_n_ticks} ticks or {self.save_every_m_seconds}s")
     
     def set_interval(self, interval_minutes: int):
         """
@@ -244,8 +259,8 @@ class CandleEngine:
                     # Save to DB only if threshold reached
                     time_since_save = current_time - current.last_save_time
                     should_save = (
-                        current.ticks_since_save >= self.SAVE_EVERY_N_TICKS or
-                        time_since_save >= self.SAVE_EVERY_M_SECONDS
+                        current.ticks_since_save >= self.save_every_n_ticks or
+                        time_since_save >= self.save_every_m_seconds
                     )
                     
                     if should_save:
