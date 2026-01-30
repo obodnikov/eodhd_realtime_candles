@@ -489,8 +489,11 @@ class APIRoutes:
                 int(to_timestamp) if to_timestamp else None
             )
 
-            # Update last request timestamp
-            await asyncio.to_thread(self.storage.update_ticker_last_request, ticker)
+            # Update last request timestamp (non-blocking, fire-and-forget)
+            try:
+                await asyncio.to_thread(self.storage.update_ticker_last_request, ticker)
+            except Exception as e:
+                logger.warning(f"Failed to update last_request for {ticker}: {e}")
 
             # Add ticker field to each candle and append to flat list
             for candle in candles:
@@ -531,8 +534,11 @@ class APIRoutes:
             int(to_timestamp) if to_timestamp else None
         )
         
-        # Update last request timestamp
-        await asyncio.to_thread(self.storage.update_ticker_last_request, ticker)
+        # Update last request timestamp (non-blocking, fire-and-forget)
+        try:
+            await asyncio.to_thread(self.storage.update_ticker_last_request, ticker)
+        except Exception as e:
+            logger.warning(f"Failed to update last_request for {ticker}: {e}")
 
         return web.json_response({
             'ticker': ticker,
@@ -554,8 +560,11 @@ class APIRoutes:
                 status=404
             )
         
-        # Update last request timestamp (run in thread pool)
-        await asyncio.to_thread(self.storage.update_ticker_last_request, ticker)
+        # Update last request timestamp (non-blocking, fire-and-forget)
+        try:
+            await asyncio.to_thread(self.storage.update_ticker_last_request, ticker)
+        except Exception as e:
+            logger.warning(f"Failed to update last_request for {ticker}: {e}")
         
         return web.json_response({
             'ticker': ticker,
@@ -688,8 +697,11 @@ class APIRoutes:
         if len(aggregated) > count:
             aggregated = aggregated[-count:]
 
-        # Update last request timestamp (run in thread pool)
-        await asyncio.to_thread(self.storage.update_ticker_last_request, ticker)
+        # Update last request timestamp (non-blocking, fire-and-forget)
+        try:
+            await asyncio.to_thread(self.storage.update_ticker_last_request, ticker)
+        except Exception as e:
+            logger.warning(f"Failed to update last_request for {ticker}: {e}")
 
         return web.json_response({
             'ticker': ticker,
@@ -737,8 +749,11 @@ class APIRoutes:
             )
             result[ticker] = [c.to_dict() for c in candles]
             
-            # Update last request timestamp
-            await asyncio.to_thread(self.storage.update_ticker_last_request, ticker)
+            # Update last request timestamp (non-blocking, fire-and-forget)
+            try:
+                await asyncio.to_thread(self.storage.update_ticker_last_request, ticker)
+            except Exception as e:
+                logger.warning(f"Failed to update last_request for {ticker}: {e}")
         
         return web.json_response({
             'interval': f"{interval_minutes}m",

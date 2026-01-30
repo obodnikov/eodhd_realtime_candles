@@ -8,7 +8,7 @@ import json
 import logging
 import time
 from datetime import datetime, timezone
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Callable
 from dataclasses import dataclass, asdict
 from pathlib import Path
 import threading
@@ -56,6 +56,10 @@ class Storage:
     
     # Cache TTL for get_stats() in seconds
     STATS_CACHE_TTL = 5.0
+    
+    # Retry configuration for database operations
+    MAX_RETRIES = 3
+    RETRY_BASE_DELAY = 0.05  # 50ms base delay for exponential backoff
 
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -68,6 +72,65 @@ class Storage:
     def _ensure_directory(self):
         """Ensure the database directory exists."""
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+    
+    def _execute_with_retry(
+        self,
+        operation: Callable[[], Any],
+        operation_name: str,
+        is_critical: bool = True,
+        max_retries: Optional[int] = None
+    ) -> Optional[Any]:
+        """
+        Execute a database operation with retry logic for lock contention.
+        
+        Uses exponential backoff to handle transient database locks without
+        blocking for extended periods. Non-blocking approach suitable for
+        use with asyncio.to_thread().
+        
+        Args:
+            operation: Callable that performs the database operation
+            operation_name: Description for logging (e.g., "save candle for AAPL")
+            is_critical: If True, raises exception on final failure. If False, logs and returns None.
+            max_retries: Override default MAX_RETRIES
+            
+        Returns:
+            Result of operation, or None if non-critical and failed
+            
+        Raises:
+            Exception: If critical operation fails after all retries
+        """
+        retries = max_retries if max_retries is not None else self.MAX_RETRIES
+        
+        for attempt in range(retries):
+            try:
+                return operation()
+            except sqlite3.OperationalError as e:
+                if 'locked' in str(e).lower() and attempt < retries - 1:
+                    # Database locked - retry with exponential backoff
+                    wait_time = self.RETRY_BASE_DELAY * (2 ** attempt)  # 50ms, 100ms, 200ms
+                    logger.warning(
+                        f"Database locked during {operation_name}, "
+                        f"retry {attempt + 1}/{retries} after {wait_time*1000:.0f}ms"
+                    )
+                    time.sleep(wait_time)
+                else:
+                    # Final attempt failed or non-lock error
+                    if is_critical:
+                        logger.error(f"Failed {operation_name} after {attempt + 1} attempts: {e}")
+                        raise
+                    else:
+                        logger.error(f"Failed {operation_name} after {attempt + 1} attempts: {e}")
+                        return None
+            except Exception as e:
+                # Unexpected error
+                if is_critical:
+                    logger.error(f"Unexpected error during {operation_name}: {e}")
+                    raise
+                else:
+                    logger.error(f"Unexpected error during {operation_name}: {e}")
+                    return None
+        
+        return None
         
     def _get_connection(self) -> sqlite3.Connection:
         """
@@ -77,12 +140,13 @@ class Storage:
         - WAL journal mode for better read/write concurrency
         - NORMAL synchronous for fewer fsyncs (good trade-off for this use case)
         - busy_timeout to wait on locks instead of failing immediately
+        - Balanced timeout for multi-worker scenarios (10s - enough for retries but won't hang APIs)
         """
         if not hasattr(self._local, 'connection'):
             conn = sqlite3.connect(
                 self.db_path,
                 check_same_thread=False,
-                timeout=5.0,  # seconds to wait when database is locked
+                timeout=10.0,  # Balanced timeout: enough for retries, won't hang APIs
             )
             conn.row_factory = sqlite3.Row
 
@@ -91,8 +155,11 @@ class Storage:
                 conn.execute("PRAGMA journal_mode=WAL;")
                 # Reduce fsyncs - acceptable trade-off for this use case
                 conn.execute("PRAGMA synchronous=NORMAL;")
-                # Wait up to 5 seconds if database is locked
-                conn.execute("PRAGMA busy_timeout=5000;")
+                # Wait up to 10 seconds if database is locked
+                conn.execute("PRAGMA busy_timeout=10000;")
+                # Cache size for better performance (10MB)
+                # Note: In memory-constrained environments, this can be reduced
+                conn.execute("PRAGMA cache_size=-10000;")
             except Exception as e:
                 # PRAGMA tuning is best-effort - don't break startup if it fails
                 logger.warning(f"Failed to apply SQLite PRAGMA settings: {e}")
@@ -203,24 +270,36 @@ class Storage:
     
     def remove_ticker(self, symbol: str) -> bool:
         """Remove a ticker and its candles. Returns True if removed."""
-        conn = self._get_connection()
-        cursor = conn.cursor()
+        def _remove():
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            
+            symbol_upper = symbol.upper()
+            
+            # Remove candles first
+            cursor.execute('DELETE FROM candles WHERE ticker = ?', (symbol_upper,))
+            
+            # Remove ticker
+            cursor.execute('DELETE FROM tickers WHERE symbol = ?', (symbol_upper,))
+            removed = cursor.rowcount > 0
+            
+            conn.commit()
+            
+            if removed:
+                logger.info(f"Removed ticker and candles: {symbol_upper}")
+            
+            return removed
         
-        symbol = symbol.upper()
+        result = self._execute_with_retry(
+            operation=_remove,
+            operation_name=f"remove ticker {symbol}",
+            is_critical=True
+        )
         
-        # Remove candles first
-        cursor.execute('DELETE FROM candles WHERE ticker = ?', (symbol,))
+        # Invalidate stats cache
+        self._stats_cache = None
         
-        # Remove ticker
-        cursor.execute('DELETE FROM tickers WHERE symbol = ?', (symbol,))
-        removed = cursor.rowcount > 0
-        
-        conn.commit()
-        
-        if removed:
-            logger.info(f"Removed ticker and candles: {symbol}")
-        
-        return removed
+        return result if result is not None else False
     
     def get_tickers(self) -> List[TrackedTicker]:
         """Get all tracked tickers with their status."""
@@ -420,37 +499,64 @@ class Storage:
         return list(reversed(candles))
     
     def update_ticker_last_request(self, symbol: str):
-        """Update last candle request timestamp for a ticker."""
-        conn = self._get_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-            UPDATE tickers 
-            SET last_candle_request_at = ?
-            WHERE symbol = ?
-        ''', (datetime.now(timezone.utc).isoformat(), symbol.upper()))
-        conn.commit()
+        """
+        Update last candle request timestamp for a ticker.
+        
+        This is a non-critical operation - failures are logged but don't raise exceptions.
+        Uses retry logic with exponential backoff for database lock contention.
+        
+        Args:
+            symbol: Ticker symbol
+        """
+        def _update():
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE tickers 
+                SET last_candle_request_at = ?
+                WHERE symbol = ?
+            ''', (datetime.now(timezone.utc).isoformat(), symbol.upper()))
+            conn.commit()
+        
+        self._execute_with_retry(
+            operation=_update,
+            operation_name=f"update last_request for {symbol}",
+            is_critical=False  # Non-critical - don't fail API calls
+        )
 
     def delete_all_tickers(self) -> int:
         """
         Remove all tickers from tracking and delete their candle data.
         Returns count of removed tickers.
         """
-        conn = self._get_connection()
-        cursor = conn.cursor()
+        def _delete_all():
+            conn = self._get_connection()
+            cursor = conn.cursor()
 
-        # Get count before deletion
-        cursor.execute('SELECT COUNT(*) FROM tickers')
-        count = cursor.fetchone()[0]
+            # Get count before deletion
+            cursor.execute('SELECT COUNT(*) FROM tickers')
+            count = cursor.fetchone()[0]
 
-        # Delete all candles first
-        cursor.execute('DELETE FROM candles')
+            # Delete all candles first
+            cursor.execute('DELETE FROM candles')
 
-        # Delete all tickers
-        cursor.execute('DELETE FROM tickers')
+            # Delete all tickers
+            cursor.execute('DELETE FROM tickers')
 
-        conn.commit()
-        logger.info(f"Deleted all {count} tickers and their candle data")
-        return count
+            conn.commit()
+            logger.info(f"Deleted all {count} tickers and their candle data")
+            return count
+        
+        result = self._execute_with_retry(
+            operation=_delete_all,
+            operation_name="delete all tickers",
+            is_critical=True
+        )
+        
+        # Invalidate stats cache
+        self._stats_cache = None
+        
+        return result if result is not None else 0
 
     def cleanup_orphaned_candles(self) -> int:
         """
@@ -463,10 +569,10 @@ class Storage:
 
         Returns count of deleted candle records.
         """
-        conn = self._get_connection()
-        cursor = conn.cursor()
+        def _cleanup():
+            conn = self._get_connection()
+            cursor = conn.cursor()
 
-        try:
             # Use IMMEDIATE transaction to lock the database for writing
             # This prevents concurrent modifications during cleanup
             cursor.execute('BEGIN IMMEDIATE')
@@ -487,35 +593,53 @@ class Storage:
                 logger.debug("No orphaned candles found")
 
             return deleted
-
-        except Exception as e:
-            conn.rollback()
-            logger.error(f"Failed to cleanup orphaned candles: {e}")
-            raise
+        
+        result = self._execute_with_retry(
+            operation=_cleanup,
+            operation_name="cleanup orphaned candles",
+            is_critical=True
+        )
+        
+        # Invalidate stats cache
+        self._stats_cache = None
+        
+        return result if result is not None else 0
 
     # =========================================================================
     # Candle Management
     # =========================================================================
     
     def save_candle(self, candle: Candle):
-        """Save or update a candle."""
-        conn = self._get_connection()
-        cursor = conn.cursor()
+        """
+        Save or update a candle with retry logic for database lock contention.
         
-        cursor.execute('''
-            INSERT OR REPLACE INTO candles 
-            (ticker, timestamp, datetime_utc, open, high, low, close, 
-             volume, tick_count, is_complete, interval_minutes)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            candle.ticker, candle.timestamp, candle.datetime_utc,
-            candle.open, candle.high, candle.low, candle.close,
-            candle.volume, candle.tick_count, 
-            1 if candle.is_complete else 0,
-            candle.interval_minutes
-        ))
+        Args:
+            candle: Candle object to save
+        """
+        def _save():
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT OR REPLACE INTO candles 
+                (ticker, timestamp, datetime_utc, open, high, low, close, 
+                 volume, tick_count, is_complete, interval_minutes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                candle.ticker, candle.timestamp, candle.datetime_utc,
+                candle.open, candle.high, candle.low, candle.close,
+                candle.volume, candle.tick_count, 
+                1 if candle.is_complete else 0,
+                candle.interval_minutes
+            ))
+            
+            conn.commit()
         
-        conn.commit()
+        self._execute_with_retry(
+            operation=_save,
+            operation_name=f"save candle for {candle.ticker}",
+            is_critical=True
+        )
     
     def get_candles(self, ticker: str, count: int = 10, 
                    include_current: bool = True,
@@ -611,24 +735,39 @@ class Storage:
         conn.commit()
     
     def cleanup_old_candles(self, ticker: str, max_candles: int):
-        """Remove old candles keeping only the most recent max_candles."""
-        conn = self._get_connection()
-        cursor = conn.cursor()
+        """
+        Remove old candles keeping only the most recent max_candles.
         
-        cursor.execute('''
-            DELETE FROM candles 
-            WHERE ticker = ? AND id NOT IN (
-                SELECT id FROM candles 
-                WHERE ticker = ? 
-                ORDER BY timestamp DESC 
-                LIMIT ?
-            )
-        ''', (ticker.upper(), ticker.upper(), max_candles))
+        This is a non-critical operation - failures are logged but don't raise exceptions.
         
-        deleted = cursor.rowcount
-        if deleted > 0:
-            conn.commit()
-            logger.debug(f"Cleaned up {deleted} old candles for {ticker}")
+        Args:
+            ticker: Ticker symbol
+            max_candles: Maximum number of candles to keep
+        """
+        def _cleanup():
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                DELETE FROM candles 
+                WHERE ticker = ? AND id NOT IN (
+                    SELECT id FROM candles 
+                    WHERE ticker = ? 
+                    ORDER BY timestamp DESC 
+                    LIMIT ?
+                )
+            ''', (ticker.upper(), ticker.upper(), max_candles))
+            
+            deleted = cursor.rowcount
+            if deleted > 0:
+                conn.commit()
+                logger.debug(f"Cleaned up {deleted} old candles for {ticker}")
+        
+        self._execute_with_retry(
+            operation=_cleanup,
+            operation_name=f"cleanup old candles for {ticker}",
+            is_critical=False  # Non-critical - don't fail on cleanup errors
+        )
     
     # =========================================================================
     # Statistics
