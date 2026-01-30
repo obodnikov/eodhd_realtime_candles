@@ -388,3 +388,13 @@ class CandleEngine:
         """Clear the pending cleanup queue after processing."""
         with self._lock:
             self._pending_cleanup.clear()
+
+    def remove_from_pending_cleanup(self, ticker: str):
+        """
+        Remove a single ticker from pending cleanup.
+        
+        Used by cleanup task to remove tickers one-by-one after successful
+        cleanup, preventing data loss if task is cancelled mid-processing.
+        """
+        with self._lock:
+            self._pending_cleanup.discard(ticker)
