@@ -1,6 +1,6 @@
 # Multi-Worker Deployment Guide
 
-**Version**: 0.4.6  
+**Version**: 0.6.0  
 **Architecture**: Option A - Separate API and WebSocket Processes
 
 ## Overview
