@@ -66,6 +66,15 @@ class Config:
 
     # Database
     database_path: str = field(default_factory=lambda: os.environ.get('DATABASE_PATH', _get_default_db_path()))
+    
+    # Database Performance Tuning
+    db_max_retries: int = field(default_factory=lambda: int(os.environ.get('DB_MAX_RETRIES', '3')))
+    db_retry_base_delay_ms: int = field(default_factory=lambda: int(os.environ.get('DB_RETRY_BASE_DELAY_MS', '50')))
+    db_busy_timeout_ms: int = field(default_factory=lambda: int(os.environ.get('DB_BUSY_TIMEOUT_MS', '10000')))
+    
+    # Candle Engine Performance Tuning
+    candle_save_every_n_ticks: int = field(default_factory=lambda: int(os.environ.get('CANDLE_SAVE_EVERY_N_TICKS', '10')))
+    candle_save_every_m_seconds: float = field(default_factory=lambda: float(os.environ.get('CANDLE_SAVE_EVERY_M_SECONDS', '5.0')))
 
     # Persistence
     config_file: str = field(default_factory=lambda: os.environ.get('CONFIG_FILE', ''))
