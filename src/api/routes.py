@@ -91,7 +91,50 @@ class APIRoutes:
     
     async def status(self, request: web.Request) -> web.Response:
         """GET /status - Detailed system status."""
-        ws_status = self.ws_manager.get_status()
+        # Check if this is a dummy WebSocketManager (API worker)
+        # or a real WebSocket worker
+        if self.ws_manager.is_dummy:
+            # API worker - read WebSocket status from database
+            # Run DB operation in thread pool
+            stale_threshold = self.config_manager.config.ws_status_stale_seconds
+            ws_status = await asyncio.to_thread(
+                self.storage.get_websocket_status,
+                stale_threshold
+            )
+            
+            if ws_status is None:
+                # No status written yet (WebSocket worker not started or just starting)
+                ticker_count = await asyncio.to_thread(self.storage.get_ticker_count)
+                tickers = await asyncio.to_thread(self.storage.get_ticker_symbols)
+                
+                ws_status = {
+                    'connected': False,
+                    'subscribed_tickers': tickers,
+                    'subscribed_count': len(tickers),
+                    'pending_subscribe': [],
+                    'connection_count': 0,
+                    'tick_count': 0,
+                    'last_message': None,
+                    'note': 'WebSocket worker not started yet or status not available'
+                }
+            elif ws_status.get('is_stale'):
+                # Status is stale (> threshold seconds old)
+                ws_status['note'] = f"WebSocket status is stale (last update {ws_status['age_seconds']:.0f}s ago)"
+            
+            # Read active candles from database (API worker)
+            active_candles = await asyncio.to_thread(
+                self.storage.get_active_candles,
+                stale_threshold
+            )
+            
+            if active_candles is None:
+                # No active candles data or stale
+                active_candles = []
+        else:
+            # Real WebSocket worker - get actual status
+            ws_status = self.ws_manager.get_status()
+            active_candles = self.candle_engine.get_active_tickers_summary()
+        
         # Run DB operation in thread pool to avoid blocking event loop
         db_stats = await asyncio.to_thread(self.storage.get_stats)
         overrides = self.config_manager.get_overrides()
@@ -103,7 +146,7 @@ class APIRoutes:
                 include_source=True,
                 overrides=overrides
             ),
-            'active_candles': self.candle_engine.get_active_tickers_summary(),
+            'active_candles': active_candles,
             'timestamp': datetime.now(timezone.utc).isoformat()
         })
     
@@ -457,8 +500,11 @@ class APIRoutes:
                 int(to_timestamp) if to_timestamp else None
             )
 
-            # Update last request timestamp
-            await asyncio.to_thread(self.storage.update_ticker_last_request, ticker)
+            # Update last request timestamp (non-blocking, fire-and-forget)
+            try:
+                await asyncio.to_thread(self.storage.update_ticker_last_request, ticker)
+            except Exception as e:
+                logger.warning(f"Failed to update last_request for {ticker}: {e}")
 
             # Add ticker field to each candle and append to flat list
             for candle in candles:
@@ -499,8 +545,11 @@ class APIRoutes:
             int(to_timestamp) if to_timestamp else None
         )
         
-        # Update last request timestamp
-        await asyncio.to_thread(self.storage.update_ticker_last_request, ticker)
+        # Update last request timestamp (non-blocking, fire-and-forget)
+        try:
+            await asyncio.to_thread(self.storage.update_ticker_last_request, ticker)
+        except Exception as e:
+            logger.warning(f"Failed to update last_request for {ticker}: {e}")
 
         return web.json_response({
             'ticker': ticker,
@@ -522,8 +571,11 @@ class APIRoutes:
                 status=404
             )
         
-        # Update last request timestamp (run in thread pool)
-        await asyncio.to_thread(self.storage.update_ticker_last_request, ticker)
+        # Update last request timestamp (non-blocking, fire-and-forget)
+        try:
+            await asyncio.to_thread(self.storage.update_ticker_last_request, ticker)
+        except Exception as e:
+            logger.warning(f"Failed to update last_request for {ticker}: {e}")
         
         return web.json_response({
             'ticker': ticker,
@@ -656,8 +708,11 @@ class APIRoutes:
         if len(aggregated) > count:
             aggregated = aggregated[-count:]
 
-        # Update last request timestamp (run in thread pool)
-        await asyncio.to_thread(self.storage.update_ticker_last_request, ticker)
+        # Update last request timestamp (non-blocking, fire-and-forget)
+        try:
+            await asyncio.to_thread(self.storage.update_ticker_last_request, ticker)
+        except Exception as e:
+            logger.warning(f"Failed to update last_request for {ticker}: {e}")
 
         return web.json_response({
             'ticker': ticker,
@@ -705,8 +760,11 @@ class APIRoutes:
             )
             result[ticker] = [c.to_dict() for c in candles]
             
-            # Update last request timestamp
-            await asyncio.to_thread(self.storage.update_ticker_last_request, ticker)
+            # Update last request timestamp (non-blocking, fire-and-forget)
+            try:
+                await asyncio.to_thread(self.storage.update_ticker_last_request, ticker)
+            except Exception as e:
+                logger.warning(f"Failed to update last_request for {ticker}: {e}")
         
         return web.json_response({
             'interval': f"{interval_minutes}m",

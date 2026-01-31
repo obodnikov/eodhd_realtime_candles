@@ -27,10 +27,11 @@ class WebSocketManager:
     
     EODHD_WS_URL = "wss://ws.eodhistoricaldata.com/ws/us"
     
-    def __init__(self, api_key: str, reconnect_delay: int = 5, ping_interval: int = 30):
+    def __init__(self, api_key: str, reconnect_delay: int = 5, ping_interval: int = 30, is_dummy: bool = False):
         self.api_key = api_key
         self.reconnect_delay = reconnect_delay
         self.ping_interval = ping_interval
+        self.is_dummy = is_dummy  # Flag to identify dummy instances in API workers
         
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._subscribed_tickers: Set[str] = set()
@@ -68,10 +69,27 @@ class WebSocketManager:
         Callback signature: (ticker: str, price: float, volume: int, timestamp_ms: int)
         
         Supports both sync and async callbacks:
-        - Async callbacks are awaited directly (non-blocking)
-        - Sync callbacks are automatically run in thread pool to avoid blocking event loop
+        - Async callbacks are fired as background tasks (non-blocking)
+        - Sync callbacks are automatically run in thread pool as background tasks
+        
+        Note: Callbacks are fire-and-forget to prevent blocking the WebSocket
+        message loop, which would cause ping timeout errors under high load.
         """
         self._on_tick = callback
+    
+    async def _safe_tick_callback(self, ticker: str, price: float, volume: int, timestamp_ms: int):
+        """Wrapper for async tick callback with error handling."""
+        try:
+            await self._on_tick(ticker, price, volume, timestamp_ms)
+        except Exception as e:
+            logger.error(f"Error in tick callback for {ticker}: {e}")
+    
+    async def _safe_sync_tick_callback(self, ticker: str, price: float, volume: int, timestamp_ms: int):
+        """Wrapper for sync tick callback - runs in thread pool with error handling."""
+        try:
+            await asyncio.to_thread(self._on_tick, ticker, price, volume, timestamp_ms)
+        except Exception as e:
+            logger.error(f"Error in tick callback for {ticker}: {e}")
     
     def set_on_connection_change(self, callback: Callable[[bool], None]):
         """Set callback for connection status changes."""
@@ -176,15 +194,14 @@ class WebSocketManager:
                 self._last_message_time = datetime.now(timezone.utc)
                 
                 if self._on_tick:
-                    try:
-                        if asyncio.iscoroutinefunction(self._on_tick):
-                            # Async callback - await directly (already non-blocking)
-                            await self._on_tick(ticker, price, volume, timestamp_ms)
-                        else:
-                            # Sync callback - run in thread pool to avoid blocking event loop
-                            await asyncio.to_thread(self._on_tick, ticker, price, volume, timestamp_ms)
-                    except Exception as e:
-                        logger.error(f"Error in tick callback for {ticker}: {e}")
+                    # Fire-and-forget: don't await tick processing to avoid blocking
+                    # the WebSocket message loop. This prevents ping timeout errors
+                    # when tick volume is high and DB writes are slow.
+                    if asyncio.iscoroutinefunction(self._on_tick):
+                        asyncio.create_task(self._safe_tick_callback(ticker, price, volume, timestamp_ms))
+                    else:
+                        # Sync callback - wrap in task with thread pool
+                        asyncio.create_task(self._safe_sync_tick_callback(ticker, price, volume, timestamp_ms))
             else:
                 logger.debug(f"Unknown message format: {message[:100]}")
                 

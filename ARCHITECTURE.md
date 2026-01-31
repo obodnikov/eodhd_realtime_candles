@@ -1,7 +1,7 @@
 # ARCHITECTURE.md
 
-**Version**: 0.4.5
-**Last Updated**: 2026-01-26
+**Version**: 0.6.0
+**Last Updated**: 2026-01-30
 **Project**: EODHD Real-Time Candle Aggregator
 
 ---
@@ -35,9 +35,9 @@ This document serves as the **architectural source of truth** for the EODHD Real
 
 | Layer | Technology | Purpose |
 |-------|-----------|---------|
-| Main API | aiohttp 3.9+ | Async REST API (port 8765) |
+| Main API | aiohttp 3.9+ | Async REST API (2 workers: ports 8765-8766) |
 | Admin UI | Flask 3.0+ | Web management interface (port 5000) |
-| WebSocket | websockets 12.0+ | EODHD real-time feed client |
+| WebSocket | websockets 12.0+ | EODHD real-time feed client (1 worker) |
 | Database | SQLite3 (WAL mode) | Candle + ticker persistence |
 | Process Manager | supervisord | Multi-process container orchestration |
 | Deployment | Docker + docker-compose | Containerized deployment |
@@ -50,23 +50,17 @@ This document serves as the **architectural source of truth** for the EODHD Real
 │                                                             │
 │  ┌──────────────────────────────────────────────────────┐  │
 │  │              Supervisord (Process Manager)           │  │
-│  └────────┬─────────────────────────────────┬───────────┘  │
-│           │                                 │              │
-│  ┌────────▼─────────┐              ┌───────▼──────────┐   │
-│  │   Main API       │              │   Admin UI       │   │
-│  │   (aiohttp)      │◄─────────────┤   (Flask)        │   │
-│  │   Port 8765      │   HTTP calls │   Port 5000      │   │
-│  └────────┬─────────┘              └──────────────────┘   │
-│           │                                                │
-│           │ writes/reads                                   │
-│           ▼                                                │
-│  ┌─────────────────┐         ┌──────────────────────┐    │
-│  │ CandleEngine    │         │  WebSocketManager    │    │
-│  │ (aggregation)   │◄────────┤  (EODHD feed)        │    │
-│  └────────┬────────┘  ticks  └──────────────────────┘    │
-│           │                                                │
-│           │ save candles                                   │
-│           ▼                                                │
+│  └────┬─────────────┬─────────────┬──────────────┬──────┘  │
+│       │             │             │              │         │
+│  ┌────▼────────┐ ┌──▼─────────┐ ┌▼────────────┐ ┌▼──────┐ │
+│  │ WebSocket   │ │ API Worker │ │ API Worker  │ │ Admin │ │
+│  │ Worker      │ │ 00         │ │ 01          │ │ UI    │ │
+│  │ (ticks)     │ │ Port 8765  │ │ Port 8766   │ │ 5000  │ │
+│  └────┬────────┘ └──┬─────────┘ └┬────────────┘ └───┬───┘ │
+│       │             │             │                  │     │
+│       │ writes      │ reads       │ reads            │ API │
+│       │             │             │                  │calls│
+│       ▼             ▼             ▼                  ▼     │
 │  ┌─────────────────────────────────────────────────────┐  │
 │  │         SQLite Database (WAL mode)                  │  │
 │  │         /data/candles.db                            │  │
@@ -76,6 +70,13 @@ This document serves as the **architectural source of truth** for the EODHD Real
 └─────────────────────────────────────────────────────────────┘
 ```
 
+**Key Architecture Benefits (v0.6.0):**
+- **True Parallelism**: 2 API workers handle HTTP requests concurrently
+- **Isolated Processing**: WebSocket worker dedicated to tick processing
+- **Better CPU Utilization**: Multi-core systems fully utilized
+- **Reduced DB Locking**: Writes isolated to WebSocket worker (eliminates "database is locked" errors)
+- **Easy Scaling**: Add more API workers by changing supervisord config
+
 ---
 
 ## 3. Repository Structure
@@ -83,7 +84,9 @@ This document serves as the **architectural source of truth** for the EODHD Real
 ```
 eodhd_realtime_candles/
 ├── src/                          # Main application code
-│   ├── main.py                   # Entry point for REST API (aiohttp)
+│   ├── main.py                   # Legacy entry point (single-process mode)
+│   ├── api_server.py             # API worker entry point (multi-process)
+│   ├── websocket_worker.py       # WebSocket worker entry point (multi-process)
 │   ├── config.py                 # Configuration management + persistence
 │   ├── storage.py                # SQLite database layer (WAL mode)
 │   ├── candle_engine.py          # Tick → OHLCV aggregation logic
@@ -103,11 +106,13 @@ eodhd_realtime_candles/
 │   ├── test_storage_cleanup.py   # Database cleanup tests
 │   ├── test_candle_engine.py     # Aggregation logic tests
 │   ├── test_candle_aggregator.py # Interval aggregation tests
-│   └── test_api_cleanup.py       # API endpoint tests
+│   ├── test_api_server.py        # API worker tests
+│   └── test_websocket_worker.py  # WebSocket worker tests
 │
 ├── docs/                         # Documentation (NOT in root)
 │   ├── chats/                    # Conversation history (context for AI)
 │   ├── ADMIN_UI.md               # Admin interface guide
+│   ├── MULTI_WORKER_DEPLOYMENT.md # Multi-worker architecture guide
 │   ├── IMPLEMENTATION_v0.4.0.md  # v0.4.0 implementation details
 │   ├── ORPHANED_CANDLES_FIX.md   # Bug fix documentation
 │   └── sqlite-performance-tuning.md  # SQLite optimization notes
@@ -135,7 +140,8 @@ eodhd_realtime_candles/
 └── .env.example                  # Environment template
 
 **Critical Paths:**
-- Entry: `src/main.py` (REST API), `src/admin/app.py` (Admin UI)
+- Entry (Production): `src/api_server.py` (API workers), `src/websocket_worker.py` (WebSocket worker), `src/admin/app.py` (Admin UI)
+- Entry (Dev): `src/main.py` (single-process mode)
 - Config: `.env` → `src/config.py` → `/data/config.json` (runtime overrides)
 - Database: `/data/candles.db` (Docker) or `./data/candles.db` (local dev)
 - Tests: `tests/` (pytest)
@@ -163,13 +169,21 @@ eodhd_realtime_candles/
 - `src/admin/api_client.py` - HTTP client for main API
 - `src/admin/templates/` - Jinja2 templates (sqowe branding)
 
-### 4.2 Backend (REST API)
+### 4.2 Backend (Multi-Worker Architecture)
 
-**Technology:** aiohttp 3.9 (async)  
-**Status:** ✅ Stable  
-**Port:** 8765
+**Technology:** aiohttp 3.9 (async) + supervisord  
+**Status:** ✅ Stable (v0.6.0)  
+**Architecture:** Separate API and WebSocket processes
 
-**Components:**
+**Worker Processes:**
+
+| Worker | File | Count | Ports | Responsibility | Status |
+|--------|------|-------|-------|----------------|--------|
+| **API Workers** | `api_server.py` | 2 | 8765-8766 | HTTP requests, read-mostly DB ops | ✅ Stable |
+| **WebSocket Worker** | `websocket_worker.py` | 1 | None | Tick processing, candle writes | ✅ Stable |
+| **Admin UI** | `admin/app.py` | 1 | 5000 | Web dashboard | ✅ Stable |
+
+**Core Components (Shared):**
 
 | Component | File | Responsibility | Status |
 |-----------|------|----------------|--------|
@@ -179,6 +193,23 @@ eodhd_realtime_candles/
 | **WebSocketManager** | `websocket_manager.py` | EODHD feed connection + reconnection | ✅ Stable |
 | **APIRoutes** | `api/routes.py` | REST endpoints (20 routes) | 🔄 Semi-Stable |
 | **ConfigManager** | `config.py` | Runtime config with persistence | ✅ Stable |
+
+**Worker Responsibilities:**
+
+**API Workers (2 instances):**
+- Handle HTTP REST requests in parallel
+- Read from database (candles, tickers, status)
+- Write ticker add/remove operations
+- Do NOT process WebSocket ticks
+- Load balanced across 2 processes
+
+**WebSocket Worker (1 instance):**
+- Connects to EODHD WebSocket feed
+- Processes all tick data
+- Aggregates ticks into OHLCV candles
+- Writes candles to database
+- Runs background cleanup task (30s interval)
+- No HTTP server (pure worker)
 
 **Key Endpoints:**
 - `/health` - No auth, no DB access (per AI_SQLite.md rule)
@@ -192,10 +223,12 @@ eodhd_realtime_candles/
 
 ### 4.3 Jobs/Automation
 
-**No scheduled jobs** - all operations are event-driven or on-demand:
-- Candle completion: triggered by time intervals (CandleEngine)
-- Cleanup: manual via `POST /candles/cleanup` or script
-- Reconnection: automatic on WebSocket disconnect
+**Background Tasks:**
+- **Candle cleanup**: Runs every 30s in WebSocket worker (batched for performance)
+- **Candle completion**: Event-driven by time intervals (CandleEngine)
+- **WebSocket reconnection**: Automatic on disconnect with configurable delay
+
+**No scheduled jobs** - all operations are event-driven or on-demand.
 
 ### 4.4 External Integrations
 
@@ -204,9 +237,10 @@ eodhd_realtime_candles/
 - Authentication: API key in query param
 - Protocol: Subscribe to tickers, receive tick data
 - Reconnection: Automatic with configurable delay (default 5s)
+- Connection: WebSocket worker only
 
 **n8n Integration:**
-- HTTP Request nodes call REST API
+- HTTP Request nodes call REST API (any API worker)
 - Example workflow: `n8n_workflows/realtime_momentum.json`
 - Polling recommended: 5-10 second intervals
 
@@ -354,6 +388,10 @@ Map of components to stability levels:
 | **API Layer** | | | |
 | `api/routes.py` | 🔄 Semi-Stable | MEDIUM | New endpoints added frequently |
 | `api/middleware.py` | ✅ Stable | LOW | Auth logic is settled |
+| **Worker Entry Points** | | | |
+| `api_server.py` | ✅ Stable | LOW | Multi-worker API entry point (v0.6.0) |
+| `websocket_worker.py` | ✅ Stable | LOW | Dedicated WebSocket worker (v0.6.0) |
+| `main.py` | ✅ Stable | LOW | Legacy single-process mode (fallback) |
 | **Configuration** | | | |
 | `config.py` | ✅ Stable | LOW | ConfigManager with persistence is stable |
 | **Admin UI** | | | |
@@ -365,7 +403,7 @@ Map of components to stability levels:
 | `config` table | ✅ Stable | LOW | Simple key-value store |
 | **Deployment** | | | |
 | `Dockerfile` | ✅ Stable | LOW | Multi-process setup is working |
-| `supervisord.conf` | ✅ Stable | LOW | Process management is stable |
+| `supervisord.conf` | ✅ Stable | LOW | Multi-worker configuration (v0.6.0) |
 | **Planned Features** | | | |
 | Prometheus metrics | 🔮 Planned | N/A | See ROADMAP.md v1.1 |
 | Multi-interval support | ✅ Implemented | LOW | v0.4.5 - GET /candles/{ticker}/{minutes} |
@@ -376,12 +414,14 @@ Map of components to stability levels:
 - SQLite WAL mode configuration (performance-critical)
 - Authentication mechanism (security-critical)
 - WebSocket protocol handling (EODHD integration)
+- Multi-worker architecture (v0.6.0 - production-tested)
 
 **Safe to modify:**
 - Admin UI templates (visual changes)
 - New API endpoints (additive changes)
 - Configuration defaults (non-breaking)
 - Documentation
+- Number of API workers in supervisord.conf (scaling)
 
 ---
 
@@ -451,11 +491,13 @@ Which approach do you prefer?"
 1. **SQLite with WAL mode** - Chosen for simplicity, no external DB needed
 2. **aiohttp for main API** - Async required for WebSocket + HTTP concurrency
 3. **Flask for admin UI** - Separate process, simpler than async templates
-4. **Supervisord for multi-process** - Single container, two processes
-5. **Thread-local SQLite connections** - Required for thread safety
-6. **Stats caching (5s TTL)** - Prevents /status endpoint from blocking on DB locks
-7. **No DB access in /health** - Critical for load balancer health checks
-8. **Candle deletion with ticker removal** - Consistency (fixed in v0.4.3)
+4. **Supervisord for multi-process** - Single container, multiple workers
+5. **Multi-worker architecture (v0.6.0)** - Separate API and WebSocket processes for performance and stability
+6. **Thread-local SQLite connections** - Required for thread safety
+7. **Stats caching (5s TTL)** - Prevents /status endpoint from blocking on DB locks
+8. **No DB access in /health** - Critical for load balancer health checks
+9. **Candle deletion with ticker removal** - Consistency (fixed in v0.4.3)
+10. **Tick-save frequency reduction** - Save every 10 ticks or 5s to reduce DB write pressure
 
 ---
 
@@ -477,6 +519,7 @@ Before making ANY code changes:
 |------|----------|
 | Coding standards | `AI.md`, `AI-PYTHON-REST-API.md`, `AI_FLASK.md`, `AI_SQLite.md` |
 | Architecture overview | This file (ARCHITECTURE.md) |
+| Multi-worker architecture | `docs/MULTI_WORKER_DEPLOYMENT.md` |
 | User documentation | `README.md` |
 | Implementation details | `docs/IMPLEMENTATION_v0.4.0.md` |
 | Recent changes/bugs | `docs/chats/` directory |
@@ -510,6 +553,12 @@ Before making ANY code changes:
 2. Create new chat log in `docs/chats/` with date
 3. Document root cause and fix
 4. Add regression test
+
+**Scale API workers:**
+1. Edit `supervisord.conf`
+2. Change `numprocs` for api_worker (or add explicit workers)
+3. Ensure port allocation is correct
+4. Test with `supervisorctl status`
 
 ---
 

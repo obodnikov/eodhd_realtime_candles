@@ -131,4 +131,4 @@ curl http://localhost:8765/health
 
 ---
 
-**Version**: 0.4.0 | **Maintained by**: obodnikov
+**Version**: 0.6.0 | **Maintained by**: obodnikov

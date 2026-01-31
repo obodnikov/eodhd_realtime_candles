@@ -8,7 +8,7 @@ import json
 import logging
 import time
 from datetime import datetime, timezone
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Callable
 from dataclasses import dataclass, asdict
 from pathlib import Path
 import threading
@@ -57,8 +57,27 @@ class Storage:
     # Cache TTL for get_stats() in seconds
     STATS_CACHE_TTL = 5.0
 
-    def __init__(self, db_path: str):
+    def __init__(
+        self, 
+        db_path: str,
+        max_retries: int = 3,
+        retry_base_delay_ms: int = 50,
+        busy_timeout_ms: int = 10000
+    ):
+        """
+        Initialize SQLite storage.
+        
+        Args:
+            db_path: Path to SQLite database file
+            max_retries: Number of retry attempts on database lock (default: 3)
+            retry_base_delay_ms: Base delay in milliseconds for exponential backoff (default: 50)
+            busy_timeout_ms: SQLite busy_timeout in milliseconds (default: 10000)
+        """
         self.db_path = db_path
+        self.max_retries = max_retries
+        self.retry_base_delay = retry_base_delay_ms / 1000.0  # Convert to seconds
+        self.busy_timeout = busy_timeout_ms / 1000.0  # Convert to seconds
+        
         self._local = threading.local()
         self._stats_cache: Optional[Dict[str, Any]] = None
         self._stats_cache_time: float = 0.0
@@ -68,6 +87,65 @@ class Storage:
     def _ensure_directory(self):
         """Ensure the database directory exists."""
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+    
+    def _execute_with_retry(
+        self,
+        operation: Callable[[], Any],
+        operation_name: str,
+        is_critical: bool = True,
+        max_retries: Optional[int] = None
+    ) -> Optional[Any]:
+        """
+        Execute a database operation with retry logic for lock contention.
+        
+        Uses exponential backoff to handle transient database locks without
+        blocking for extended periods. Non-blocking approach suitable for
+        use with asyncio.to_thread().
+        
+        Args:
+            operation: Callable that performs the database operation
+            operation_name: Description for logging (e.g., "save candle for AAPL")
+            is_critical: If True, raises exception on final failure. If False, logs and returns None.
+            max_retries: Override default max_retries
+            
+        Returns:
+            Result of operation, or None if non-critical and failed
+            
+        Raises:
+            Exception: If critical operation fails after all retries
+        """
+        retries = max_retries if max_retries is not None else self.max_retries
+        
+        for attempt in range(retries):
+            try:
+                return operation()
+            except sqlite3.OperationalError as e:
+                if 'locked' in str(e).lower() and attempt < retries - 1:
+                    # Database locked - retry with exponential backoff
+                    wait_time = self.retry_base_delay * (2 ** attempt)
+                    logger.warning(
+                        f"Database locked during {operation_name}, "
+                        f"retry {attempt + 1}/{retries} after {wait_time*1000:.0f}ms"
+                    )
+                    time.sleep(wait_time)
+                else:
+                    # Final attempt failed or non-lock error
+                    if is_critical:
+                        logger.error(f"Failed {operation_name} after {attempt + 1} attempts: {e}")
+                        raise
+                    else:
+                        logger.error(f"Failed {operation_name} after {attempt + 1} attempts: {e}")
+                        return None
+            except Exception as e:
+                # Unexpected error
+                if is_critical:
+                    logger.error(f"Unexpected error during {operation_name}: {e}")
+                    raise
+                else:
+                    logger.error(f"Unexpected error during {operation_name}: {e}")
+                    return None
+        
+        return None
         
     def _get_connection(self) -> sqlite3.Connection:
         """
@@ -77,12 +155,13 @@ class Storage:
         - WAL journal mode for better read/write concurrency
         - NORMAL synchronous for fewer fsyncs (good trade-off for this use case)
         - busy_timeout to wait on locks instead of failing immediately
+        - Configurable timeout for multi-worker scenarios
         """
         if not hasattr(self._local, 'connection'):
             conn = sqlite3.connect(
                 self.db_path,
                 check_same_thread=False,
-                timeout=5.0,  # seconds to wait when database is locked
+                timeout=self.busy_timeout,
             )
             conn.row_factory = sqlite3.Row
 
@@ -91,8 +170,11 @@ class Storage:
                 conn.execute("PRAGMA journal_mode=WAL;")
                 # Reduce fsyncs - acceptable trade-off for this use case
                 conn.execute("PRAGMA synchronous=NORMAL;")
-                # Wait up to 5 seconds if database is locked
-                conn.execute("PRAGMA busy_timeout=5000;")
+                # Wait if database is locked (configurable via busy_timeout_ms)
+                conn.execute(f"PRAGMA busy_timeout={int(self.busy_timeout * 1000)};")
+                # Cache size for better performance (10MB)
+                # Note: In memory-constrained environments, this can be reduced
+                conn.execute("PRAGMA cache_size=-10000;")
             except Exception as e:
                 # PRAGMA tuning is best-effort - don't break startup if it fails
                 logger.warning(f"Failed to apply SQLite PRAGMA settings: {e}")
@@ -162,6 +244,30 @@ class Storage:
             )
         ''')
         
+        # WebSocket status table (for multi-worker status sharing)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS websocket_status (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                connected INTEGER NOT NULL,
+                subscribed_tickers TEXT NOT NULL,
+                subscribed_count INTEGER NOT NULL,
+                pending_subscribe TEXT NOT NULL,
+                connection_count INTEGER NOT NULL,
+                tick_count INTEGER NOT NULL,
+                last_message TEXT,
+                last_update TEXT NOT NULL
+            )
+        ''')
+        
+        # Active candles status table (for multi-worker status sharing)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS active_candles_status (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                data TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        ''')
+        
         conn.commit()
         logger.info(f"Database initialized at {self.db_path}")
     
@@ -188,24 +294,36 @@ class Storage:
     
     def remove_ticker(self, symbol: str) -> bool:
         """Remove a ticker and its candles. Returns True if removed."""
-        conn = self._get_connection()
-        cursor = conn.cursor()
+        def _remove():
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            
+            symbol_upper = symbol.upper()
+            
+            # Remove candles first
+            cursor.execute('DELETE FROM candles WHERE ticker = ?', (symbol_upper,))
+            
+            # Remove ticker
+            cursor.execute('DELETE FROM tickers WHERE symbol = ?', (symbol_upper,))
+            removed = cursor.rowcount > 0
+            
+            conn.commit()
+            
+            if removed:
+                logger.info(f"Removed ticker and candles: {symbol_upper}")
+            
+            return removed
         
-        symbol = symbol.upper()
+        result = self._execute_with_retry(
+            operation=_remove,
+            operation_name=f"remove ticker {symbol}",
+            is_critical=True
+        )
         
-        # Remove candles first
-        cursor.execute('DELETE FROM candles WHERE ticker = ?', (symbol,))
+        # Invalidate stats cache
+        self._stats_cache = None
         
-        # Remove ticker
-        cursor.execute('DELETE FROM tickers WHERE symbol = ?', (symbol,))
-        removed = cursor.rowcount > 0
-        
-        conn.commit()
-        
-        if removed:
-            logger.info(f"Removed ticker and candles: {symbol}")
-        
-        return removed
+        return result if result is not None else False
     
     def get_tickers(self) -> List[TrackedTicker]:
         """Get all tracked tickers with their status."""
@@ -405,37 +523,64 @@ class Storage:
         return list(reversed(candles))
     
     def update_ticker_last_request(self, symbol: str):
-        """Update last candle request timestamp for a ticker."""
-        conn = self._get_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-            UPDATE tickers 
-            SET last_candle_request_at = ?
-            WHERE symbol = ?
-        ''', (datetime.now(timezone.utc).isoformat(), symbol.upper()))
-        conn.commit()
+        """
+        Update last candle request timestamp for a ticker.
+        
+        This is a non-critical operation - failures are logged but don't raise exceptions.
+        Uses retry logic with exponential backoff for database lock contention.
+        
+        Args:
+            symbol: Ticker symbol
+        """
+        def _update():
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE tickers 
+                SET last_candle_request_at = ?
+                WHERE symbol = ?
+            ''', (datetime.now(timezone.utc).isoformat(), symbol.upper()))
+            conn.commit()
+        
+        self._execute_with_retry(
+            operation=_update,
+            operation_name=f"update last_request for {symbol}",
+            is_critical=False  # Non-critical - don't fail API calls
+        )
 
     def delete_all_tickers(self) -> int:
         """
         Remove all tickers from tracking and delete their candle data.
         Returns count of removed tickers.
         """
-        conn = self._get_connection()
-        cursor = conn.cursor()
+        def _delete_all():
+            conn = self._get_connection()
+            cursor = conn.cursor()
 
-        # Get count before deletion
-        cursor.execute('SELECT COUNT(*) FROM tickers')
-        count = cursor.fetchone()[0]
+            # Get count before deletion
+            cursor.execute('SELECT COUNT(*) FROM tickers')
+            count = cursor.fetchone()[0]
 
-        # Delete all candles first
-        cursor.execute('DELETE FROM candles')
+            # Delete all candles first
+            cursor.execute('DELETE FROM candles')
 
-        # Delete all tickers
-        cursor.execute('DELETE FROM tickers')
+            # Delete all tickers
+            cursor.execute('DELETE FROM tickers')
 
-        conn.commit()
-        logger.info(f"Deleted all {count} tickers and their candle data")
-        return count
+            conn.commit()
+            logger.info(f"Deleted all {count} tickers and their candle data")
+            return count
+        
+        result = self._execute_with_retry(
+            operation=_delete_all,
+            operation_name="delete all tickers",
+            is_critical=True
+        )
+        
+        # Invalidate stats cache
+        self._stats_cache = None
+        
+        return result if result is not None else 0
 
     def cleanup_orphaned_candles(self) -> int:
         """
@@ -448,10 +593,10 @@ class Storage:
 
         Returns count of deleted candle records.
         """
-        conn = self._get_connection()
-        cursor = conn.cursor()
+        def _cleanup():
+            conn = self._get_connection()
+            cursor = conn.cursor()
 
-        try:
             # Use IMMEDIATE transaction to lock the database for writing
             # This prevents concurrent modifications during cleanup
             cursor.execute('BEGIN IMMEDIATE')
@@ -472,35 +617,53 @@ class Storage:
                 logger.debug("No orphaned candles found")
 
             return deleted
-
-        except Exception as e:
-            conn.rollback()
-            logger.error(f"Failed to cleanup orphaned candles: {e}")
-            raise
+        
+        result = self._execute_with_retry(
+            operation=_cleanup,
+            operation_name="cleanup orphaned candles",
+            is_critical=True
+        )
+        
+        # Invalidate stats cache
+        self._stats_cache = None
+        
+        return result if result is not None else 0
 
     # =========================================================================
     # Candle Management
     # =========================================================================
     
     def save_candle(self, candle: Candle):
-        """Save or update a candle."""
-        conn = self._get_connection()
-        cursor = conn.cursor()
+        """
+        Save or update a candle with retry logic for database lock contention.
         
-        cursor.execute('''
-            INSERT OR REPLACE INTO candles 
-            (ticker, timestamp, datetime_utc, open, high, low, close, 
-             volume, tick_count, is_complete, interval_minutes)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            candle.ticker, candle.timestamp, candle.datetime_utc,
-            candle.open, candle.high, candle.low, candle.close,
-            candle.volume, candle.tick_count, 
-            1 if candle.is_complete else 0,
-            candle.interval_minutes
-        ))
+        Args:
+            candle: Candle object to save
+        """
+        def _save():
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT OR REPLACE INTO candles 
+                (ticker, timestamp, datetime_utc, open, high, low, close, 
+                 volume, tick_count, is_complete, interval_minutes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                candle.ticker, candle.timestamp, candle.datetime_utc,
+                candle.open, candle.high, candle.low, candle.close,
+                candle.volume, candle.tick_count, 
+                1 if candle.is_complete else 0,
+                candle.interval_minutes
+            ))
+            
+            conn.commit()
         
-        conn.commit()
+        self._execute_with_retry(
+            operation=_save,
+            operation_name=f"save candle for {candle.ticker}",
+            is_critical=True
+        )
     
     def get_candles(self, ticker: str, count: int = 10, 
                    include_current: bool = True,
@@ -596,24 +759,39 @@ class Storage:
         conn.commit()
     
     def cleanup_old_candles(self, ticker: str, max_candles: int):
-        """Remove old candles keeping only the most recent max_candles."""
-        conn = self._get_connection()
-        cursor = conn.cursor()
+        """
+        Remove old candles keeping only the most recent max_candles.
         
-        cursor.execute('''
-            DELETE FROM candles 
-            WHERE ticker = ? AND id NOT IN (
-                SELECT id FROM candles 
-                WHERE ticker = ? 
-                ORDER BY timestamp DESC 
-                LIMIT ?
-            )
-        ''', (ticker.upper(), ticker.upper(), max_candles))
+        This is a non-critical operation - failures are logged but don't raise exceptions.
         
-        deleted = cursor.rowcount
-        if deleted > 0:
-            conn.commit()
-            logger.debug(f"Cleaned up {deleted} old candles for {ticker}")
+        Args:
+            ticker: Ticker symbol
+            max_candles: Maximum number of candles to keep
+        """
+        def _cleanup():
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                DELETE FROM candles 
+                WHERE ticker = ? AND id NOT IN (
+                    SELECT id FROM candles 
+                    WHERE ticker = ? 
+                    ORDER BY timestamp DESC 
+                    LIMIT ?
+                )
+            ''', (ticker.upper(), ticker.upper(), max_candles))
+            
+            deleted = cursor.rowcount
+            if deleted > 0:
+                conn.commit()
+                logger.debug(f"Cleaned up {deleted} old candles for {ticker}")
+        
+        self._execute_with_retry(
+            operation=_cleanup,
+            operation_name=f"cleanup old candles for {ticker}",
+            is_critical=False  # Non-critical - don't fail on cleanup errors
+        )
     
     # =========================================================================
     # Statistics
@@ -673,6 +851,167 @@ class Storage:
         self._stats_cache_time = now
 
         return result
+    
+    # =========================================================================
+    # WebSocket Status (Multi-Worker Status Sharing)
+    # =========================================================================
+    
+    def update_websocket_status(self, status: Dict[str, Any]):
+        """
+        Update WebSocket status in database for multi-worker visibility.
+        
+        Called by WebSocket worker to share status with API workers.
+        Uses REPLACE to upsert single row (id=1).
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            REPLACE INTO websocket_status (
+                id, connected, subscribed_tickers, subscribed_count,
+                pending_subscribe, connection_count, tick_count,
+                last_message, last_update
+            ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            1 if status.get('connected') else 0,
+            json.dumps(status.get('subscribed_tickers', [])),
+            status.get('subscribed_count', 0),
+            json.dumps(status.get('pending_subscribe', [])),
+            status.get('connection_count', 0),
+            status.get('tick_count', 0),
+            status.get('last_message'),
+            datetime.now(timezone.utc).isoformat()
+        ))
+        
+        conn.commit()
+    
+    def get_websocket_status(self, stale_threshold_seconds: int = 30) -> Optional[Dict[str, Any]]:
+        """
+        Get WebSocket status from database.
+        
+        Args:
+            stale_threshold_seconds: Seconds after which status is considered stale (default: 30)
+        
+        Returns status dict with 'is_stale' flag if last update > threshold.
+        Returns None if no status has been written yet.
+        Handles JSON parsing errors and datetime parsing errors gracefully.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('SELECT * FROM websocket_status WHERE id = 1')
+        row = cursor.fetchone()
+        
+        if not row:
+            return None
+        
+        # Parse JSON fields with error handling
+        try:
+            subscribed_tickers = json.loads(row['subscribed_tickers'])
+        except (json.JSONDecodeError, TypeError) as e:
+            logger.error(f"Failed to parse subscribed_tickers JSON: {e}")
+            subscribed_tickers = []
+        
+        try:
+            pending_subscribe = json.loads(row['pending_subscribe'])
+        except (json.JSONDecodeError, TypeError) as e:
+            logger.error(f"Failed to parse pending_subscribe JSON: {e}")
+            pending_subscribe = []
+        
+        # Parse datetime with error handling
+        try:
+            last_update = datetime.fromisoformat(row['last_update'])
+            now = datetime.now(timezone.utc)
+            age_seconds = (now - last_update).total_seconds()
+            is_stale = age_seconds > stale_threshold_seconds
+        except (ValueError, TypeError) as e:
+            logger.error(f"Failed to parse last_update timestamp: {e}")
+            # If timestamp is malformed, consider it very stale
+            age_seconds = 999999
+            is_stale = True
+        
+        return {
+            'connected': bool(row['connected']),
+            'subscribed_tickers': subscribed_tickers,
+            'subscribed_count': row['subscribed_count'],
+            'pending_subscribe': pending_subscribe,
+            'connection_count': row['connection_count'],
+            'tick_count': row['tick_count'],
+            'last_message': row['last_message'],
+            'last_update': row['last_update'],
+            'is_stale': is_stale,
+            'age_seconds': age_seconds
+        }
+    
+    # =========================================================================
+    # Active Candles Status (Multi-Worker Status Sharing)
+    # =========================================================================
+    
+    def update_active_candles(self, candles: List[Dict[str, Any]]):
+        """
+        Update active candles status in database for multi-worker visibility.
+        
+        Called by WebSocket worker to share active candles with API workers.
+        Uses REPLACE to upsert single row (id=1).
+        
+        Args:
+            candles: List of active candle summaries from CandleEngine.get_active_tickers_summary()
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            REPLACE INTO active_candles_status (id, data, updated_at)
+            VALUES (1, ?, ?)
+        ''', (
+            json.dumps(candles),
+            datetime.now(timezone.utc).isoformat()
+        ))
+        
+        conn.commit()
+    
+    def get_active_candles(self, stale_threshold_seconds: int = 30) -> Optional[List[Dict[str, Any]]]:
+        """
+        Get active candles status from database.
+        
+        Args:
+            stale_threshold_seconds: Seconds after which status is considered stale (default: 30)
+        
+        Returns list of active candle summaries, or None if no data or stale.
+        Handles JSON parsing errors gracefully.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('SELECT * FROM active_candles_status WHERE id = 1')
+        row = cursor.fetchone()
+        
+        if not row:
+            return None
+        
+        # Check if data is stale
+        try:
+            updated_at = datetime.fromisoformat(row['updated_at'])
+            now = datetime.now(timezone.utc)
+            age_seconds = (now - updated_at).total_seconds()
+            
+            if age_seconds > stale_threshold_seconds:
+                logger.debug(f"Active candles data is stale ({age_seconds:.0f}s old)")
+                return None
+        except (ValueError, TypeError) as e:
+            logger.error(f"Failed to parse updated_at timestamp: {e}")
+            return None
+        
+        # Parse JSON data with error handling
+        try:
+            candles = json.loads(row['data'])
+            if not isinstance(candles, list):
+                logger.error("Active candles data is not a list")
+                return None
+            return candles
+        except (json.JSONDecodeError, TypeError) as e:
+            logger.error(f"Failed to parse active candles JSON: {e}")
+            return None
 
 
 def _get_default_config_path() -> str:
