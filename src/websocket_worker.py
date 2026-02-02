@@ -179,6 +179,54 @@ async def active_candles_task(storage: Storage, candle_engine: CandleEngine):
             logger.error(f"Error in active candles update task: {e}")
 
 
+async def ticker_sync_task(storage: Storage, ws_manager: WebSocketManager, sync_interval: int = 30):
+    """
+    Background task that syncs ticker subscriptions with database.
+    
+    Runs periodically to detect tickers added/removed via API workers.
+    This is necessary because API workers have dummy WebSocketManagers that
+    don't actually connect to EODHD - they only update the database.
+    
+    The WebSocket worker must poll the database to discover new tickers
+    and subscribe to them on the real WebSocket connection.
+    
+    Args:
+        storage: Storage instance for database access
+        ws_manager: WebSocketManager instance for subscriptions
+        sync_interval: Interval in seconds between sync checks (default: 30)
+    """
+    logger = logging.getLogger(__name__)
+    logger.info(f"Ticker sync task started ({sync_interval}s interval)")
+    
+    while True:
+        try:
+            await asyncio.sleep(sync_interval)
+            
+            # Get current tickers from database
+            db_tickers = set(await asyncio.to_thread(storage.get_ticker_symbols))
+            
+            # Get currently subscribed tickers (explicit set conversion for type safety)
+            subscribed = set(ws_manager.subscribed_tickers)
+            
+            # Find new tickers to subscribe
+            new_tickers = db_tickers - subscribed
+            if new_tickers:
+                logger.info(f"Ticker sync: subscribing to {len(new_tickers)} new tickers: {new_tickers}")
+                await ws_manager.subscribe(new_tickers)
+            
+            # Find removed tickers to unsubscribe
+            removed_tickers = subscribed - db_tickers
+            if removed_tickers:
+                logger.info(f"Ticker sync: unsubscribing from {len(removed_tickers)} removed tickers: {removed_tickers}")
+                await ws_manager.unsubscribe(removed_tickers)
+                
+        except asyncio.CancelledError:
+            logger.info("Ticker sync task cancelled")
+            break
+        except Exception as e:
+            logger.error(f"Error in ticker sync task: {e}")
+
+
 async def run_worker(config: Config):
     """Run the WebSocket worker."""
     logger = logging.getLogger(__name__)
@@ -250,6 +298,11 @@ async def run_worker(config: Config):
     # Start active candles update task
     active_candles_task_handle = asyncio.create_task(active_candles_task(storage, candle_engine))
     
+    # Start ticker sync task (detects tickers added/removed via API workers)
+    ticker_sync_task_handle = asyncio.create_task(
+        ticker_sync_task(storage, ws_manager, config.ticker_sync_interval_seconds)
+    )
+    
     logger.info("WebSocket worker running")
     
     # Setup signal handlers for graceful shutdown
@@ -273,6 +326,7 @@ async def run_worker(config: Config):
     cleanup_task_handle.cancel()
     status_task_handle.cancel()
     active_candles_task_handle.cancel()
+    ticker_sync_task_handle.cancel()
     
     try:
         await cleanup_task_handle
@@ -286,6 +340,11 @@ async def run_worker(config: Config):
     
     try:
         await active_candles_task_handle
+    except asyncio.CancelledError:
+        pass
+    
+    try:
+        await ticker_sync_task_handle
     except asyncio.CancelledError:
         pass
     

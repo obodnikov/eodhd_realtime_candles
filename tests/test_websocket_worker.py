@@ -9,7 +9,7 @@ import asyncio
 from unittest.mock import Mock, patch, AsyncMock, MagicMock
 from datetime import datetime, timezone
 
-from src.websocket_worker import cleanup_task, run_worker, setup_logging
+from src.websocket_worker import cleanup_task, ticker_sync_task, run_worker, setup_logging
 from src.config import Config
 from src.storage import Storage
 from src.candle_engine import CandleEngine
@@ -163,6 +163,190 @@ class TestWebSocketWorkerConfiguration:
         
         # Verify mocking works
         assert mock_config is not None
+
+
+class TestTickerSyncTask:
+    """Test ticker sync task functionality."""
+
+    @pytest.mark.asyncio
+    async def test_ticker_sync_subscribes_new_tickers(self):
+        """Test ticker sync subscribes to new tickers from database."""
+        storage = Mock(spec=Storage)
+        storage.get_ticker_symbols = Mock(return_value=['AAPL', 'MSFT', 'GOOGL'])
+        
+        ws_manager = Mock()
+        ws_manager.subscribed_tickers = {'AAPL'}  # Only AAPL subscribed
+        ws_manager.subscribe = AsyncMock()
+        ws_manager.unsubscribe = AsyncMock()
+        
+        # Patch asyncio.sleep to speed up test
+        with patch('src.websocket_worker.asyncio.sleep', new_callable=AsyncMock) as mock_sleep:
+            mock_sleep.side_effect = [None, asyncio.CancelledError()]
+            
+            task = asyncio.create_task(ticker_sync_task(storage, ws_manager))
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        
+        # Verify subscribe was called with new tickers
+        ws_manager.subscribe.assert_called_once()
+        subscribed = ws_manager.subscribe.call_args[0][0]
+        assert 'MSFT' in subscribed
+        assert 'GOOGL' in subscribed
+        assert 'AAPL' not in subscribed  # Already subscribed
+
+    @pytest.mark.asyncio
+    async def test_ticker_sync_unsubscribes_removed_tickers(self):
+        """Test ticker sync unsubscribes from removed tickers."""
+        storage = Mock(spec=Storage)
+        storage.get_ticker_symbols = Mock(return_value=['AAPL'])  # Only AAPL in DB
+        
+        ws_manager = Mock()
+        ws_manager.subscribed_tickers = {'AAPL', 'MSFT', 'GOOGL'}  # Extra tickers subscribed
+        ws_manager.subscribe = AsyncMock()
+        ws_manager.unsubscribe = AsyncMock()
+        
+        # Patch asyncio.sleep to speed up test
+        with patch('src.websocket_worker.asyncio.sleep', new_callable=AsyncMock) as mock_sleep:
+            mock_sleep.side_effect = [None, asyncio.CancelledError()]
+            
+            task = asyncio.create_task(ticker_sync_task(storage, ws_manager))
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        
+        # Verify unsubscribe was called with removed tickers
+        ws_manager.unsubscribe.assert_called_once()
+        unsubscribed = ws_manager.unsubscribe.call_args[0][0]
+        assert 'MSFT' in unsubscribed
+        assert 'GOOGL' in unsubscribed
+        assert 'AAPL' not in unsubscribed  # Still in DB
+
+    @pytest.mark.asyncio
+    async def test_ticker_sync_handles_no_changes(self):
+        """Test ticker sync does nothing when tickers match."""
+        storage = Mock(spec=Storage)
+        storage.get_ticker_symbols = Mock(return_value=['AAPL', 'MSFT'])
+        
+        ws_manager = Mock()
+        ws_manager.subscribed_tickers = {'AAPL', 'MSFT'}  # Same as DB
+        ws_manager.subscribe = AsyncMock()
+        ws_manager.unsubscribe = AsyncMock()
+        
+        # Patch asyncio.sleep to speed up test
+        with patch('src.websocket_worker.asyncio.sleep', new_callable=AsyncMock) as mock_sleep:
+            mock_sleep.side_effect = [None, asyncio.CancelledError()]
+            
+            task = asyncio.create_task(ticker_sync_task(storage, ws_manager))
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        
+        # Verify no subscribe/unsubscribe calls
+        ws_manager.subscribe.assert_not_called()
+        ws_manager.unsubscribe.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ticker_sync_handles_empty_database(self):
+        """Test ticker sync handles empty database gracefully."""
+        storage = Mock(spec=Storage)
+        storage.get_ticker_symbols = Mock(return_value=[])
+        
+        ws_manager = Mock()
+        ws_manager.subscribed_tickers = {'AAPL', 'MSFT'}
+        ws_manager.subscribe = AsyncMock()
+        ws_manager.unsubscribe = AsyncMock()
+        
+        # Patch asyncio.sleep to speed up test
+        with patch('src.websocket_worker.asyncio.sleep', new_callable=AsyncMock) as mock_sleep:
+            mock_sleep.side_effect = [None, asyncio.CancelledError()]
+            
+            task = asyncio.create_task(ticker_sync_task(storage, ws_manager))
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        
+        # Verify unsubscribe was called for all tickers
+        ws_manager.unsubscribe.assert_called_once()
+        unsubscribed = ws_manager.unsubscribe.call_args[0][0]
+        assert 'AAPL' in unsubscribed
+        assert 'MSFT' in unsubscribed
+
+    @pytest.mark.asyncio
+    async def test_ticker_sync_handles_db_error(self):
+        """Test ticker sync handles database errors gracefully."""
+        storage = Mock(spec=Storage)
+        storage.get_ticker_symbols = Mock(side_effect=Exception("DB error"))
+        
+        ws_manager = Mock()
+        ws_manager.subscribed_tickers = {'AAPL'}
+        ws_manager.subscribe = AsyncMock()
+        ws_manager.unsubscribe = AsyncMock()
+        
+        # Patch asyncio.sleep to speed up test
+        with patch('src.websocket_worker.asyncio.sleep', new_callable=AsyncMock) as mock_sleep:
+            mock_sleep.side_effect = [None, asyncio.CancelledError()]
+            
+            task = asyncio.create_task(ticker_sync_task(storage, ws_manager))
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        
+        # Verify no subscribe/unsubscribe calls due to error
+        ws_manager.subscribe.assert_not_called()
+        ws_manager.unsubscribe.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ticker_sync_handles_list_return_type(self):
+        """Test ticker sync handles list return type from subscribed_tickers."""
+        storage = Mock(spec=Storage)
+        storage.get_ticker_symbols = Mock(return_value=['AAPL', 'MSFT'])
+        
+        ws_manager = Mock()
+        # Return list instead of set (defensive coding test)
+        ws_manager.subscribed_tickers = ['AAPL']
+        ws_manager.subscribe = AsyncMock()
+        ws_manager.unsubscribe = AsyncMock()
+        
+        # Patch asyncio.sleep to speed up test
+        with patch('src.websocket_worker.asyncio.sleep', new_callable=AsyncMock) as mock_sleep:
+            mock_sleep.side_effect = [None, asyncio.CancelledError()]
+            
+            task = asyncio.create_task(ticker_sync_task(storage, ws_manager))
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        
+        # Verify subscribe was called (type conversion worked)
+        ws_manager.subscribe.assert_called_once()
+        subscribed = ws_manager.subscribe.call_args[0][0]
+        assert 'MSFT' in subscribed
+
+    @pytest.mark.asyncio
+    async def test_ticker_sync_cancellation(self):
+        """Test ticker sync handles cancellation gracefully."""
+        storage = Mock(spec=Storage)
+        storage.get_ticker_symbols = Mock(return_value=['AAPL'])
+        
+        ws_manager = Mock()
+        ws_manager.subscribed_tickers = {'AAPL'}
+        
+        # Run and immediately cancel
+        task = asyncio.create_task(ticker_sync_task(storage, ws_manager))
+        await asyncio.sleep(0.1)
+        task.cancel()
+        
+        # Should not raise exception
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass  # Expected
 
 
 class TestWebSocketWorkerIntegration:
