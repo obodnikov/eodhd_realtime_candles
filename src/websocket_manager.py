@@ -27,10 +27,12 @@ class WebSocketManager:
     
     EODHD_WS_URL = "wss://ws.eodhistoricaldata.com/ws/us"
     
-    def __init__(self, api_key: str, reconnect_delay: int = 5, ping_interval: int = 30, is_dummy: bool = False):
+    def __init__(self, api_key: str, reconnect_delay: int = 5, ping_interval: int = 30, 
+                 auth_timeout: int = 10, is_dummy: bool = False):
         self.api_key = api_key
         self.reconnect_delay = reconnect_delay
         self.ping_interval = ping_interval
+        self.auth_timeout = auth_timeout  # Timeout for authorization response
         self.is_dummy = is_dummy  # Flag to identify dummy instances in API workers
         
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
@@ -39,6 +41,7 @@ class WebSocketManager:
         self._pending_unsubscribe: Set[str] = set()
         
         self._connected = False
+        self._authorized = False  # Track authorization state
         self._running = False
         self._last_message_time: Optional[datetime] = None
         self._connection_count = 0
@@ -172,15 +175,31 @@ class WebSocketManager:
         await self._ws.send(json.dumps(msg))
         logger.debug(f"Sent unsubscribe: {tickers}")
     
-    async def _process_message(self, message: str):
-        """Process incoming WebSocket message."""
+    async def _process_message(self, message: str) -> bool:
+        """
+        Process incoming WebSocket message.
+        
+        Only processes tick data when authorized. Status messages are always processed.
+        
+        Returns:
+            True if this was a successful authorization message, False otherwise.
+        """
         try:
             data = json.loads(message)
             
-            # Check for status messages
+            # Check for status messages (including authorization)
             if 'status_code' in data:
                 logger.info(f"EODHD status: {data}")
-                return
+                # Check for successful authorization
+                if data.get('status_code') == 200 and data.get('message') == 'Authorized':
+                    self._authorized = True
+                    return True
+                return False
+            
+            # Only process tick data when authorized
+            if not self._authorized:
+                logger.debug(f"Ignoring message before authorization: {message[:50]}...")
+                return False
             
             # Process trade tick
             # Format: {"s": "AAPL", "p": 227.31, "v": 100, "t": 1725198451165, ...}
@@ -204,11 +223,62 @@ class WebSocketManager:
                         asyncio.create_task(self._safe_sync_tick_callback(ticker, price, volume, timestamp_ms))
             else:
                 logger.debug(f"Unknown message format: {message[:100]}")
+            
+            return False
                 
         except json.JSONDecodeError:
             logger.warning(f"Failed to parse message: {message[:100]}")
+            return False
         except Exception as e:
             logger.error(f"Error processing message: {e}")
+            return False
+    
+    async def _wait_for_authorization(self, ws) -> bool:
+        """
+        Wait for authorization message from EODHD.
+        
+        Uses asyncio.wait_for to enforce a hard timeout even if no messages arrive.
+        
+        Args:
+            ws: WebSocket connection
+            
+        Returns:
+            True if authorized successfully, False on timeout or error.
+        """
+        try:
+            return await asyncio.wait_for(
+                self._wait_for_auth_message(ws),
+                timeout=self.auth_timeout
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"Authorization timeout after {self.auth_timeout}s - no auth response received")
+            return False
+    
+    async def _wait_for_auth_message(self, ws) -> bool:
+        """
+        Internal method to wait for authorization message.
+        
+        Separated from _wait_for_authorization to allow asyncio.wait_for wrapping.
+        """
+        async for message in ws:
+            if not self._running:
+                return False
+            
+            # Only look for authorization message, ignore everything else
+            try:
+                data = json.loads(message)
+                if 'status_code' in data:
+                    logger.info(f"EODHD status: {data}")
+                    if data.get('status_code') == 200 and data.get('message') == 'Authorized':
+                        self._authorized = True
+                        return True
+                else:
+                    # Non-status message before auth - log and ignore
+                    logger.debug(f"Ignoring pre-auth message: {message[:50]}...")
+            except json.JSONDecodeError:
+                logger.warning(f"Failed to parse message during auth: {message[:50]}...")
+        
+        return False
     
     async def _connection_loop(self):
         """Main connection loop with automatic reconnection."""
@@ -223,6 +293,7 @@ class WebSocketManager:
                 ) as ws:
                     self._ws = ws
                     self._connected = True
+                    self._authorized = False  # Reset authorization state on new connection
                     self._connection_count += 1
                     
                     logger.info(f"Connected to EODHD (connection #{self._connection_count})")
@@ -231,14 +302,20 @@ class WebSocketManager:
                     if self._on_connection_change:
                         self._on_connection_change(True)
                     
-                    # Subscribe to pending tickers
+                    # Wait for authorization before proceeding
+                    if not await self._wait_for_authorization(ws):
+                        logger.warning("Authorization failed, will reconnect...")
+                        continue
+                    
+                    # Authorization successful - send subscriptions
+                    logger.info("Authorization received, sending subscriptions...")
                     all_tickers = self._subscribed_tickers | self._pending_subscribe
                     if all_tickers:
                         await self._send_subscribe(all_tickers)
                         self._subscribed_tickers = all_tickers
                         self._pending_subscribe.clear()
                     
-                    # Process messages
+                    # Process messages after authorization
                     async for message in ws:
                         if not self._running:
                             break
@@ -261,6 +338,7 @@ class WebSocketManager:
                 logger.error(f"WebSocket error: {e}")
             finally:
                 self._connected = False
+                self._authorized = False
                 self._ws = None
                 
                 if self._on_connection_change:
