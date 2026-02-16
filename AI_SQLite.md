@@ -18,6 +18,8 @@ conn = sqlite3.connect(
 conn.execute("PRAGMA journal_mode=WAL;")
 conn.execute("PRAGMA synchronous=NORMAL;")
 conn.execute("PRAGMA busy_timeout=5000;")
+conn.execute("PRAGMA cache_size=-10000;")        # 10MB cache
+conn.execute("PRAGMA wal_autocheckpoint=1000;")   # ~4MB WAL before auto-checkpoint
 ```
 
 ### Why:
@@ -25,6 +27,8 @@ conn.execute("PRAGMA busy_timeout=5000;")
 - **synchronous=NORMAL**: Reduces disk fsyncs (acceptable for non-critical data)
 - **busy_timeout**: Waits on locks instead of immediate failure
 - **timeout**: Python-level wait for locked database
+- **cache_size**: Larger page cache reduces disk reads under load
+- **wal_autocheckpoint**: Prevents unbounded WAL file growth (default 1000 pages is ~4MB)
 
 ---
 
@@ -247,7 +251,7 @@ def cleanup_old_candles(self, ticker: str, max_candles: int):
 
 ---
 
-## 10. WAL Mode File Handling
+## 10. WAL Mode File Handling & Checkpoint Management
 
 When using WAL mode, SQLite creates additional files:
 - `database.db-wal` (write-ahead log)
@@ -259,6 +263,58 @@ When using WAL mode, SQLite creates additional files:
 # docker-compose.yml
 volumes:
   - candle_data:/data  # Contains .db, .db-wal, .db-shm
+```
+
+### WAL Checkpoint Rules (CRITICAL)
+
+Without periodic checkpointing, the WAL file grows unbounded and causes:
+- Disk space exhaustion (WAL can grow to tens of GB)
+- `database is locked` errors on container restart (SQLite tries to recover a huge WAL)
+- Startup failures across all workers
+
+**ALWAYS:**
+- Set `PRAGMA wal_autocheckpoint=1000` on every connection (built-in defense)
+- Run `PRAGMA wal_checkpoint(PASSIVE)` periodically from the websocket worker (every 30s via cleanup task)
+- Use PASSIVE mode so checkpoints never block readers or writers
+
+```python
+# CORRECT - Periodic checkpoint in Storage class
+def checkpoint_wal(self) -> dict:
+    conn = self._get_connection()
+    result = conn.execute("PRAGMA wal_checkpoint(PASSIVE);").fetchone()
+    # result = (busy, log_pages, checkpointed_pages)
+    return {
+        'busy': result[0],
+        'log_pages': result[1],
+        'checkpointed_pages': result[2]
+    }
+
+# Called from websocket worker cleanup task (every 30s)
+await asyncio.to_thread(storage.checkpoint_wal)
+```
+
+**DON'T:**
+- Use `TRUNCATE` or `FULL` checkpoint modes in production (they block writers)
+- Skip `wal_autocheckpoint` PRAGMA assuming defaults are enough
+- Rely solely on SQLite's auto-checkpoint (it can be blocked by long-running readers)
+
+### WAL Recovery Procedure
+
+If the WAL file grows excessively large (e.g., after a crash or missed checkpoints):
+
+```bash
+# 1. Stop all processes accessing the database
+docker stop <container>
+
+# 2. Try a manual checkpoint first
+sqlite3 /path/to/candles.db "PRAGMA wal_checkpoint(TRUNCATE);"
+
+# 3. If checkpoint hangs or fails, remove WAL files (loses uncommitted data)
+cp /path/to/candles.db /path/to/candles.db.backup
+rm /path/to/candles.db-wal /path/to/candles.db-shm
+
+# 4. Restart
+docker start <container>
 ```
 
 ---
@@ -276,3 +332,5 @@ Before merging any SQLite-related code:
 - [ ] Cleanup operations batched/scheduled?
 - [ ] `/health` endpoint database-free?
 - [ ] Timing logs for slow operations?
+- [ ] `wal_autocheckpoint` configured on connections?
+- [ ] Periodic `PRAGMA wal_checkpoint(PASSIVE)` in websocket worker cleanup task?

@@ -29,6 +29,7 @@ from dotenv import load_dotenv
 
 from .config import Config, ConfigManager
 from .storage import Storage
+from .storage_factory import create_storage, get_database_type
 from .candle_engine import CandleEngine
 from .websocket_manager import WebSocketManager
 
@@ -47,7 +48,7 @@ def setup_logging(level: str):
     logging.getLogger('websockets').setLevel(logging.WARNING)
 
 
-async def cleanup_task(storage: Storage, candle_engine: CandleEngine):
+async def cleanup_task(storage, candle_engine: CandleEngine):
     """
     Background task that processes pending candle cleanup.
     
@@ -90,6 +91,12 @@ async def cleanup_task(storage: Storage, candle_engine: CandleEngine):
             
             if cleaned_count > 0:
                 logger.debug(f"Batch cleanup completed for {cleaned_count} tickers")
+            
+            # Periodic WAL checkpoint to prevent unbounded WAL growth
+            try:
+                await asyncio.to_thread(storage.checkpoint_wal)
+            except Exception as e:
+                logger.warning(f"WAL checkpoint error: {e}")
                 
         except asyncio.CancelledError:
             logger.info("Background cleanup task cancelled")
@@ -98,7 +105,7 @@ async def cleanup_task(storage: Storage, candle_engine: CandleEngine):
             logger.error(f"Error in cleanup task: {e}")
 
 
-async def websocket_status_task(storage: Storage, ws_manager: WebSocketManager):
+async def websocket_status_task(storage, ws_manager: WebSocketManager):
     """
     Background task that periodically writes WebSocket status to database.
     
@@ -148,7 +155,7 @@ async def websocket_status_task(storage: Storage, ws_manager: WebSocketManager):
             logger.error(f"Error in WebSocket status update task: {e}")
 
 
-async def active_candles_task(storage: Storage, candle_engine: CandleEngine):
+async def active_candles_task(storage, candle_engine: CandleEngine):
     """
     Background task that periodically writes active candles to database.
     
@@ -179,18 +186,61 @@ async def active_candles_task(storage: Storage, candle_engine: CandleEngine):
             logger.error(f"Error in active candles update task: {e}")
 
 
+async def ticker_sync_task(storage: Storage, ws_manager: WebSocketManager, sync_interval: int = 30):
+    """
+    Background task that syncs ticker subscriptions with database.
+    
+    Runs periodically to detect tickers added/removed via API workers.
+    This is necessary because API workers have dummy WebSocketManagers that
+    don't actually connect to EODHD - they only update the database.
+    
+    The WebSocket worker must poll the database to discover new tickers
+    and subscribe to them on the real WebSocket connection.
+    
+    Args:
+        storage: Storage instance for database access
+        ws_manager: WebSocketManager instance for subscriptions
+        sync_interval: Interval in seconds between sync checks (default: 30)
+    """
+    logger = logging.getLogger(__name__)
+    logger.info(f"Ticker sync task started ({sync_interval}s interval)")
+    
+    while True:
+        try:
+            await asyncio.sleep(sync_interval)
+            
+            # Get current tickers from database
+            db_tickers = set(await asyncio.to_thread(storage.get_ticker_symbols))
+            
+            # Get currently subscribed tickers (explicit set conversion for type safety)
+            subscribed = set(ws_manager.subscribed_tickers)
+            
+            # Find new tickers to subscribe
+            new_tickers = db_tickers - subscribed
+            if new_tickers:
+                logger.info(f"Ticker sync: subscribing to {len(new_tickers)} new tickers: {new_tickers}")
+                await ws_manager.subscribe(new_tickers)
+            
+            # Find removed tickers to unsubscribe
+            removed_tickers = subscribed - db_tickers
+            if removed_tickers:
+                logger.info(f"Ticker sync: unsubscribing from {len(removed_tickers)} removed tickers: {removed_tickers}")
+                await ws_manager.unsubscribe(removed_tickers)
+                
+        except asyncio.CancelledError:
+            logger.info("Ticker sync task cancelled")
+            break
+        except Exception as e:
+            logger.error(f"Error in ticker sync task: {e}")
+
+
 async def run_worker(config: Config):
     """Run the WebSocket worker."""
     logger = logging.getLogger(__name__)
     
     # Initialize components
     config_manager = ConfigManager(config)
-    storage = Storage(
-        db_path=config.database_path,
-        max_retries=config.db_max_retries,
-        retry_base_delay_ms=config.db_retry_base_delay_ms,
-        busy_timeout_ms=config.db_busy_timeout_ms
-    )
+    storage = create_storage(config)
     candle_engine = CandleEngine(
         storage=storage,
         interval_minutes=config.candle_interval_minutes,
@@ -250,6 +300,11 @@ async def run_worker(config: Config):
     # Start active candles update task
     active_candles_task_handle = asyncio.create_task(active_candles_task(storage, candle_engine))
     
+    # Start ticker sync task (detects tickers added/removed via API workers)
+    ticker_sync_task_handle = asyncio.create_task(
+        ticker_sync_task(storage, ws_manager, config.ticker_sync_interval_seconds)
+    )
+    
     logger.info("WebSocket worker running")
     
     # Setup signal handlers for graceful shutdown
@@ -273,6 +328,7 @@ async def run_worker(config: Config):
     cleanup_task_handle.cancel()
     status_task_handle.cancel()
     active_candles_task_handle.cancel()
+    ticker_sync_task_handle.cancel()
     
     try:
         await cleanup_task_handle
@@ -286,6 +342,11 @@ async def run_worker(config: Config):
     
     try:
         await active_candles_task_handle
+    except asyncio.CancelledError:
+        pass
+    
+    try:
+        await ticker_sync_task_handle
     except asyncio.CancelledError:
         pass
     
@@ -342,7 +403,7 @@ def main():
     logger.info(f"Candle interval: {config.candle_interval_minutes} minutes")
     logger.info(f"Max tickers: {config.max_tickers}")
     logger.info(f"Max candles per ticker: {config.max_candles_stored}")
-    logger.info(f"Database: {config.database_path}")
+    logger.info(f"Database: {get_database_type()}")
     logger.info(f"Mode: WebSocket + tick processing (no HTTP server)")
     logger.info("=" * 60)
 

@@ -87,6 +87,36 @@ class Storage:
     def _ensure_directory(self):
         """Ensure the database directory exists."""
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+    def checkpoint_wal(self) -> dict:
+        """
+        Run a passive WAL checkpoint to keep the WAL file from growing unbounded.
+
+        Uses PASSIVE mode so it never blocks readers or writers.
+        Should be called periodically (e.g., every 30-60 seconds) from the
+        websocket worker's cleanup task.
+
+        Returns:
+            dict with checkpoint results or error info
+        """
+        try:
+            conn = self._get_connection()
+            # PASSIVE: checkpoint as much as possible without blocking
+            result = conn.execute("PRAGMA wal_checkpoint(PASSIVE);").fetchone()
+            # result = (busy, log_pages, checkpointed_pages)
+            info = {
+                'busy': result[0],
+                'log_pages': result[1],
+                'checkpointed_pages': result[2]
+            }
+            if result[1] > 0:
+                logger.debug(
+                    f"WAL checkpoint: {result[2]}/{result[1]} pages checkpointed"
+                    f"{' (busy)' if result[0] else ''}"
+                )
+            return info
+        except Exception as e:
+            logger.warning(f"WAL checkpoint failed: {e}")
+            return {'error': str(e)}
     
     def _execute_with_retry(
         self,
@@ -175,6 +205,8 @@ class Storage:
                 # Cache size for better performance (10MB)
                 # Note: In memory-constrained environments, this can be reduced
                 conn.execute("PRAGMA cache_size=-10000;")
+                # Auto-checkpoint every 1000 pages (~4MB) to prevent WAL bloat
+                conn.execute("PRAGMA wal_autocheckpoint=1000;")
             except Exception as e:
                 # PRAGMA tuning is best-effort - don't break startup if it fails
                 logger.warning(f"Failed to apply SQLite PRAGMA settings: {e}")

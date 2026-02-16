@@ -40,8 +40,12 @@ pytest-asyncio>=0.21.0
 # Test utilities
 pytest-mock>=3.12.0
 
+# === PostgreSQL Support (Optional) ===
+# PostgreSQL adapter - install for PostgreSQL backend
+psycopg2-binary>=2.9.9
+
 # No additional dependencies needed - using Python standard library for:
-# - sqlite3 (database)
+# - sqlite3 (database - default backend)
 # - asyncio (async runtime)
 # - dataclasses (data structures)
 # - json (JSON handling)

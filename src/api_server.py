@@ -26,6 +26,7 @@ from dotenv import load_dotenv
 
 from .config import Config, ConfigManager
 from .storage import Storage
+from .storage_factory import create_storage, get_database_type
 from .candle_engine import CandleEngine
 from .websocket_manager import WebSocketManager
 from .api import APIRoutes, create_auth_middleware, error_middleware, logging_middleware
@@ -62,12 +63,7 @@ async def create_app(config: Config) -> web.Application:
     
     # Initialize components (read-only mode for API workers)
     config_manager = ConfigManager(config)
-    storage = Storage(
-        db_path=config.database_path,
-        max_retries=config.db_max_retries,
-        retry_base_delay_ms=config.db_retry_base_delay_ms,
-        busy_timeout_ms=config.db_busy_timeout_ms
-    )
+    storage = create_storage(config)
     
     # CandleEngine in read-only mode (no tick processing)
     candle_engine = CandleEngine(
@@ -141,7 +137,7 @@ def main():
     logger.info("API Server Worker")
     logger.info("=" * 60)
     logger.info(f"HTTP server: {config.http_host}:{config.http_port}")
-    logger.info(f"Database: {config.database_path}")
+    logger.info(f"Database: {get_database_type()}")
     logger.info(f"Mode: Read-mostly (no WebSocket processing)")
     logger.info("=" * 60)
 
