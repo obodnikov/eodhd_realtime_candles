@@ -46,7 +46,12 @@ def create_storage(config: Config) -> Union[Storage, 'PostgreSQLStorage']:
 def _create_sqlite_storage(config: Config) -> Storage:
     """Create SQLite storage instance."""
     logger.info(f"Using SQLite storage at {config.database_path}")
-    return Storage(config.database_path)
+    return Storage(
+        config.database_path,
+        max_retries=config.db_max_retries,
+        retry_base_delay_ms=config.db_retry_base_delay_ms,
+        busy_timeout_ms=config.db_busy_timeout_ms
+    )
 
 
 def _create_postgres_storage() -> 'PostgreSQLStorage':
