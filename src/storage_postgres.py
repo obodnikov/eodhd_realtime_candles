@@ -828,11 +828,14 @@ class PostgreSQLStorage:
         """Convert a value to ISO format string for JSON serialization.
         
         Handles datetime objects (from TIMESTAMPTZ columns) and strings.
+        Normalizes datetime to UTC for consistent API output.
         Returns None if value is None.
         """
         if value is None:
             return None
         if isinstance(value, datetime):
+            if value.tzinfo is not None:
+                value = value.astimezone(timezone.utc)
             return value.isoformat()
         return str(value)
 
@@ -855,6 +858,8 @@ class PostgreSQLStorage:
         if isinstance(value, datetime):
             dt = value
         elif isinstance(value, str):
+            if value.endswith('Z'):
+                value = value[:-1] + '+00:00'
             dt = datetime.fromisoformat(value)
         else:
             raise ValueError(f"{field_name} has unexpected type {type(value).__name__}")
