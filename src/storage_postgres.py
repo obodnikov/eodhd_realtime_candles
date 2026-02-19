@@ -294,12 +294,12 @@ class PostgreSQLStorage:
             for row in cursor.fetchall():
                 tickers.append(TrackedTicker(
                     symbol=row['symbol'],
-                    added_at=row['added_at'],
+                    added_at=self._to_isoformat(row['added_at']),
                     status=row['status'],
-                    last_tick_at=row['last_tick_at'],
+                    last_tick_at=self._to_isoformat(row['last_tick_at']),
                     last_price=float(row['last_price']) if row['last_price'] else None,
                     candle_count=row['candle_count'],
-                    last_candle_request_at=row['last_candle_request_at']
+                    last_candle_request_at=self._to_isoformat(row['last_candle_request_at'])
                 ))
             
             return tickers
@@ -379,12 +379,12 @@ class PostgreSQLStorage:
 
             return TrackedTicker(
                 symbol=row['symbol'],
-                added_at=row['added_at'],
+                added_at=self._to_isoformat(row['added_at']),
                 status=row['status'],
-                last_tick_at=row['last_tick_at'],
+                last_tick_at=self._to_isoformat(row['last_tick_at']),
                 last_price=float(row['last_price']) if row['last_price'] else None,
                 candle_count=row['candle_count'],
-                last_candle_request_at=row['last_candle_request_at']
+                last_candle_request_at=self._to_isoformat(row['last_candle_request_at'])
             )
         finally:
             self._put_connection(conn)
@@ -823,6 +823,19 @@ class PostgreSQLStorage:
         finally:
             self._put_connection(conn)
     
+    @staticmethod
+    def _to_isoformat(value: Any) -> Optional[str]:
+        """Convert a value to ISO format string for JSON serialization.
+        
+        Handles datetime objects (from TIMESTAMPTZ columns) and strings.
+        Returns None if value is None.
+        """
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value.isoformat()
+        return str(value)
+
     @staticmethod
     def _parse_timestamp(value: Any, field_name: str) -> datetime:
         """Parse a timestamp value from PostgreSQL into a timezone-aware datetime.
