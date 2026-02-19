@@ -92,11 +92,12 @@ async def cleanup_task(storage, candle_engine: CandleEngine):
             if cleaned_count > 0:
                 logger.debug(f"Batch cleanup completed for {cleaned_count} tickers")
             
-            # Periodic WAL checkpoint to prevent unbounded WAL growth
-            try:
-                await asyncio.to_thread(storage.checkpoint_wal)
-            except Exception as e:
-                logger.warning(f"WAL checkpoint error: {e}")
+            # Periodic WAL checkpoint to prevent unbounded WAL growth (SQLite only)
+            if hasattr(storage, 'checkpoint_wal'):
+                try:
+                    await asyncio.to_thread(storage.checkpoint_wal)
+                except Exception as e:
+                    logger.warning(f"WAL checkpoint error: {e}")
                 
         except asyncio.CancelledError:
             logger.info("Background cleanup task cancelled")
