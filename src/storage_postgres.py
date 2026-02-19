@@ -294,12 +294,12 @@ class PostgreSQLStorage:
             for row in cursor.fetchall():
                 tickers.append(TrackedTicker(
                     symbol=row['symbol'],
-                    added_at=row['added_at'],
+                    added_at=self._to_isoformat(row['added_at']),
                     status=row['status'],
-                    last_tick_at=row['last_tick_at'],
+                    last_tick_at=self._to_isoformat(row['last_tick_at']),
                     last_price=float(row['last_price']) if row['last_price'] else None,
                     candle_count=row['candle_count'],
-                    last_candle_request_at=row['last_candle_request_at']
+                    last_candle_request_at=self._to_isoformat(row['last_candle_request_at'])
                 ))
             
             return tickers
@@ -379,12 +379,12 @@ class PostgreSQLStorage:
 
             return TrackedTicker(
                 symbol=row['symbol'],
-                added_at=row['added_at'],
+                added_at=self._to_isoformat(row['added_at']),
                 status=row['status'],
-                last_tick_at=row['last_tick_at'],
+                last_tick_at=self._to_isoformat(row['last_tick_at']),
                 last_price=float(row['last_price']) if row['last_price'] else None,
                 candle_count=row['candle_count'],
-                last_candle_request_at=row['last_candle_request_at']
+                last_candle_request_at=self._to_isoformat(row['last_candle_request_at'])
             )
         finally:
             self._put_connection(conn)
@@ -823,6 +823,54 @@ class PostgreSQLStorage:
         finally:
             self._put_connection(conn)
     
+    @staticmethod
+    def _to_isoformat(value: Any) -> Optional[str]:
+        """Convert a value to ISO format string for JSON serialization.
+        
+        Handles datetime objects (from TIMESTAMPTZ columns) and strings.
+        Normalizes datetime to UTC for consistent API output.
+        Returns None if value is None.
+        """
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            if value.tzinfo is not None:
+                value = value.astimezone(timezone.utc)
+            return value.isoformat()
+        return str(value)
+
+    @staticmethod
+    def _parse_timestamp(value: Any, field_name: str) -> datetime:
+        """Parse a timestamp value from PostgreSQL into a timezone-aware datetime.
+        
+        Handles native datetime objects (from TIMESTAMPTZ columns) and
+        ISO-format strings (from migrated data or TEXT columns).
+        
+        Returns:
+            Timezone-aware datetime (UTC if no tzinfo present).
+            
+        Raises:
+            ValueError: If value is None or not a recognized type.
+        """
+        if value is None:
+            raise ValueError(f"{field_name} is None")
+        
+        if isinstance(value, datetime):
+            dt = value
+        elif isinstance(value, str):
+            if value.endswith('Z'):
+                value = value[:-1] + '+00:00'
+            dt = datetime.fromisoformat(value)
+        else:
+            raise ValueError(f"{field_name} has unexpected type {type(value).__name__}")
+        
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        
+        return dt
+
     def get_websocket_status(self, stale_threshold_seconds: int = 30) -> Optional[Dict[str, Any]]:
         """Get WebSocket status from database."""
         conn = self._get_connection()
@@ -848,7 +896,7 @@ class PostgreSQLStorage:
                 pending_subscribe = []
             
             try:
-                last_update = datetime.fromisoformat(row['last_update'])
+                last_update = self._parse_timestamp(row['last_update'], 'last_update')
                 now = datetime.now(timezone.utc)
                 age_seconds = (now - last_update).total_seconds()
                 is_stale = age_seconds > stale_threshold_seconds
@@ -856,6 +904,7 @@ class PostgreSQLStorage:
                 logger.error(f"Failed to parse last_update timestamp: {e}")
                 age_seconds = 999999
                 is_stale = True
+                last_update = None
             
             return {
                 'connected': bool(row['connected']),
@@ -865,7 +914,7 @@ class PostgreSQLStorage:
                 'connection_count': row['connection_count'],
                 'tick_count': row['tick_count'],
                 'last_message': row['last_message'],
-                'last_update': row['last_update'],
+                'last_update': last_update.isoformat() if last_update else None,
                 'is_stale': is_stale,
                 'age_seconds': age_seconds
             }
@@ -910,7 +959,7 @@ class PostgreSQLStorage:
                 return None
             
             try:
-                updated_at = datetime.fromisoformat(row['updated_at'])
+                updated_at = self._parse_timestamp(row['updated_at'], 'updated_at')
                 now = datetime.now(timezone.utc)
                 age_seconds = (now - updated_at).total_seconds()
                 
