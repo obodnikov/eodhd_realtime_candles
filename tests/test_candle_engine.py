@@ -954,6 +954,41 @@ class TestCandleEngineCandleWriteFlush(unittest.TestCase):
         metrics = self.engine.get_candle_write_metrics()
         self.assertEqual(metrics["candle_write_dropped_count"], 1)
 
+    def test_full_mixed_queue_evicts_oldest_incomplete_first(self):
+        """When full, eviction should prefer oldest incomplete entry over completed ones."""
+        self.engine.candle_write_queue_maxsize = 3
+
+        with self.engine._lock:
+            self.engine._enqueue_candle_write_locked(Candle("AAPL", 1, "", 1, 1, 1, 1, 1, 1, False, 1))
+            self.engine._enqueue_candle_write_locked(Candle("MSFT", 2, "", 1, 1, 1, 1, 1, 1, True, 1))
+            self.engine._enqueue_candle_write_locked(Candle("GOOG", 3, "", 1, 1, 1, 1, 1, 1, False, 1))
+            self.engine._enqueue_candle_write_locked(Candle("NVDA", 4, "", 1, 1, 1, 1, 1, 1, True, 1))
+
+            queued_keys = list(self.engine._pending_candle_writes.keys())
+
+        self.assertEqual(len(queued_keys), 3)
+        self.assertNotIn(("AAPL", 1, 1), queued_keys)
+        self.assertIn(("MSFT", 2, 1), queued_keys)
+        self.assertIn(("GOOG", 3, 1), queued_keys)
+        self.assertIn(("NVDA", 4, 1), queued_keys)
+
+    def test_multiple_flush_failures_keep_item_until_success(self):
+        """Repeated flush failures should keep item queued until a successful write."""
+        self.engine.process_tick("TSLA", 250.0, 10, 1735747200000)
+        self.storage.save_candle.side_effect = [
+            RuntimeError("db error #1"),
+            RuntimeError("db error #2"),
+            None
+        ]
+
+        self.engine.flush_pending_candle_writes()
+        self.engine.flush_pending_candle_writes()
+        self.engine.flush_pending_candle_writes()
+
+        self.assertEqual(self.storage.save_candle.call_count, 3)
+        metrics = self.engine.get_candle_write_metrics()
+        self.assertEqual(metrics["candle_write_queue_size"], 0)
+
 
 if __name__ == '__main__':
     unittest.main()
