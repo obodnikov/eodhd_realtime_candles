@@ -990,5 +990,44 @@ class TestCandleEngineCandleWriteFlush(unittest.TestCase):
         self.assertEqual(metrics["candle_write_queue_size"], 0)
 
 
+class TestCandleEngineTickGuards(unittest.TestCase):
+    """Tests for stale/out-of-order tick protections."""
+
+    def setUp(self):
+        self.storage = Mock()
+        self.engine = CandleEngine(
+            self.storage,
+            interval_minutes=1,
+            max_candles=100,
+            save_every_n_ticks=1000,
+            save_every_m_seconds=1000.0,
+            ticker_status_update_interval_seconds=1.0,
+            tick_max_age_seconds=180
+        )
+
+    def test_stale_tick_is_dropped_before_candle_creation(self):
+        """Ticks older than max age should not create or mutate candle state."""
+        stale_ts_ms = int((datetime.now(timezone.utc).timestamp() - 400) * 1000)
+        self.engine.process_tick("ELF", 91.48, 100, stale_ts_ms)
+
+        self.assertNotIn("ELF", self.engine._current_candles)
+        metrics = self.engine.get_candle_write_metrics()
+        self.assertEqual(metrics["stale_tick_dropped_count"], 1)
+
+    def test_out_of_order_tick_is_dropped(self):
+        """Older tick timestamp after a newer one should be ignored."""
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        older_ms = now_ms - 60_000
+
+        self.engine.process_tick("ELF", 91.57, 100, now_ms)
+        self.engine.process_tick("ELF", 91.49, 100, older_ms)
+
+        current = self.engine._current_candles["ELF"]
+        self.assertEqual(current.tick_count, 1)
+        self.assertEqual(current.close, 91.57)
+        metrics = self.engine.get_candle_write_metrics()
+        self.assertEqual(metrics["out_of_order_tick_dropped_count"], 1)
+
+
 if __name__ == '__main__':
     unittest.main()

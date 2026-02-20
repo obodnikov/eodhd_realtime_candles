@@ -146,7 +146,9 @@ async def websocket_status_task(storage, ws_manager: WebSocketManager, get_tick_
                 status.get('tick_dropped_count'),
                 status.get('candle_write_queue_size'),
                 status.get('candle_write_queue_maxsize'),
-                status.get('candle_write_dropped_count')
+                status.get('candle_write_dropped_count'),
+                status.get('stale_tick_dropped_count'),
+                status.get('out_of_order_tick_dropped_count')
             )
             
             if last_status != status_key:
@@ -299,7 +301,8 @@ async def run_worker(config: Config):
         save_every_n_ticks=config.candle_save_every_n_ticks,
         save_every_m_seconds=config.candle_save_every_m_seconds,
         ticker_status_update_interval_seconds=config.ticker_status_update_interval_seconds,
-        candle_write_queue_maxsize=config.candle_write_queue_maxsize
+        candle_write_queue_maxsize=config.candle_write_queue_maxsize,
+        tick_max_age_seconds=config.tick_max_age_seconds
     )
     ws_manager = WebSocketManager(
         api_key=config.eodhd_api_key,

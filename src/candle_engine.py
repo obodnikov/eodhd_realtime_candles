@@ -66,7 +66,8 @@ class CandleEngine:
         save_every_n_ticks: int = 10,
         save_every_m_seconds: float = 5.0,
         ticker_status_update_interval_seconds: float = 1.0,
-        candle_write_queue_maxsize: int = 10000
+        candle_write_queue_maxsize: int = 10000,
+        tick_max_age_seconds: int = 0
     ):
         """
         Initialize candle engine.
@@ -81,6 +82,9 @@ class CandleEngine:
                 to DB at most once per interval per ticker (default: 1.0s)
             candle_write_queue_maxsize: Max queued candle writes before
                 dropping oldest incomplete entries (default: 10000)
+            tick_max_age_seconds: Max accepted age of incoming ticks relative
+                to current UTC time before they are dropped as stale.
+                Set to 0 to disable stale-age filtering.
         """
         self.storage = storage
         self.interval_minutes = interval_minutes
@@ -88,6 +92,7 @@ class CandleEngine:
         self.max_candles = max_candles
         self.ticker_status_update_interval_seconds = ticker_status_update_interval_seconds
         self.candle_write_queue_maxsize = candle_write_queue_maxsize
+        self.tick_max_age_seconds = tick_max_age_seconds
         
         # Configurable save frequency thresholds
         self.save_every_n_ticks = save_every_n_ticks
@@ -107,6 +112,7 @@ class CandleEngine:
         # Pending ticker-status writes to reduce per-tick DB commit pressure.
         self._pending_ticker_status: Dict[str, Tuple[str, float]] = {}
         self._last_ticker_status_write: Dict[str, float] = {}
+        self._last_tick_timestamp_ms: Dict[str, int] = {}
 
         # Pending candle writes to move DB I/O out of the hot lock path.
         # OrderedDict preserves age so we can evict oldest incomplete entries first.
@@ -115,6 +121,8 @@ class CandleEngine:
             Candle
         ] = OrderedDict()
         self._candle_write_dropped_count = 0
+        self._stale_tick_dropped_count = 0
+        self._out_of_order_tick_dropped_count = 0
         
         # Callback for candle completion (for WebSocket notifications)
         self._on_candle_complete: Optional[Callable[[Candle], None]] = None
@@ -128,6 +136,10 @@ class CandleEngine:
         logger.info(
             "Candle write queue max size: %d",
             self.candle_write_queue_maxsize
+        )
+        logger.info(
+            "Tick max age filter: %s",
+            f"{self.tick_max_age_seconds}s" if self.tick_max_age_seconds > 0 else "disabled"
         )
     
     def set_interval(self, interval_minutes: int):
@@ -239,6 +251,20 @@ class CandleEngine:
             timestamp_ms: Unix timestamp in milliseconds
         """
         ticker = ticker.upper()
+        if self.tick_max_age_seconds > 0:
+            now_ms = int(time.time() * 1000)
+            if timestamp_ms < (now_ms - self.tick_max_age_seconds * 1000):
+                with self._lock:
+                    self._stale_tick_dropped_count += 1
+                return
+
+        with self._lock:
+            last_seen = self._last_tick_timestamp_ms.get(ticker)
+            if last_seen is not None and timestamp_ms < last_seen:
+                self._out_of_order_tick_dropped_count += 1
+                return
+            self._last_tick_timestamp_ms[ticker] = timestamp_ms
+
         candle_start = self._get_candle_start(timestamp_ms)
         current_time = time.time()
         status_timestamp = datetime.now(timezone.utc).isoformat()
@@ -279,6 +305,9 @@ class CandleEngine:
                     )
                     # Save first tick of new candle
                     self._save_current_candle_state_locked(ticker)
+                elif candle_start < current.start_timestamp:
+                    self._out_of_order_tick_dropped_count += 1
+                    return
                 else:
                     # Update current candle
                     current.high = max(current.high, price)
@@ -565,12 +594,14 @@ class CandleEngine:
                     self._pending_candle_writes[key] = candle
 
     def get_candle_write_metrics(self) -> dict:
-        """Get current candle write queue metrics."""
+        """Get current candle/tick drop metrics."""
         with self._lock:
             return {
                 'candle_write_queue_size': len(self._pending_candle_writes),
                 'candle_write_queue_maxsize': self.candle_write_queue_maxsize,
-                'candle_write_dropped_count': self._candle_write_dropped_count
+                'candle_write_dropped_count': self._candle_write_dropped_count,
+                'stale_tick_dropped_count': self._stale_tick_dropped_count,
+                'out_of_order_tick_dropped_count': self._out_of_order_tick_dropped_count
             }
 
     def get_pending_cleanup(self) -> Set[str]:

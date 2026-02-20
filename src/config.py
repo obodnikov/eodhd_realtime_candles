@@ -82,6 +82,7 @@ class Config:
     candle_write_queue_maxsize: int = field(default_factory=lambda: int(os.environ.get('CANDLE_WRITE_QUEUE_MAXSIZE', '10000')))
     tick_queue_maxsize: int = field(default_factory=lambda: int(os.environ.get('TICK_QUEUE_MAXSIZE', '50000')))
     tick_worker_concurrency: int = field(default_factory=lambda: int(os.environ.get('TICK_WORKER_CONCURRENCY', '100')))
+    tick_max_age_seconds: int = field(default_factory=lambda: int(os.environ.get('TICK_MAX_AGE_SECONDS', '180')))
 
     # Persistence
     config_file: str = field(default_factory=lambda: os.environ.get('CONFIG_FILE', ''))
@@ -117,6 +118,9 @@ class Config:
 
         if self.tick_worker_concurrency < 1:
             errors.append(f"tick_worker_concurrency must be at least 1")
+
+        if self.tick_max_age_seconds < 0:
+            errors.append("tick_max_age_seconds must be >= 0")
         
         return errors
     
@@ -152,6 +156,7 @@ class Config:
             'ws_ping_interval': self.ws_ping_interval,
             'ticker_status_update_interval_seconds': self.ticker_status_update_interval_seconds,
             'candle_write_queue_maxsize': self.candle_write_queue_maxsize,
+            'tick_max_age_seconds': self.tick_max_age_seconds,
             'authentication_enabled': self.api_key is not None,
         }
 

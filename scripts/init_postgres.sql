@@ -71,6 +71,10 @@ CREATE TABLE IF NOT EXISTS active_candles_status (
     updated_at TIMESTAMPTZ NOT NULL
 );
 
+-- Idempotent additive migrations for websocket status metrics
+ALTER TABLE websocket_status ADD COLUMN IF NOT EXISTS stale_tick_dropped_count BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE websocket_status ADD COLUMN IF NOT EXISTS out_of_order_tick_dropped_count BIGINT NOT NULL DEFAULT 0;
+
 -- Grant permissions (adjust user as needed)
 -- GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO eodhd_user;
 -- GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO eodhd_user;
