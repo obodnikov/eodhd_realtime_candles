@@ -811,5 +811,60 @@ class TestCandleEngineSaveFrequency(unittest.TestCase):
         self.assertEqual(db_candle.volume, expected_volume)
 
 
+class TestCandleEngineTickerStatusFlush(unittest.TestCase):
+    """Tests for ticker status throttling and flush failure handling."""
+
+    def setUp(self):
+        self.storage = Mock()
+        self.engine = CandleEngine(
+            self.storage,
+            interval_minutes=1,
+            max_candles=100,
+            save_every_n_ticks=1000,
+            save_every_m_seconds=1000.0,
+            ticker_status_update_interval_seconds=1.0
+        )
+
+    def test_immediate_status_failure_requeues_pending_update(self):
+        """Failed immediate status update should be re-queued for retry."""
+        self.storage.update_ticker_status.side_effect = RuntimeError("db down")
+
+        self.engine.process_tick("AAPL", 150.0, 10, 1735747200000)
+
+        self.assertTrue(self.storage.update_ticker_status.called)
+        self.assertIn("AAPL", self.engine._pending_ticker_status)
+        last_tick_at, last_price = self.engine._pending_ticker_status["AAPL"]
+        self.assertIsInstance(last_tick_at, str)
+        self.assertEqual(last_price, 150.0)
+
+    def test_flush_pending_statuses_success_clears_queue(self):
+        """Successful flush should clear pending queue and update write marker."""
+        with self.engine._lock:
+            self.engine._pending_ticker_status["MSFT"] = (
+                datetime.now(timezone.utc).isoformat(),
+                320.5
+            )
+
+        self.engine.flush_pending_ticker_statuses()
+
+        self.assertNotIn("MSFT", self.engine._pending_ticker_status)
+        self.assertIn("MSFT", self.engine._last_ticker_status_write)
+        self.storage.update_ticker_status.assert_called_once()
+
+    def test_flush_pending_statuses_failure_keeps_queue(self):
+        """Failed flush should keep pending status for next retry cycle."""
+        with self.engine._lock:
+            self.engine._pending_ticker_status["NVDA"] = (
+                datetime.now(timezone.utc).isoformat(),
+                900.0
+            )
+        self.storage.update_ticker_status.side_effect = RuntimeError("temporary db error")
+
+        self.engine.flush_pending_ticker_statuses()
+
+        self.assertIn("NVDA", self.engine._pending_ticker_status)
+        self.storage.update_ticker_status.assert_called_once()
+
+
 if __name__ == '__main__':
     unittest.main()

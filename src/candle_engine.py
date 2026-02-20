@@ -7,7 +7,7 @@ import logging
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Dict, Optional, Callable, Set
+from typing import Dict, Optional, Callable, Set, Tuple
 from dataclasses import dataclass
 
 from .storage import Storage, Candle
@@ -63,7 +63,8 @@ class CandleEngine:
         interval_minutes: int = 5, 
         max_candles: int = 100,
         save_every_n_ticks: int = 10,
-        save_every_m_seconds: float = 5.0
+        save_every_m_seconds: float = 5.0,
+        ticker_status_update_interval_seconds: float = 1.0
     ):
         """
         Initialize candle engine.
@@ -74,11 +75,14 @@ class CandleEngine:
             max_candles: Maximum candles to store per ticker
             save_every_n_ticks: Save current candle every N ticks (default: 10)
             save_every_m_seconds: Save current candle every M seconds (default: 5.0)
+            ticker_status_update_interval_seconds: Flush ticker last-tick status
+                to DB at most once per interval per ticker (default: 1.0s)
         """
         self.storage = storage
         self.interval_minutes = interval_minutes
         self.interval_seconds = interval_minutes * 60
         self.max_candles = max_candles
+        self.ticker_status_update_interval_seconds = ticker_status_update_interval_seconds
         
         # Configurable save frequency thresholds
         self.save_every_n_ticks = save_every_n_ticks
@@ -94,12 +98,20 @@ class CandleEngine:
         # Pending cleanup queue - tickers that need old candles removed
         # Cleanup runs on a timer, not per-candle completion (performance)
         self._pending_cleanup: Set[str] = set()
+
+        # Pending ticker-status writes to reduce per-tick DB commit pressure.
+        self._pending_ticker_status: Dict[str, Tuple[str, float]] = {}
+        self._last_ticker_status_write: Dict[str, float] = {}
         
         # Callback for candle completion (for WebSocket notifications)
         self._on_candle_complete: Optional[Callable[[Candle], None]] = None
         
         logger.info(f"CandleEngine initialized: {interval_minutes}m interval, max {max_candles} candles")
         logger.info(f"Tick-save frequency: every {self.save_every_n_ticks} ticks or {self.save_every_m_seconds}s")
+        logger.info(
+            "Ticker status update frequency: max once every %.2fs per ticker",
+            self.ticker_status_update_interval_seconds
+        )
     
     def set_interval(self, interval_minutes: int):
         """
@@ -212,17 +224,20 @@ class CandleEngine:
         ticker = ticker.upper()
         candle_start = self._get_candle_start(timestamp_ms)
         current_time = time.time()
-        
-        # Update ticker status in storage (thread-safe via thread-local connections)
-        self.storage.update_ticker_status(
-            ticker, 
-            status='active',
-            last_tick_at=datetime.now(timezone.utc).isoformat(),
-            last_price=price
-        )
-        
+        status_timestamp = datetime.now(timezone.utc).isoformat()
+        status_to_flush: Optional[Tuple[str, str, float]] = None
+
         # Lock for thread-safe access to _current_candles and _pending_cleanup
         with self._lock:
+            # Track latest status in memory and throttle DB writes.
+            self._pending_ticker_status[ticker] = (status_timestamp, price)
+            last_write = self._last_ticker_status_write.get(ticker, 0.0)
+            if current_time - last_write >= self.ticker_status_update_interval_seconds:
+                pending = self._pending_ticker_status.pop(ticker, None)
+                if pending is not None:
+                    status_to_flush = (ticker, pending[0], pending[1])
+                    self._last_ticker_status_write[ticker] = current_time
+
             # Check if we have a current candle for this ticker
             if ticker in self._current_candles:
                 current = self._current_candles[ticker]
@@ -283,6 +298,24 @@ class CandleEngine:
                 )
                 self._save_current_candle_state_locked(ticker)
                 logger.info(f"Started tracking {ticker} at price {price:.2f}")
+
+        # Flush ticker status outside the lock to reduce lock hold time.
+        if status_to_flush is not None:
+            try:
+                self.storage.update_ticker_status(
+                    status_to_flush[0],
+                    status='active',
+                    last_tick_at=status_to_flush[1],
+                    last_price=status_to_flush[2]
+                )
+            except Exception as e:
+                logger.error(f"Failed immediate ticker status update for {status_to_flush[0]}: {e}")
+                # Re-queue failed status so periodic flush task can retry.
+                with self._lock:
+                    self._pending_ticker_status[status_to_flush[0]] = (
+                        status_to_flush[1],
+                        status_to_flush[2]
+                    )
     
     def _save_current_candle_state_locked(self, ticker: str):
         """
@@ -347,6 +380,8 @@ class CandleEngine:
             if ticker in self._current_candles:
                 del self._current_candles[ticker]
                 logger.info(f"Stopped tracking {ticker}")
+            self._pending_ticker_status.pop(ticker, None)
+            self._last_ticker_status_write.pop(ticker, None)
     
     def get_active_tickers(self) -> list:
         """Get list of tickers with active (in-progress) candles."""
@@ -393,6 +428,43 @@ class CandleEngine:
         with self._lock:
             for ticker in list(self._current_candles.keys()):
                 self._complete_current_candle_locked(ticker, force=True)
+
+    def flush_pending_ticker_statuses(self):
+        """
+        Flush pending ticker status updates to storage.
+
+        Called by a periodic background task and during shutdown to reduce
+        per-tick status writes while preserving recent ticker heartbeat data.
+        """
+        with self._lock:
+            pending_items = list(self._pending_ticker_status.items())
+            self._pending_ticker_status.clear()
+
+        if not pending_items:
+            return
+
+        failed_items: Dict[str, Tuple[str, float]] = {}
+        now = time.time()
+        successful_tickers = []
+        for ticker, (last_tick_at, last_price) in pending_items:
+            try:
+                self.storage.update_ticker_status(
+                    ticker,
+                    status='active',
+                    last_tick_at=last_tick_at,
+                    last_price=last_price
+                )
+            except Exception as e:
+                logger.error(f"Failed flushing ticker status for {ticker}: {e}")
+                failed_items[ticker] = (last_tick_at, last_price)
+            else:
+                successful_tickers.append(ticker)
+
+        with self._lock:
+            for ticker in successful_tickers:
+                self._last_ticker_status_write[ticker] = now
+            if failed_items:
+                self._pending_ticker_status.update(failed_items)
 
     def get_pending_cleanup(self) -> Set[str]:
         """Get set of tickers pending cleanup."""
