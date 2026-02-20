@@ -154,6 +154,15 @@ class PostgreSQLStorage:
             cursor.execute(
                 'ALTER TABLE websocket_status ADD COLUMN IF NOT EXISTS tick_dropped_count BIGINT NOT NULL DEFAULT 0'
             )
+            cursor.execute(
+                'ALTER TABLE websocket_status ADD COLUMN IF NOT EXISTS candle_write_queue_size INTEGER NOT NULL DEFAULT 0'
+            )
+            cursor.execute(
+                'ALTER TABLE websocket_status ADD COLUMN IF NOT EXISTS candle_write_queue_maxsize INTEGER NOT NULL DEFAULT 0'
+            )
+            cursor.execute(
+                'ALTER TABLE websocket_status ADD COLUMN IF NOT EXISTS candle_write_dropped_count BIGINT NOT NULL DEFAULT 0'
+            )
             conn.commit()
             logger.info("PostgreSQL database schema initialized")
         finally:
@@ -218,6 +227,9 @@ class PostgreSQLStorage:
                 tick_enqueued_count BIGINT NOT NULL DEFAULT 0,
                 tick_processed_count BIGINT NOT NULL DEFAULT 0,
                 tick_dropped_count BIGINT NOT NULL DEFAULT 0,
+                candle_write_queue_size INTEGER NOT NULL DEFAULT 0,
+                candle_write_queue_maxsize INTEGER NOT NULL DEFAULT 0,
+                candle_write_dropped_count BIGINT NOT NULL DEFAULT 0,
                 last_message TEXT,
                 last_update TEXT NOT NULL
             )
@@ -821,8 +833,9 @@ class PostgreSQLStorage:
                     pending_subscribe, connection_count, tick_count,
                     tick_queue_size, tick_queue_maxsize,
                     tick_enqueued_count, tick_processed_count, tick_dropped_count,
+                    candle_write_queue_size, candle_write_queue_maxsize, candle_write_dropped_count,
                     last_message, last_update
-                ) VALUES (1, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ) VALUES (1, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (id) DO UPDATE SET
                     connected = EXCLUDED.connected,
                     subscribed_tickers = EXCLUDED.subscribed_tickers,
@@ -835,6 +848,9 @@ class PostgreSQLStorage:
                     tick_enqueued_count = EXCLUDED.tick_enqueued_count,
                     tick_processed_count = EXCLUDED.tick_processed_count,
                     tick_dropped_count = EXCLUDED.tick_dropped_count,
+                    candle_write_queue_size = EXCLUDED.candle_write_queue_size,
+                    candle_write_queue_maxsize = EXCLUDED.candle_write_queue_maxsize,
+                    candle_write_dropped_count = EXCLUDED.candle_write_dropped_count,
                     last_message = EXCLUDED.last_message,
                     last_update = EXCLUDED.last_update
             ''', (
@@ -849,6 +865,9 @@ class PostgreSQLStorage:
                 status.get('tick_enqueued_count', 0),
                 status.get('tick_processed_count', 0),
                 status.get('tick_dropped_count', 0),
+                status.get('candle_write_queue_size', 0),
+                status.get('candle_write_queue_maxsize', 0),
+                status.get('candle_write_dropped_count', 0),
                 status.get('last_message'),
                 datetime.now(timezone.utc).isoformat()
             ))
@@ -952,6 +971,9 @@ class PostgreSQLStorage:
                 'tick_enqueued_count': row.get('tick_enqueued_count', 0),
                 'tick_processed_count': row.get('tick_processed_count', 0),
                 'tick_dropped_count': row.get('tick_dropped_count', 0),
+                'candle_write_queue_size': row.get('candle_write_queue_size', 0),
+                'candle_write_queue_maxsize': row.get('candle_write_queue_maxsize', 0),
+                'candle_write_dropped_count': row.get('candle_write_dropped_count', 0),
                 'last_message': row['last_message'],
                 'last_update': last_update.isoformat() if last_update else None,
                 'is_stale': is_stale,

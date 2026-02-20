@@ -69,7 +69,8 @@ async def create_app(config: Config) -> web.Application:
         max_candles=config.max_candles_stored,
         save_every_n_ticks=config.candle_save_every_n_ticks,
         save_every_m_seconds=config.candle_save_every_m_seconds,
-        ticker_status_update_interval_seconds=config.ticker_status_update_interval_seconds
+        ticker_status_update_interval_seconds=config.ticker_status_update_interval_seconds,
+        candle_write_queue_maxsize=config.candle_write_queue_maxsize
     )
     ws_manager = WebSocketManager(
         api_key=config.eodhd_api_key,
@@ -150,6 +151,42 @@ async def cleanup_task(app: web.Application):
             logger.error(f"Error in cleanup task: {e}")
 
 
+async def ticker_status_flush_task(app: web.Application):
+    """Background task for flushing throttled ticker status updates."""
+    logger = logging.getLogger(__name__)
+    candle_engine: CandleEngine = app['candle_engine']
+    interval = app['config_manager'].config.ticker_status_update_interval_seconds
+    logger.info("Ticker status flush task started (%.2fs interval)", interval)
+
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            await asyncio.to_thread(candle_engine.flush_pending_ticker_statuses)
+        except asyncio.CancelledError:
+            logger.info("Ticker status flush task cancelled")
+            break
+        except Exception as e:
+            logger.error(f"Error in ticker status flush task: {e}")
+
+
+async def candle_write_flush_task(app: web.Application):
+    """Background task for flushing queued candle writes."""
+    logger = logging.getLogger(__name__)
+    candle_engine: CandleEngine = app['candle_engine']
+    interval = 0.25
+    logger.info("Candle write flush task started (%.2fs interval)", interval)
+
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            await asyncio.to_thread(candle_engine.flush_pending_candle_writes)
+        except asyncio.CancelledError:
+            logger.info("Candle write flush task cancelled")
+            break
+        except Exception as e:
+            logger.error(f"Error in candle write flush task: {e}")
+
+
 async def on_startup(app: web.Application):
     """Initialize services on startup."""
     logger = logging.getLogger(__name__)
@@ -179,6 +216,8 @@ async def on_startup(app: web.Application):
     
     # Start background cleanup task
     app['cleanup_task'] = asyncio.create_task(cleanup_task(app))
+    app['ticker_status_flush_task'] = asyncio.create_task(ticker_status_flush_task(app))
+    app['candle_write_flush_task'] = asyncio.create_task(candle_write_flush_task(app))
     
     logger.info("Service started successfully")
 
@@ -200,9 +239,26 @@ async def on_shutdown(app: web.Application):
             await app['cleanup_task']
         except asyncio.CancelledError:
             pass
+
+    if 'ticker_status_flush_task' in app:
+        app['ticker_status_flush_task'].cancel()
+        try:
+            await app['ticker_status_flush_task']
+        except asyncio.CancelledError:
+            pass
+
+    if 'candle_write_flush_task' in app:
+        app['candle_write_flush_task'].cancel()
+        try:
+            await app['candle_write_flush_task']
+        except asyncio.CancelledError:
+            pass
     
     # Complete any in-progress candles
+    await asyncio.to_thread(candle_engine.flush_pending_ticker_statuses)
+    await asyncio.to_thread(candle_engine.flush_pending_candle_writes)
     candle_engine.complete_all_candles()
+    await asyncio.to_thread(candle_engine.flush_pending_candle_writes)
     
     # Process any remaining pending cleanups before shutdown
     pending = candle_engine.get_pending_cleanup()

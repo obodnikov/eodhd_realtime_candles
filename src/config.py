@@ -79,6 +79,7 @@ class Config:
     candle_save_every_n_ticks: int = field(default_factory=lambda: int(os.environ.get('CANDLE_SAVE_EVERY_N_TICKS', '10')))
     candle_save_every_m_seconds: float = field(default_factory=lambda: float(os.environ.get('CANDLE_SAVE_EVERY_M_SECONDS', '5.0')))
     ticker_status_update_interval_seconds: float = field(default_factory=lambda: float(os.environ.get('TICKER_STATUS_UPDATE_INTERVAL_SECONDS', '1.0')))
+    candle_write_queue_maxsize: int = field(default_factory=lambda: int(os.environ.get('CANDLE_WRITE_QUEUE_MAXSIZE', '10000')))
     tick_queue_maxsize: int = field(default_factory=lambda: int(os.environ.get('TICK_QUEUE_MAXSIZE', '50000')))
     tick_worker_concurrency: int = field(default_factory=lambda: int(os.environ.get('TICK_WORKER_CONCURRENCY', '100')))
 
@@ -107,6 +108,9 @@ class Config:
 
         if self.ticker_status_update_interval_seconds <= 0:
             errors.append("ticker_status_update_interval_seconds must be > 0")
+
+        if self.candle_write_queue_maxsize < 1:
+            errors.append("candle_write_queue_maxsize must be at least 1")
 
         if self.tick_queue_maxsize < 1:
             errors.append(f"tick_queue_maxsize must be at least 1")
@@ -147,6 +151,7 @@ class Config:
             'ws_reconnect_delay': self.ws_reconnect_delay,
             'ws_ping_interval': self.ws_ping_interval,
             'ticker_status_update_interval_seconds': self.ticker_status_update_interval_seconds,
+            'candle_write_queue_maxsize': self.candle_write_queue_maxsize,
             'authentication_enabled': self.api_key is not None,
         }
 

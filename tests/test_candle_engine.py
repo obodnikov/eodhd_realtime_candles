@@ -866,5 +866,94 @@ class TestCandleEngineTickerStatusFlush(unittest.TestCase):
         self.storage.update_ticker_status.assert_called_once()
 
 
+class TestCandleEngineCandleWriteFlush(unittest.TestCase):
+    """Tests for queued candle writes and flush behavior."""
+
+    def setUp(self):
+        self.storage = Mock()
+        self.engine = CandleEngine(
+            self.storage,
+            interval_minutes=1,
+            max_candles=100,
+            save_every_n_ticks=1000,
+            save_every_m_seconds=1000.0,
+            ticker_status_update_interval_seconds=1.0,
+            candle_write_queue_maxsize=100
+        )
+
+    def test_process_tick_enqueues_candle_write_without_immediate_db_write(self):
+        """Tick processing should queue candle write; flush performs DB write."""
+        self.engine.process_tick("AAPL", 100.0, 10, 1735747200000)
+
+        self.storage.save_candle.assert_not_called()
+        metrics = self.engine.get_candle_write_metrics()
+        self.assertEqual(metrics["candle_write_queue_size"], 1)
+
+        self.engine.flush_pending_candle_writes()
+        self.storage.save_candle.assert_called_once()
+        metrics = self.engine.get_candle_write_metrics()
+        self.assertEqual(metrics["candle_write_queue_size"], 0)
+
+    def test_flush_failed_candle_write_is_requeued(self):
+        """Failed candle write flush should keep item queued for retry."""
+        self.engine.process_tick("MSFT", 200.0, 10, 1735747200000)
+        self.storage.save_candle.side_effect = RuntimeError("db error")
+
+        self.engine.flush_pending_candle_writes()
+
+        self.assertEqual(self.storage.save_candle.call_count, 1)
+        metrics = self.engine.get_candle_write_metrics()
+        self.assertEqual(metrics["candle_write_queue_size"], 1)
+
+    def test_complete_candle_overrides_incomplete_for_same_key(self):
+        """Completed candle write should replace queued incomplete version."""
+        base_ts = 1735747200000
+        self.engine.process_tick("NVDA", 300.0, 10, base_ts)
+        self.engine.process_tick("NVDA", 301.0, 10, base_ts + 60000)  # next 1m candle
+
+        self.engine.flush_pending_candle_writes()
+
+        writes = [call.args[0] for call in self.storage.save_candle.call_args_list]
+        completed_same_timestamp = [
+            c for c in writes if c.ticker == "NVDA" and c.timestamp == 1735747200 and c.is_complete
+        ]
+        self.assertEqual(len(completed_same_timestamp), 1)
+
+    def test_full_completed_queue_evicts_oldest_for_new_completed_candle(self):
+        """When queue is full of completed candles, newest completed should replace oldest."""
+        self.engine.candle_write_queue_maxsize = 2
+
+        with self.engine._lock:
+            self.engine._enqueue_candle_write_locked(Candle("AAPL", 1, "", 1, 1, 1, 1, 1, 1, True, 1))
+            self.engine._enqueue_candle_write_locked(Candle("MSFT", 2, "", 1, 1, 1, 1, 1, 1, True, 1))
+            self.engine._enqueue_candle_write_locked(Candle("NVDA", 3, "", 1, 1, 1, 1, 1, 1, True, 1))
+
+            queued_keys = list(self.engine._pending_candle_writes.keys())
+
+        self.assertEqual(len(queued_keys), 2)
+        self.assertNotIn(("AAPL", 1, 1), queued_keys)
+        self.assertIn(("MSFT", 2, 1), queued_keys)
+        self.assertIn(("NVDA", 3, 1), queued_keys)
+
+    def test_full_completed_queue_drops_incomplete_candle(self):
+        """When queue is full of completed candles, incoming incomplete write is dropped."""
+        self.engine.candle_write_queue_maxsize = 2
+
+        with self.engine._lock:
+            self.engine._enqueue_candle_write_locked(Candle("AAPL", 1, "", 1, 1, 1, 1, 1, 1, True, 1))
+            self.engine._enqueue_candle_write_locked(Candle("MSFT", 2, "", 1, 1, 1, 1, 1, 1, True, 1))
+            self.engine._enqueue_candle_write_locked(Candle("NVDA", 3, "", 1, 1, 1, 1, 1, 1, False, 1))
+
+            queued_keys = list(self.engine._pending_candle_writes.keys())
+
+        self.assertEqual(len(queued_keys), 2)
+        self.assertIn(("AAPL", 1, 1), queued_keys)
+        self.assertIn(("MSFT", 2, 1), queued_keys)
+        self.assertNotIn(("NVDA", 3, 1), queued_keys)
+
+        metrics = self.engine.get_candle_write_metrics()
+        self.assertEqual(metrics["candle_write_dropped_count"], 1)
+
+
 if __name__ == '__main__':
     unittest.main()

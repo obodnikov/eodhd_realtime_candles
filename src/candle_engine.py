@@ -6,6 +6,7 @@ Converts tick data into OHLCV candles at configurable intervals.
 import logging
 import threading
 import time
+from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Dict, Optional, Callable, Set, Tuple
 from dataclasses import dataclass
@@ -64,7 +65,8 @@ class CandleEngine:
         max_candles: int = 100,
         save_every_n_ticks: int = 10,
         save_every_m_seconds: float = 5.0,
-        ticker_status_update_interval_seconds: float = 1.0
+        ticker_status_update_interval_seconds: float = 1.0,
+        candle_write_queue_maxsize: int = 10000
     ):
         """
         Initialize candle engine.
@@ -77,12 +79,15 @@ class CandleEngine:
             save_every_m_seconds: Save current candle every M seconds (default: 5.0)
             ticker_status_update_interval_seconds: Flush ticker last-tick status
                 to DB at most once per interval per ticker (default: 1.0s)
+            candle_write_queue_maxsize: Max queued candle writes before
+                dropping oldest incomplete entries (default: 10000)
         """
         self.storage = storage
         self.interval_minutes = interval_minutes
         self.interval_seconds = interval_minutes * 60
         self.max_candles = max_candles
         self.ticker_status_update_interval_seconds = ticker_status_update_interval_seconds
+        self.candle_write_queue_maxsize = candle_write_queue_maxsize
         
         # Configurable save frequency thresholds
         self.save_every_n_ticks = save_every_n_ticks
@@ -102,6 +107,14 @@ class CandleEngine:
         # Pending ticker-status writes to reduce per-tick DB commit pressure.
         self._pending_ticker_status: Dict[str, Tuple[str, float]] = {}
         self._last_ticker_status_write: Dict[str, float] = {}
+
+        # Pending candle writes to move DB I/O out of the hot lock path.
+        # OrderedDict preserves age so we can evict oldest incomplete entries first.
+        self._pending_candle_writes: OrderedDict[
+            Tuple[str, int, int],
+            Candle
+        ] = OrderedDict()
+        self._candle_write_dropped_count = 0
         
         # Callback for candle completion (for WebSocket notifications)
         self._on_candle_complete: Optional[Callable[[Candle], None]] = None
@@ -111,6 +124,10 @@ class CandleEngine:
         logger.info(
             "Ticker status update frequency: max once every %.2fs per ticker",
             self.ticker_status_update_interval_seconds
+        )
+        logger.info(
+            "Candle write queue max size: %d",
+            self.candle_write_queue_maxsize
         )
     
     def set_interval(self, interval_minutes: int):
@@ -174,8 +191,8 @@ class CandleEngine:
             interval_minutes=self.interval_minutes
         )
         
-        # Save to storage
-        self.storage.save_candle(completed)
+        # Queue write to storage (flushed by background task).
+        self._enqueue_candle_write_locked(completed)
         
         # Queue cleanup instead of running immediately (performance optimization)
         # Cleanup will be processed by background task
@@ -342,7 +359,53 @@ class CandleEngine:
             interval_minutes=self.interval_minutes
         )
         
-        self.storage.save_candle(candle)
+        self._enqueue_candle_write_locked(candle)
+
+    def _enqueue_candle_write_locked(self, candle: Candle):
+        """
+        Queue candle write while holding engine lock.
+
+        Dedupes by (ticker, timestamp, interval) so frequent updates to an
+        in-progress candle replace older queued versions.
+        """
+        key = (candle.ticker, candle.timestamp, candle.interval_minutes)
+        existing = self._pending_candle_writes.get(key)
+
+        # Never allow an incomplete update to overwrite a completed candle.
+        if existing is not None:
+            if existing.is_complete and not candle.is_complete:
+                return
+            self._pending_candle_writes[key] = candle
+            self._pending_candle_writes.move_to_end(key)
+            return
+
+        if len(self._pending_candle_writes) >= self.candle_write_queue_maxsize:
+            # Prefer evicting the oldest incomplete entry first.
+            evict_key: Optional[Tuple[str, int, int]] = None
+            for pending_key, pending_candle in self._pending_candle_writes.items():
+                if not pending_candle.is_complete:
+                    evict_key = pending_key
+                    break
+
+            if evict_key is None and candle.is_complete and self._pending_candle_writes:
+                # Queue is saturated with completed candles; keep newest completed
+                # snapshot by evicting the oldest completed entry.
+                evict_key = next(iter(self._pending_candle_writes))
+
+            if evict_key is None:
+                # Queue saturated with completed candles and incoming candle is
+                # incomplete. Drop the incoming write and record metric.
+                self._candle_write_dropped_count += 1
+                if self._candle_write_dropped_count % 1000 == 0:
+                    logger.warning(
+                        "Candle write queue saturated, dropped %d queued writes",
+                        self._candle_write_dropped_count
+                    )
+                return
+
+            self._pending_candle_writes.pop(evict_key, None)
+
+        self._pending_candle_writes[key] = candle
     
     def get_current_candle(self, ticker: str) -> Optional[dict]:
         """Get the current in-progress candle for a ticker."""
@@ -465,6 +528,50 @@ class CandleEngine:
                 self._last_ticker_status_write[ticker] = now
             if failed_items:
                 self._pending_ticker_status.update(failed_items)
+
+    def flush_pending_candle_writes(self):
+        """
+        Flush queued candle writes to storage.
+
+        Failed writes are re-queued for retry on the next flush cycle.
+        """
+        with self._lock:
+            pending_items = list(self._pending_candle_writes.items())
+            self._pending_candle_writes.clear()
+
+        if not pending_items:
+            return
+
+        failed: Dict[Tuple[str, int, int], Candle] = {}
+        for key, candle in pending_items:
+            try:
+                self.storage.save_candle(candle)
+            except Exception as e:
+                logger.error(
+                    "Failed flushing candle write for %s %s: %s",
+                    candle.ticker,
+                    candle.datetime_utc,
+                    e
+                )
+                failed[key] = candle
+
+        if failed:
+            with self._lock:
+                for key, candle in failed.items():
+                    # Preserve an existing complete version if already present.
+                    existing = self._pending_candle_writes.get(key)
+                    if existing is not None and existing.is_complete and not candle.is_complete:
+                        continue
+                    self._pending_candle_writes[key] = candle
+
+    def get_candle_write_metrics(self) -> dict:
+        """Get current candle write queue metrics."""
+        with self._lock:
+            return {
+                'candle_write_queue_size': len(self._pending_candle_writes),
+                'candle_write_queue_maxsize': self.candle_write_queue_maxsize,
+                'candle_write_dropped_count': self._candle_write_dropped_count
+            }
 
     def get_pending_cleanup(self) -> Set[str]:
         """Get set of tickers pending cleanup."""

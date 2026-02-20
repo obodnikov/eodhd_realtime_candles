@@ -291,6 +291,9 @@ class Storage:
                 tick_enqueued_count INTEGER NOT NULL DEFAULT 0,
                 tick_processed_count INTEGER NOT NULL DEFAULT 0,
                 tick_dropped_count INTEGER NOT NULL DEFAULT 0,
+                candle_write_queue_size INTEGER NOT NULL DEFAULT 0,
+                candle_write_queue_maxsize INTEGER NOT NULL DEFAULT 0,
+                candle_write_dropped_count INTEGER NOT NULL DEFAULT 0,
                 last_message TEXT,
                 last_update TEXT NOT NULL
             )
@@ -309,6 +312,12 @@ class Storage:
             cursor.execute("ALTER TABLE websocket_status ADD COLUMN tick_processed_count INTEGER NOT NULL DEFAULT 0")
         if 'tick_dropped_count' not in ws_columns:
             cursor.execute("ALTER TABLE websocket_status ADD COLUMN tick_dropped_count INTEGER NOT NULL DEFAULT 0")
+        if 'candle_write_queue_size' not in ws_columns:
+            cursor.execute("ALTER TABLE websocket_status ADD COLUMN candle_write_queue_size INTEGER NOT NULL DEFAULT 0")
+        if 'candle_write_queue_maxsize' not in ws_columns:
+            cursor.execute("ALTER TABLE websocket_status ADD COLUMN candle_write_queue_maxsize INTEGER NOT NULL DEFAULT 0")
+        if 'candle_write_dropped_count' not in ws_columns:
+            cursor.execute("ALTER TABLE websocket_status ADD COLUMN candle_write_dropped_count INTEGER NOT NULL DEFAULT 0")
         
         # Active candles status table (for multi-worker status sharing)
         cursor.execute('''
@@ -923,8 +932,9 @@ class Storage:
                 pending_subscribe, connection_count, tick_count,
                 tick_queue_size, tick_queue_maxsize,
                 tick_enqueued_count, tick_processed_count, tick_dropped_count,
+                candle_write_queue_size, candle_write_queue_maxsize, candle_write_dropped_count,
                 last_message, last_update
-            ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             1 if status.get('connected') else 0,
             json.dumps(status.get('subscribed_tickers', [])),
@@ -937,6 +947,9 @@ class Storage:
             status.get('tick_enqueued_count', 0),
             status.get('tick_processed_count', 0),
             status.get('tick_dropped_count', 0),
+            status.get('candle_write_queue_size', 0),
+            status.get('candle_write_queue_maxsize', 0),
+            status.get('candle_write_dropped_count', 0),
             status.get('last_message'),
             datetime.now(timezone.utc).isoformat()
         ))
@@ -1000,6 +1013,9 @@ class Storage:
             'tick_enqueued_count': row['tick_enqueued_count'],
             'tick_processed_count': row['tick_processed_count'],
             'tick_dropped_count': row['tick_dropped_count'],
+            'candle_write_queue_size': row['candle_write_queue_size'],
+            'candle_write_queue_maxsize': row['candle_write_queue_maxsize'],
+            'candle_write_dropped_count': row['candle_write_dropped_count'],
             'last_message': row['last_message'],
             'last_update': row['last_update'],
             'is_stale': is_stale,
