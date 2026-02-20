@@ -106,7 +106,7 @@ async def cleanup_task(storage, candle_engine: CandleEngine):
             logger.error(f"Error in cleanup task: {e}")
 
 
-async def websocket_status_task(storage, ws_manager: WebSocketManager):
+async def websocket_status_task(storage, ws_manager: WebSocketManager, get_tick_metrics):
     """
     Background task that periodically writes WebSocket status to database.
     
@@ -127,6 +127,7 @@ async def websocket_status_task(storage, ws_manager: WebSocketManager):
             
             # Get current WebSocket status
             status = ws_manager.get_status()
+            status.update(get_tick_metrics())
             
             # Only update if status changed (optimization)
             # Compare all relevant fields including lists (convert to tuple for comparison)
@@ -255,23 +256,89 @@ async def run_worker(config: Config):
         ping_interval=config.ws_ping_interval
     )
     
-    # Semaphore to limit concurrent tick processing tasks
-    # Prevents unbounded task growth under high tick volume
-    tick_semaphore = asyncio.Semaphore(100)
+    # Bounded queue + fixed workers to apply backpressure under high tick volume
+    tick_queue: asyncio.Queue[tuple[str, float, int, int]] = asyncio.Queue(
+        maxsize=config.tick_queue_maxsize
+    )
+    tick_enqueued = 0
+    tick_dropped = 0
+    tick_processed = 0
     
-    # Create async tick handler that runs DB operations in thread pool
+    # Create async tick handler that enqueues ticks without blocking WebSocket loop
     async def async_process_tick(ticker: str, price: float, volume: int, timestamp_ms: int):
         """
-        Async wrapper for tick processing - runs DB ops in thread pool.
-        
-        Uses semaphore to limit concurrency and prevent unbounded task growth
-        when tick volume exceeds processing capacity.
+        Enqueue tick for bounded, worker-based processing.
         """
-        async with tick_semaphore:
-            await asyncio.to_thread(candle_engine.process_tick, ticker, price, volume, timestamp_ms)
+        nonlocal tick_enqueued, tick_dropped
+
+        try:
+            tick_queue.put_nowait((ticker, price, volume, timestamp_ms))
+            tick_enqueued += 1
+        except asyncio.QueueFull:
+            tick_dropped += 1
+            if tick_dropped % 1000 == 0:
+                logger.warning(
+                    "Tick queue full - dropped %d ticks (queue size=%d, max=%d)",
+                    tick_dropped,
+                    tick_queue.qsize(),
+                    config.tick_queue_maxsize
+                )
+
+    async def tick_worker(worker_id: int):
+        """Consume ticks from queue and process in thread pool."""
+        nonlocal tick_processed
+
+        while True:
+            try:
+                ticker, price, volume, timestamp_ms = await tick_queue.get()
+                try:
+                    try:
+                        await asyncio.to_thread(
+                            candle_engine.process_tick,
+                            ticker,
+                            price,
+                            volume,
+                            timestamp_ms
+                        )
+                        tick_processed += 1
+                    except Exception as e:
+                        logger.error(
+                            "Tick worker %d failed processing %s at %d: %s",
+                            worker_id,
+                            ticker,
+                            timestamp_ms,
+                            e
+                        )
+                finally:
+                    tick_queue.task_done()
+            except asyncio.CancelledError:
+                logger.debug("Tick worker %d cancelled", worker_id)
+                break
+
+    def get_tick_metrics() -> dict:
+        """Expose queue metrics via shared websocket status row."""
+        return {
+            'tick_queue_size': tick_queue.qsize(),
+            'tick_queue_maxsize': config.tick_queue_maxsize,
+            'tick_enqueued_count': tick_enqueued,
+            'tick_processed_count': tick_processed,
+            'tick_dropped_count': tick_dropped
+        }
     
     # Wire up tick processing (async to avoid blocking event loop)
-    ws_manager.set_on_tick(async_process_tick)
+    ws_manager.set_on_tick(async_process_tick, fire_and_forget=False)
+
+    # Start fixed-size tick processing workers
+    tick_worker_handles = [
+        asyncio.create_task(tick_worker(i))
+        for i in range(config.tick_worker_concurrency)
+    ]
+
+    logger.info(
+        "Tick processing queue initialized (workers=%d, maxsize=%d)",
+        config.tick_worker_concurrency,
+        config.tick_queue_maxsize
+    )
     
     # Load existing tickers from database
     existing_tickers = storage.get_ticker_symbols()
@@ -296,7 +363,9 @@ async def run_worker(config: Config):
     cleanup_task_handle = asyncio.create_task(cleanup_task(storage, candle_engine))
     
     # Start WebSocket status update task
-    status_task_handle = asyncio.create_task(websocket_status_task(storage, ws_manager))
+    status_task_handle = asyncio.create_task(
+        websocket_status_task(storage, ws_manager, get_tick_metrics)
+    )
     
     # Start active candles update task
     active_candles_task_handle = asyncio.create_task(active_candles_task(storage, candle_engine))
@@ -330,6 +399,8 @@ async def run_worker(config: Config):
     status_task_handle.cancel()
     active_candles_task_handle.cancel()
     ticker_sync_task_handle.cancel()
+    for handle in tick_worker_handles:
+        handle.cancel()
     
     try:
         await cleanup_task_handle
@@ -350,6 +421,12 @@ async def run_worker(config: Config):
         await ticker_sync_task_handle
     except asyncio.CancelledError:
         pass
+
+    for handle in tick_worker_handles:
+        try:
+            await handle
+        except asyncio.CancelledError:
+            pass
     
     # Complete any in-progress candles
     candle_engine.complete_all_candles()

@@ -46,6 +46,7 @@ class WebSocketManager:
         self._last_message_time: Optional[datetime] = None
         self._connection_count = 0
         self._tick_count = 0
+        self._fire_and_forget_ticks = True
         
         # Callback for processing ticks (auto-detects sync vs async)
         self._on_tick: Optional[Callable[[str, float, int, int], Union[None, Awaitable[None]]]] = None
@@ -65,7 +66,11 @@ class WebSocketManager:
     def url(self) -> str:
         return f"{self.EODHD_WS_URL}?api_token={self.api_key}"
     
-    def set_on_tick(self, callback: Callable[[str, float, int, int], Union[None, Awaitable[None]]]):
+    def set_on_tick(
+        self,
+        callback: Callable[[str, float, int, int], Union[None, Awaitable[None]]],
+        fire_and_forget: bool = True
+    ):
         """
         Set callback for tick processing.
         
@@ -75,10 +80,11 @@ class WebSocketManager:
         - Async callbacks are fired as background tasks (non-blocking)
         - Sync callbacks are automatically run in thread pool as background tasks
         
-        Note: Callbacks are fire-and-forget to prevent blocking the WebSocket
-        message loop, which would cause ping timeout errors under high load.
+        Note: When fire_and_forget=True, callbacks are scheduled as background
+        tasks to avoid blocking the WebSocket message loop.
         """
         self._on_tick = callback
+        self._fire_and_forget_ticks = fire_and_forget
     
     async def _safe_tick_callback(self, ticker: str, price: float, volume: int, timestamp_ms: int):
         """Wrapper for async tick callback with error handling."""
@@ -213,14 +219,19 @@ class WebSocketManager:
                 self._last_message_time = datetime.now(timezone.utc)
                 
                 if self._on_tick:
-                    # Fire-and-forget: don't await tick processing to avoid blocking
-                    # the WebSocket message loop. This prevents ping timeout errors
-                    # when tick volume is high and DB writes are slow.
-                    if asyncio.iscoroutinefunction(self._on_tick):
-                        asyncio.create_task(self._safe_tick_callback(ticker, price, volume, timestamp_ms))
+                    if self._fire_and_forget_ticks:
+                        # Fire-and-forget mode: don't await tick processing.
+                        if asyncio.iscoroutinefunction(self._on_tick):
+                            asyncio.create_task(self._safe_tick_callback(ticker, price, volume, timestamp_ms))
+                        else:
+                            # Sync callback - wrap in task with thread pool
+                            asyncio.create_task(self._safe_sync_tick_callback(ticker, price, volume, timestamp_ms))
                     else:
-                        # Sync callback - wrap in task with thread pool
-                        asyncio.create_task(self._safe_sync_tick_callback(ticker, price, volume, timestamp_ms))
+                        # Backpressure mode: await callback to prevent unbounded task growth.
+                        if asyncio.iscoroutinefunction(self._on_tick):
+                            await self._safe_tick_callback(ticker, price, volume, timestamp_ms)
+                        else:
+                            await self._safe_sync_tick_callback(ticker, price, volume, timestamp_ms)
             else:
                 logger.debug(f"Unknown message format: {message[:100]}")
             

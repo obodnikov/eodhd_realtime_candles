@@ -52,6 +52,11 @@ CREATE TABLE IF NOT EXISTS websocket_status (
     pending_subscribe TEXT NOT NULL,
     connection_count INTEGER NOT NULL,
     tick_count BIGINT NOT NULL,
+    tick_queue_size INTEGER NOT NULL DEFAULT 0,
+    tick_queue_maxsize INTEGER NOT NULL DEFAULT 0,
+    tick_enqueued_count BIGINT NOT NULL DEFAULT 0,
+    tick_processed_count BIGINT NOT NULL DEFAULT 0,
+    tick_dropped_count BIGINT NOT NULL DEFAULT 0,
     last_message TEXT,
     last_update TIMESTAMPTZ NOT NULL
 );

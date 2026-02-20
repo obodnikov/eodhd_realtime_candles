@@ -78,6 +78,8 @@ class Config:
     # Candle Engine Performance Tuning
     candle_save_every_n_ticks: int = field(default_factory=lambda: int(os.environ.get('CANDLE_SAVE_EVERY_N_TICKS', '10')))
     candle_save_every_m_seconds: float = field(default_factory=lambda: float(os.environ.get('CANDLE_SAVE_EVERY_M_SECONDS', '5.0')))
+    tick_queue_maxsize: int = field(default_factory=lambda: int(os.environ.get('TICK_QUEUE_MAXSIZE', '50000')))
+    tick_worker_concurrency: int = field(default_factory=lambda: int(os.environ.get('TICK_WORKER_CONCURRENCY', '100')))
 
     # Persistence
     config_file: str = field(default_factory=lambda: os.environ.get('CONFIG_FILE', ''))
@@ -101,6 +103,12 @@ class Config:
         
         if self.max_candles_stored < 1:
             errors.append(f"max_candles_stored must be at least 1")
+
+        if self.tick_queue_maxsize < 1:
+            errors.append(f"tick_queue_maxsize must be at least 1")
+
+        if self.tick_worker_concurrency < 1:
+            errors.append(f"tick_worker_concurrency must be at least 1")
         
         return errors
     
