@@ -6,6 +6,7 @@ Handles connection, reconnection, subscription management, and tick processing.
 import asyncio
 import json
 import logging
+import random
 from datetime import datetime, timezone
 from typing import Set, Callable, Optional, Union, Awaitable
 import websockets
@@ -28,12 +29,21 @@ class WebSocketManager:
     EODHD_WS_URL = "wss://ws.eodhistoricaldata.com/ws/us"
     
     def __init__(self, api_key: str, reconnect_delay: int = 5, ping_interval: int = 30, 
-                 auth_timeout: int = 10, is_dummy: bool = False):
+                 auth_timeout: int = 10, is_dummy: bool = False,
+                 max_reconnect_delay: int = 60):
+        if reconnect_delay < 1:
+            raise ValueError(f"reconnect_delay must be >= 1, got {reconnect_delay}")
+        if max_reconnect_delay < 1:
+            raise ValueError(f"max_reconnect_delay must be >= 1, got {max_reconnect_delay}")
+        # Ensure max is at least as large as base delay
+        max_reconnect_delay = max(max_reconnect_delay, reconnect_delay)
+
         self.api_key = api_key
         self.reconnect_delay = reconnect_delay
         self.ping_interval = ping_interval
         self.auth_timeout = auth_timeout  # Timeout for authorization response
         self.is_dummy = is_dummy  # Flag to identify dummy instances in API workers
+        self.max_reconnect_delay = max_reconnect_delay  # Cap for exponential backoff
         
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._subscribed_tickers: Set[str] = set()
@@ -47,6 +57,7 @@ class WebSocketManager:
         self._connection_count = 0
         self._tick_count = 0
         self._fire_and_forget_ticks = True
+        self._consecutive_failures = 0  # Track consecutive failed connections for backoff
         
         # Callback for processing ticks (auto-detects sync vs async)
         self._on_tick: Optional[Callable[[str, float, int, int], Union[None, Awaitable[None]]]] = None
@@ -195,9 +206,14 @@ class WebSocketManager:
             
             # Check for status messages (including authorization)
             if 'status_code' in data:
-                logger.info(f"EODHD status: {data}")
+                status_code = data.get('status_code')
+                if status_code == 200:
+                    logger.info(f"EODHD status: {data}")
+                else:
+                    # Non-200 from EODHD is a server-side problem — log as warning
+                    logger.warning(f"EODHD upstream error (status {status_code}): {data.get('message', 'unknown')}")
                 # Check for successful authorization
-                if data.get('status_code') == 200 and data.get('message') == 'Authorized':
+                if status_code == 200 and data.get('message') == 'Authorized':
                     self._authorized = True
                     return True
                 return False
@@ -279,8 +295,12 @@ class WebSocketManager:
             try:
                 data = json.loads(message)
                 if 'status_code' in data:
-                    logger.info(f"EODHD status: {data}")
-                    if data.get('status_code') == 200 and data.get('message') == 'Authorized':
+                    status_code = data.get('status_code')
+                    if status_code == 200:
+                        logger.info(f"EODHD status: {data}")
+                    else:
+                        logger.warning(f"EODHD upstream error (status {status_code}): {data.get('message', 'unknown')}")
+                    if status_code == 200 and data.get('message') == 'Authorized':
                         self._authorized = True
                         return True
                 else:
@@ -291,8 +311,40 @@ class WebSocketManager:
         
         return False
     
+    def _get_backoff_delay(self) -> float:
+        """Calculate reconnect delay with exponential backoff and jitter."""
+        if self._consecutive_failures == 0:
+            return self.reconnect_delay
+        # Cap the exponent to avoid computing huge integers unnecessarily
+        max_useful_exp = 0
+        if self.max_reconnect_delay > self.reconnect_delay:
+            import math
+            max_useful_exp = int(math.ceil(
+                math.log2(self.max_reconnect_delay / self.reconnect_delay)
+            ))
+        exponent = min(self._consecutive_failures - 1, max_useful_exp)
+        delay = self.reconnect_delay * (2 ** exponent)
+        delay = min(delay, self.max_reconnect_delay)
+        # Full jitter: randomize between base delay and computed delay
+        # Prevents thundering herd when multiple workers reconnect simultaneously
+        return random.uniform(self.reconnect_delay, delay)
+
+    def _get_backoff_delay_deterministic(self) -> float:
+        """Calculate the deterministic (non-jittered) backoff ceiling for status reporting."""
+        if self._consecutive_failures == 0:
+            return float(self.reconnect_delay)
+        import math
+        max_useful_exp = 0
+        if self.max_reconnect_delay > self.reconnect_delay:
+            max_useful_exp = int(math.ceil(
+                math.log2(self.max_reconnect_delay / self.reconnect_delay)
+            ))
+        exponent = min(self._consecutive_failures - 1, max_useful_exp)
+        delay = self.reconnect_delay * (2 ** exponent)
+        return float(min(delay, self.max_reconnect_delay))
+
     async def _connection_loop(self):
-        """Main connection loop with automatic reconnection."""
+        """Main connection loop with automatic reconnection and exponential backoff."""
         while self._running:
             try:
                 logger.info(f"Connecting to EODHD WebSocket...")
@@ -316,37 +368,43 @@ class WebSocketManager:
                     # Wait for authorization before proceeding
                     if not await self._wait_for_authorization(ws):
                         logger.warning("Authorization failed, will reconnect...")
-                        continue
-                    
-                    # Authorization successful - send subscriptions
-                    logger.info("Authorization received, sending subscriptions...")
-                    all_tickers = self._subscribed_tickers | self._pending_subscribe
-                    if all_tickers:
-                        await self._send_subscribe(all_tickers)
-                        self._subscribed_tickers = all_tickers
-                        self._pending_subscribe.clear()
-                    
-                    # Process messages after authorization
-                    async for message in ws:
-                        if not self._running:
-                            break
-                        await self._process_message(message)
+                        self._consecutive_failures += 1
+                        # Fall through to finally + reconnect sleep below
+                    else:
+                        # Authorization successful — reset backoff
+                        self._consecutive_failures = 0
                         
-                        # Handle pending operations
-                        if self._pending_subscribe:
-                            await self._send_subscribe(self._pending_subscribe)
-                            self._subscribed_tickers.update(self._pending_subscribe)
+                        # Send subscriptions
+                        logger.info("Authorization received, sending subscriptions...")
+                        all_tickers = self._subscribed_tickers | self._pending_subscribe
+                        if all_tickers:
+                            await self._send_subscribe(all_tickers)
+                            self._subscribed_tickers = all_tickers
                             self._pending_subscribe.clear()
                         
-                        if self._pending_unsubscribe:
-                            await self._send_unsubscribe(self._pending_unsubscribe)
-                            self._subscribed_tickers -= self._pending_unsubscribe
-                            self._pending_unsubscribe.clear()
+                        # Process messages after authorization
+                        async for message in ws:
+                            if not self._running:
+                                break
+                            await self._process_message(message)
+                            
+                            # Handle pending operations
+                            if self._pending_subscribe:
+                                await self._send_subscribe(self._pending_subscribe)
+                                self._subscribed_tickers.update(self._pending_subscribe)
+                                self._pending_subscribe.clear()
+                            
+                            if self._pending_unsubscribe:
+                                await self._send_unsubscribe(self._pending_unsubscribe)
+                                self._subscribed_tickers -= self._pending_unsubscribe
+                                self._pending_unsubscribe.clear()
                     
             except ConnectionClosed as e:
                 logger.warning(f"WebSocket connection closed: {e}")
+                self._consecutive_failures += 1
             except Exception as e:
                 logger.error(f"WebSocket error: {e}")
+                self._consecutive_failures += 1
             finally:
                 self._connected = False
                 self._authorized = False
@@ -356,8 +414,15 @@ class WebSocketManager:
                     self._on_connection_change(False)
             
             if self._running:
-                logger.info(f"Reconnecting in {self.reconnect_delay} seconds...")
-                await asyncio.sleep(self.reconnect_delay)
+                delay = self._get_backoff_delay()
+                if self._consecutive_failures > 1:
+                    logger.warning(
+                        f"Reconnecting in {delay:.0f}s "
+                        f"(attempt {self._consecutive_failures}, backoff active)"
+                    )
+                else:
+                    logger.info(f"Reconnecting in {delay:.0f}s...")
+                await asyncio.sleep(delay)
     
     async def start(self):
         """Start the WebSocket connection."""
@@ -365,6 +430,7 @@ class WebSocketManager:
             return
         
         self._running = True
+        self._consecutive_failures = 0  # Fresh start with base reconnect timing
         asyncio.create_task(self._connection_loop())
         logger.info("WebSocket manager started")
     
@@ -386,5 +452,7 @@ class WebSocketManager:
             'pending_subscribe': list(self._pending_subscribe),
             'connection_count': self._connection_count,
             'tick_count': self._tick_count,
-            'last_message': self._last_message_time.isoformat() if self._last_message_time else None
+            'last_message': self._last_message_time.isoformat() if self._last_message_time else None,
+            'consecutive_failures': self._consecutive_failures,
+            'backoff_delay_ceiling': self._get_backoff_delay_deterministic(),
         }
