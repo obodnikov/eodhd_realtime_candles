@@ -15,6 +15,11 @@ from websockets.exceptions import ConnectionClosed
 logger = logging.getLogger(__name__)
 
 
+class EodhdServerError(Exception):
+    """Raised when EODHD sends a non-200 status during the active tick stream."""
+    pass
+
+
 class WebSocketManager:
     """
     Manages WebSocket connection to EODHD real-time data feed.
@@ -212,6 +217,15 @@ class WebSocketManager:
                 else:
                     # Non-200 from EODHD is a server-side problem — log as warning
                     logger.warning(f"EODHD upstream error (status {status_code}): {data.get('message', 'unknown')}")
+                    # If we're already authorized and receiving a 5xx server error in
+                    # the tick stream, the feed is dead — force reconnect.
+                    # 4xx errors (bad subscribe payload, etc.) are recoverable and
+                    # should not trigger reconnect.
+                    if self._authorized and status_code >= 500:
+                        raise EodhdServerError(
+                            f"EODHD sent status {status_code} during active stream: "
+                            f"{data.get('message', 'unknown')}"
+                        )
                 # Check for successful authorization
                 if status_code == 200 and data.get('message') == 'Authorized':
                     self._authorized = True
@@ -399,6 +413,9 @@ class WebSocketManager:
                                 self._subscribed_tickers -= self._pending_unsubscribe
                                 self._pending_unsubscribe.clear()
                     
+            except EodhdServerError as e:
+                logger.warning(f"EODHD server error during stream, forcing reconnect: {e}")
+                self._consecutive_failures += 1
             except ConnectionClosed as e:
                 logger.warning(f"WebSocket connection closed: {e}")
                 self._consecutive_failures += 1

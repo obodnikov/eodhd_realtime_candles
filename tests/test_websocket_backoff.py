@@ -7,7 +7,7 @@ import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from src.websocket_manager import WebSocketManager
+from src.websocket_manager import WebSocketManager, EodhdServerError
 
 
 class TestBackoffDelayCalculation:
@@ -182,6 +182,67 @@ class TestEodhdErrorLogging:
             assert result is False
             mock_logger.warning.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_eodhd_500_after_auth_raises_server_error(self):
+        """EODHD 500 during active stream (after auth) should raise EodhdServerError."""
+        ws = WebSocketManager(api_key='test')
+        ws._authorized = True  # Simulate already authorized
+
+        msg = json.dumps({'status_code': 500, 'message': 'Internal error. Try again later'})
+        with pytest.raises(EodhdServerError, match="status 500"):
+            await ws._process_message(msg)
+
+    @pytest.mark.asyncio
+    async def test_eodhd_500_before_auth_does_not_raise(self):
+        """EODHD 500 before auth (during auth phase) should not raise."""
+        ws = WebSocketManager(api_key='test')
+        ws._authorized = False
+
+        msg = json.dumps({'status_code': 500, 'message': 'Internal error. Try again later'})
+        # Should not raise, just return False
+        result = await ws._process_message(msg)
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_eodhd_503_after_auth_raises_server_error(self):
+        """EODHD 503 during active stream should also raise EodhdServerError."""
+        ws = WebSocketManager(api_key='test')
+        ws._authorized = True
+
+        msg = json.dumps({'status_code': 503, 'message': 'Service Unavailable'})
+        with pytest.raises(EodhdServerError, match="status 503"):
+            await ws._process_message(msg)
+
+    @pytest.mark.asyncio
+    async def test_eodhd_400_after_auth_does_not_raise(self):
+        """EODHD 400 after auth is a client error — should not trigger reconnect."""
+        ws = WebSocketManager(api_key='test')
+        ws._authorized = True
+
+        msg = json.dumps({'status_code': 400, 'message': 'Bad request'})
+        result = await ws._process_message(msg)
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_eodhd_401_after_auth_does_not_raise(self):
+        """EODHD 401 after auth is recoverable — should not trigger reconnect."""
+        ws = WebSocketManager(api_key='test')
+        ws._authorized = True
+
+        msg = json.dumps({'status_code': 401, 'message': 'Unauthorized'})
+        result = await ws._process_message(msg)
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_eodhd_429_after_auth_does_not_raise(self):
+        """EODHD 429 (rate limit) after auth should not trigger reconnect."""
+        ws = WebSocketManager(api_key='test')
+        ws._authorized = True
+
+        msg = json.dumps({'status_code': 429, 'message': 'Too many requests'})
+        result = await ws._process_message(msg)
+        assert result is False
+
 
 class TestGetStatusIncludesBackoff:
     """Tests for backoff fields in get_status()."""
@@ -342,3 +403,47 @@ class TestConnectionLoopIntegration:
             await ws.start()
 
         assert ws._consecutive_failures == 0
+
+    @pytest.mark.asyncio
+    async def test_eodhd_500_in_stream_triggers_reconnect(self):
+        """EODHD 500 after auth should break the message loop and trigger reconnect."""
+        ws = WebSocketManager(api_key='test', reconnect_delay=1, max_reconnect_delay=10)
+        ws._running = True
+
+        auth_msg = json.dumps({'status_code': 200, 'message': 'Authorized'})
+        error_msg = json.dumps({'status_code': 500, 'message': 'Internal error. Try again later'})
+        sleep_called = []
+
+        class MockConnectCM:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self_cm):
+                mock_ws = MagicMock()
+
+                # Auth succeeds, then EODHD sends 500 in the tick stream
+                async def msg_iter():
+                    yield auth_msg
+                    yield error_msg
+
+                mock_ws.__aiter__ = lambda self: msg_iter()
+                mock_ws.send = AsyncMock()
+                mock_ws.close = AsyncMock()
+                return mock_ws
+
+            async def __aexit__(self_cm, *args):
+                pass
+
+        async def mock_sleep(delay):
+            sleep_called.append(delay)
+            ws._running = False  # Stop after first reconnect
+
+        with patch('src.websocket_manager.websockets.connect', MockConnectCM):
+            with patch('src.websocket_manager.asyncio.sleep', mock_sleep):
+                await ws._connection_loop()
+
+        # Should have triggered a reconnect (sleep was called)
+        assert len(sleep_called) == 1
+        assert sleep_called[0] >= ws.reconnect_delay
+        # Failure counter should have incremented
+        assert ws._consecutive_failures == 1
