@@ -1,4 +1,4 @@
-# EODHD Real-Time Candle Aggregator v0.6.0
+# EODHD Real-Time Candle Aggregator v0.9.4
 
 > **Converts EODHD WebSocket tick data into configurable OHLCV candles with full REST API management**
 
@@ -19,7 +19,7 @@ This microservice solves the problem that EODHD's Intraday Historical API only p
 - ✅ **Multi-worker architecture** for high performance and scalability
 - ✅ **Admin Web UI** with real-time monitoring and Chart.js visualizations
 
-### Architecture (v0.6.0)
+### Architecture (v0.9.4)
 
 The service uses a **multi-worker architecture** for optimal performance and scalability:
 
@@ -533,7 +533,7 @@ docker-compose up -d
 
 ## Changelog
 
-### v0.6.0 (2026-01-30)
+### v0.9.4 (2026-01-30)
 - **Multi-Worker Architecture**: Implemented separate API and WebSocket processes for better scalability
   - **2 API Workers**: Handle HTTP requests in parallel (ports 8765, 8766)
   - **1 WebSocket Worker**: Dedicated tick processing and candle aggregation

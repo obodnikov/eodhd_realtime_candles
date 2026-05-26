@@ -96,3 +96,6 @@ package-lock.json
 #Claude
 .claude/
 .claude-plugins/
+
+# semantic-index
+.index/
