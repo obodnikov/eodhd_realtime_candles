@@ -32,6 +32,7 @@
                 <li><a href="{{ url_for('tickers') }}" class="navbar-link {% if request.endpoint == 'tickers' %}active{% endif %}">Tickers</a></li>
                 <li><a href="{{ url_for('candles') }}" class="navbar-link {% if request.endpoint == 'candles' %}active{% endif %}">Candles</a></li>
                 <li><a href="{{ url_for('config') }}" class="navbar-link {% if request.endpoint == 'config' %}active{% endif %}">Config</a></li>
+                <li><a href="{{ url_for('logs') }}" class="navbar-link {% if request.endpoint == 'logs' %}active{% endif %}">Logs</a></li>
                 <li><a href="{{ url_for('logout') }}" class="navbar-link">Logout</a></li>
             </ul>
         </div>

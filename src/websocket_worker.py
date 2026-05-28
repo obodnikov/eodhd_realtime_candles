@@ -47,6 +47,10 @@ def setup_logging(level: str):
     # Reduce noise from libraries
     logging.getLogger('websockets').setLevel(logging.WARNING)
 
+    # Install in-memory log buffer for admin panel
+    from .log_buffer import install_log_buffer
+    install_log_buffer()
+
 
 async def cleanup_task(storage, candle_engine: CandleEngine):
     """

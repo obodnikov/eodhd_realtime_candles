@@ -34,6 +34,7 @@ class APIRoutes:
         self.app.router.add_get('/health', self.health)
         self.app.router.add_get('/status', self.status)
         self.app.router.add_post('/reconnect', self.reconnect)
+        self.app.router.add_get('/logs', self.get_logs)
         
         # Configuration
         self.app.router.add_get('/config', self.get_config)
@@ -158,6 +159,47 @@ class APIRoutes:
         return web.json_response({
             'message': 'Reconnection initiated',
             'timestamp': datetime.now(timezone.utc).isoformat()
+        })
+
+    async def get_logs(self, request: web.Request) -> web.Response:
+        """
+        GET /logs - Get recent WARNING/ERROR log entries.
+        
+        Protected by API key middleware (same as all non-health endpoints).
+        
+        Query params:
+            limit: Max entries to return (default 100, max 500)
+            level: Filter by level - 'WARNING', 'ERROR', or omit for both
+        """
+        from ..log_buffer import get_log_buffer
+
+        # Validate limit parameter
+        try:
+            limit = int(request.query.get('limit', 100))
+        except (ValueError, TypeError):
+            return web.json_response(
+                {'error': 'Invalid limit parameter, must be an integer'},
+                status=400
+            )
+        limit = max(1, min(limit, 500))
+
+        level = request.query.get('level', None)
+        if level:
+            level = level.upper().strip()
+            if level not in ('WARNING', 'ERROR'):
+                return web.json_response(
+                    {'error': 'Invalid level parameter, must be WARNING or ERROR'},
+                    status=400
+                )
+
+        buffer = get_log_buffer()
+        entries = buffer.get_entries(limit=limit, level=level)
+
+        return web.json_response({
+            'entries': entries,
+            'total_buffered': buffer.count,
+            'limit': limit,
+            'level_filter': level,
         })
     
     # =========================================================================

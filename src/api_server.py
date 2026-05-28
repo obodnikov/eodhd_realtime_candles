@@ -45,6 +45,10 @@ def setup_logging(level: str):
     # Reduce noise from libraries
     logging.getLogger('aiohttp').setLevel(logging.WARNING)
 
+    # Install in-memory log buffer for admin panel
+    from .log_buffer import install_log_buffer
+    install_log_buffer()
+
 
 async def create_app(config: Config) -> web.Application:
     """Create and configure the API application."""

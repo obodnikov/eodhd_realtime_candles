@@ -99,3 +99,5 @@ package-lock.json
 
 # semantic-index
 .index/
+
+.kiro/
