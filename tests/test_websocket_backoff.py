@@ -87,6 +87,16 @@ class TestBackoffParameterValidation:
         with pytest.raises(ValueError, match="max_reconnect_delay"):
             WebSocketManager(api_key='test', max_reconnect_delay=-5)
 
+    def test_data_timeout_zero_raises(self):
+        """data_timeout=0 should raise ValueError."""
+        with pytest.raises(ValueError, match="data_timeout"):
+            WebSocketManager(api_key='test', data_timeout=0)
+
+    def test_data_timeout_negative_raises(self):
+        """Negative data_timeout should raise ValueError."""
+        with pytest.raises(ValueError, match="data_timeout"):
+            WebSocketManager(api_key='test', data_timeout=-1)
+
     def test_max_normalized_to_at_least_base(self):
         """max_reconnect_delay is normalized to >= reconnect_delay."""
         ws = WebSocketManager(api_key='test', reconnect_delay=10, max_reconnect_delay=3)
@@ -330,7 +340,7 @@ class TestConnectionLoopIntegration:
     @pytest.mark.asyncio
     async def test_successful_auth_resets_failures(self):
         """Successful authorization should reset _consecutive_failures to 0."""
-        ws = WebSocketManager(api_key='test', reconnect_delay=1, max_reconnect_delay=10)
+        ws = WebSocketManager(api_key='test', reconnect_delay=1, max_reconnect_delay=10, data_timeout=60)
         ws._running = True
         ws._consecutive_failures = 5  # Pre-existing failures
 
@@ -343,11 +353,17 @@ class TestConnectionLoopIntegration:
             async def __aenter__(self_cm):
                 mock_ws = MagicMock()
 
-                # Successful auth, then no more messages (loop ends naturally)
-                async def msg_iter():
+                # Auth phase uses async for
+                async def auth_iter():
                     yield auth_msg
 
-                mock_ws.__aiter__ = lambda self: msg_iter()
+                mock_ws.__aiter__ = lambda self: auth_iter()
+
+                # Data phase: immediately raise to end loop
+                async def mock_recv():
+                    raise OSError("Connection reset by peer")
+
+                mock_ws.recv = mock_recv
                 mock_ws.send = AsyncMock()
                 mock_ws.close = AsyncMock()
                 return mock_ws
@@ -363,9 +379,9 @@ class TestConnectionLoopIntegration:
             with patch('src.websocket_manager.asyncio.sleep', mock_sleep):
                 await ws._connection_loop()
 
-        # After successful auth, failures should have been reset to 0
-        # The connection loop ends naturally (no exception), so no increment
-        assert ws._consecutive_failures == 0
+        # After successful auth, failures were reset to 0.
+        # The OSError increments by 1, so final value is 1 (not 5+1=6).
+        assert ws._consecutive_failures == 1
 
     @pytest.mark.asyncio
     async def test_connection_exception_increments_failures(self):
@@ -421,12 +437,23 @@ class TestConnectionLoopIntegration:
             async def __aenter__(self_cm):
                 mock_ws = MagicMock()
 
-                # Auth succeeds, then EODHD sends 500 in the tick stream
-                async def msg_iter():
+                # Auth phase uses async for (via __aiter__)
+                async def auth_iter():
                     yield auth_msg
-                    yield error_msg
 
-                mock_ws.__aiter__ = lambda self: msg_iter()
+                mock_ws.__aiter__ = lambda self: auth_iter()
+
+                # Data phase uses recv() — returns 500 then raises
+                data_messages = [error_msg]
+                data_iter = iter(data_messages)
+
+                async def mock_recv():
+                    try:
+                        return next(data_iter)
+                    except StopIteration:
+                        raise OSError("Connection reset by peer")
+
+                mock_ws.recv = mock_recv
                 mock_ws.send = AsyncMock()
                 mock_ws.close = AsyncMock()
                 return mock_ws
@@ -447,3 +474,140 @@ class TestConnectionLoopIntegration:
         assert sleep_called[0] >= ws.reconnect_delay
         # Failure counter should have incremented
         assert ws._consecutive_failures == 1
+
+    @pytest.mark.asyncio
+    async def test_data_timeout_triggers_reconnect(self):
+        """Silent feed after receiving ticks should trigger reconnect after data_timeout."""
+        ws = WebSocketManager(api_key='test', reconnect_delay=1, data_timeout=60)
+        ws._running = True
+
+        auth_msg = json.dumps({'status_code': 200, 'message': 'Authorized'})
+        tick_msg = json.dumps({'s': 'AAPL', 'p': 150.0, 'v': 100, 't': 1234567890000})
+        sleep_called = []
+
+        class MockConnectCM:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self_cm):
+                mock_ws = MagicMock()
+
+                # Auth phase
+                async def auth_iter():
+                    yield auth_msg
+
+                mock_ws.__aiter__ = lambda self: auth_iter()
+
+                # Data phase: one tick then block forever
+                call_count = [0]
+
+                async def mock_recv():
+                    call_count[0] += 1
+                    if call_count[0] == 1:
+                        return tick_msg  # First tick — activates timeout
+                    # After tick, block forever to trigger timeout
+                    await asyncio.get_event_loop().create_future()
+
+                mock_ws.recv = mock_recv
+                mock_ws.send = AsyncMock()
+                mock_ws.close = AsyncMock()
+                return mock_ws
+
+            async def __aexit__(self_cm, *args):
+                pass
+
+        # Patch wait_for to immediately raise TimeoutError on the 2nd call
+        # (1st call returns the tick, 2nd call should timeout)
+        original_wait_for = asyncio.wait_for
+        wait_for_call_count = [0]
+
+        async def mock_wait_for(coro, timeout=None):
+            wait_for_call_count[0] += 1
+            if wait_for_call_count[0] >= 2:
+                # Second wait_for call (after tick) — simulate timeout
+                coro.close()
+                raise asyncio.TimeoutError()
+            return await original_wait_for(coro, timeout=0.1)
+
+        async def mock_sleep(delay):
+            sleep_called.append(delay)
+            ws._running = False
+
+        with patch('src.websocket_manager.websockets.connect', MockConnectCM):
+            with patch('src.websocket_manager.asyncio.wait_for', mock_wait_for):
+                with patch('src.websocket_manager.asyncio.sleep', mock_sleep):
+                    await ws._connection_loop()
+
+        # Should have triggered reconnect due to data timeout
+        assert len(sleep_called) == 1
+        assert ws._consecutive_failures == 1
+
+    @pytest.mark.asyncio
+    async def test_no_timeout_before_first_tick_even_with_prior_tick_count(self):
+        """
+        If _tick_count is non-zero from a prior connection but no tick has arrived
+        on the current connection, the tight data_timeout should NOT be enforced.
+        Instead, the longer first_data_timeout (5x) applies.
+        """
+        ws = WebSocketManager(api_key='test', reconnect_delay=1, data_timeout=60)
+        ws._running = True
+        ws._tick_count = 500  # Simulate prior connections had ticks
+
+        auth_msg = json.dumps({'status_code': 200, 'message': 'Authorized'})
+        # Non-tick status message (not a tick, won't activate tight timeout)
+        status_msg = json.dumps({'status_code': 200, 'message': 'OK'})
+        wait_for_timeouts = []
+
+        class MockConnectCM:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self_cm):
+                mock_ws = MagicMock()
+
+                # Auth phase
+                async def auth_iter():
+                    yield auth_msg
+
+                mock_ws.__aiter__ = lambda self: auth_iter()
+
+                # Data phase: return non-tick messages then raise
+                call_count = [0]
+
+                async def mock_recv():
+                    call_count[0] += 1
+                    if call_count[0] <= 2:
+                        return status_msg  # Non-tick messages
+                    raise OSError("Test complete")
+
+                mock_ws.recv = mock_recv
+                mock_ws.send = AsyncMock()
+                mock_ws.close = AsyncMock()
+                return mock_ws
+
+            async def __aexit__(self_cm, *args):
+                pass
+
+        # Spy on wait_for to capture what timeout values are used
+        original_wait_for = asyncio.wait_for
+
+        async def spy_wait_for(coro, timeout=None):
+            wait_for_timeouts.append(timeout)
+            return await original_wait_for(coro, timeout=0.1)
+
+        async def mock_sleep(delay):
+            ws._running = False
+
+        with patch('src.websocket_manager.websockets.connect', MockConnectCM):
+            with patch('src.websocket_manager.asyncio.wait_for', spy_wait_for):
+                with patch('src.websocket_manager.asyncio.sleep', mock_sleep):
+                    await ws._connection_loop()
+
+        # All wait_for calls should have used the longer first_data_timeout (5x = 300)
+        # because no tick was received on this connection
+        expected_first_timeout = ws.data_timeout * 5  # 300
+        for t in wait_for_timeouts:
+            assert t == expected_first_timeout, (
+                f"Expected first_data_timeout={expected_first_timeout}, got {t}. "
+                f"Tight data_timeout should not apply before first tick on connection."
+            )

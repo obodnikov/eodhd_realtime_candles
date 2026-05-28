@@ -311,7 +311,8 @@ async def run_worker(config: Config):
     ws_manager = WebSocketManager(
         api_key=config.eodhd_api_key,
         reconnect_delay=config.ws_reconnect_delay,
-        ping_interval=config.ws_ping_interval
+        ping_interval=config.ws_ping_interval,
+        data_timeout=config.ws_data_timeout
     )
     
     # Bounded queue + fixed workers to apply backpressure under high tick volume

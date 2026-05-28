@@ -35,11 +35,13 @@ class WebSocketManager:
     
     def __init__(self, api_key: str, reconnect_delay: int = 5, ping_interval: int = 30, 
                  auth_timeout: int = 10, is_dummy: bool = False,
-                 max_reconnect_delay: int = 60):
+                 max_reconnect_delay: int = 60, data_timeout: int = 60):
         if reconnect_delay < 1:
             raise ValueError(f"reconnect_delay must be >= 1, got {reconnect_delay}")
         if max_reconnect_delay < 1:
             raise ValueError(f"max_reconnect_delay must be >= 1, got {max_reconnect_delay}")
+        if data_timeout < 1:
+            raise ValueError(f"data_timeout must be >= 1, got {data_timeout}")
         # Ensure max is at least as large as base delay
         max_reconnect_delay = max(max_reconnect_delay, reconnect_delay)
 
@@ -47,6 +49,7 @@ class WebSocketManager:
         self.reconnect_delay = reconnect_delay
         self.ping_interval = ping_interval
         self.auth_timeout = auth_timeout  # Timeout for authorization response
+        self.data_timeout = data_timeout  # Max seconds to wait for data before forcing reconnect
         self.is_dummy = is_dummy  # Flag to identify dummy instances in API workers
         self.max_reconnect_delay = max_reconnect_delay  # Cap for exponential backoff
         
@@ -396,11 +399,47 @@ class WebSocketManager:
                             self._subscribed_tickers = all_tickers
                             self._pending_subscribe.clear()
                         
-                        # Process messages after authorization
-                        async for message in ws:
-                            if not self._running:
+                        # Process messages after authorization.
+                        # Use recv() with timeout to detect silent dead feeds.
+                        # Two-phase timeout:
+                        #   1. Before first tick: use a longer first_data_timeout (5x data_timeout)
+                        #      to allow for slow subscription setup without hanging forever.
+                        #   2. After first tick: use data_timeout to detect feed going silent.
+                        received_tick_on_connection = False
+                        tick_count_at_start = self._tick_count
+                        first_data_timeout = self.data_timeout * 5  # Generous initial window
+                        while self._running:
+                            try:
+                                if received_tick_on_connection:
+                                    # After first tick, enforce tight data timeout
+                                    message = await asyncio.wait_for(
+                                        ws.recv(), timeout=self.data_timeout
+                                    )
+                                else:
+                                    # Before first tick, use longer timeout to avoid
+                                    # hanging forever while still preventing reconnect storms
+                                    message = await asyncio.wait_for(
+                                        ws.recv(), timeout=first_data_timeout
+                                    )
+                            except asyncio.TimeoutError:
+                                if received_tick_on_connection:
+                                    logger.warning(
+                                        f"No data received for {self.data_timeout}s after "
+                                        f"previous activity — feed appears silent, forcing reconnect"
+                                    )
+                                else:
+                                    logger.warning(
+                                        f"No data received for {first_data_timeout}s since "
+                                        f"subscription — feed may be dead, forcing reconnect"
+                                    )
+                                self._consecutive_failures += 1
                                 break
+                            
                             await self._process_message(message)
+                            
+                            # Detect first tick on this connection by comparing tick count
+                            if not received_tick_on_connection and self._tick_count > tick_count_at_start:
+                                received_tick_on_connection = True
                             
                             # Handle pending operations
                             if self._pending_subscribe:
