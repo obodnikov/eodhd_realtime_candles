@@ -1,5 +1,6 @@
 """
-In-memory ring buffer for WARNING/ERROR log entries.
+In-memory ring buffer for WARNING/ERROR log entries, with optional
+database persistence for cross-process visibility.
 
 Attaches to the root logger and captures recent warning/error messages
 for display in the admin panel without file I/O.
@@ -7,14 +8,20 @@ for display in the admin panel without file I/O.
 
 import logging
 import threading
+import queue
 from collections import deque
 from datetime import datetime, timezone
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 
 class LogBufferHandler(logging.Handler):
     """
-    A logging handler that stores recent WARNING+ entries in a ring buffer.
+    A logging handler that stores recent WARNING+ entries in a ring buffer
+    and optionally persists them to the database for cross-process access.
+    
+    Database writes are non-blocking: entries are queued and written by a
+    background thread. If the queue is full, entries are dropped silently
+    to avoid blocking the logging path.
     
     Thread-safe. Designed to be attached to the root logger so it captures
     messages from all modules.
@@ -24,9 +31,47 @@ class LogBufferHandler(logging.Handler):
         super().__init__(level=level)
         self._buffer: deque = deque(maxlen=max_entries)
         self._lock = threading.Lock()
+        self._storage = None
+        self._db_queue: queue.Queue = queue.Queue(maxsize=200)
+        self._db_thread: Optional[threading.Thread] = None
+        self._db_drop_count = 0
+
+    def set_storage(self, storage):
+        """
+        Attach a storage backend for database persistence.
+        Only enables DB persistence if the storage has save_log_entry().
+        Starts a background thread that drains the queue to the DB.
+        """
+        if not hasattr(storage, 'save_log_entry') or not callable(getattr(storage, 'save_log_entry')):
+            return  # Storage doesn't support log persistence
+        self._storage = storage
+        if self._db_thread is None or not self._db_thread.is_alive():
+            self._db_thread = threading.Thread(
+                target=self._db_writer_loop, daemon=True, name="log-db-writer"
+            )
+            self._db_thread.start()
+
+    def _db_writer_loop(self):
+        """Background thread that writes queued log entries to the database."""
+        while True:
+            try:
+                entry = self._db_queue.get(timeout=5.0)
+                if entry is None:
+                    break  # Shutdown signal
+                if self._storage is not None:
+                    try:
+                        self._storage.save_log_entry(
+                            level=entry['level'],
+                            logger_name=entry['logger'],
+                            message=entry['message']
+                        )
+                    except Exception:
+                        pass  # Don't recurse on DB errors
+            except queue.Empty:
+                continue
 
     def emit(self, record: logging.LogRecord):
-        """Store a log record in the buffer."""
+        """Store a log record in the buffer and queue for DB persistence."""
         # Defensive level check for direct emit() calls
         if record.levelno < self.level:
             return
@@ -39,8 +84,22 @@ class LogBufferHandler(logging.Handler):
             }
             with self._lock:
                 self._buffer.append(entry)
+            
+            # Non-blocking enqueue for DB persistence
+            if self._storage is not None:
+                try:
+                    self._db_queue.put_nowait(entry)
+                except queue.Full:
+                    self._db_drop_count += 1
         except Exception:
             self.handleError(record)
+
+    def shutdown(self):
+        """Flush pending log entries and stop the background writer thread."""
+        if self._db_thread is not None and self._db_thread.is_alive():
+            self._db_queue.put(None)  # Sentinel to stop the loop
+            self._db_thread.join(timeout=5.0)
+        self._storage = None
 
     def get_entries(self, limit: int = 100, level: str = None) -> List[Dict[str, Any]]:
         """

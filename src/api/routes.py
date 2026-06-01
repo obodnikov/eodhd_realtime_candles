@@ -163,16 +163,16 @@ class APIRoutes:
 
     async def get_logs(self, request: web.Request) -> web.Response:
         """
-        GET /logs - Get recent WARNING/ERROR log entries.
+        GET /logs - Get recent WARNING/ERROR log entries from the database.
         
         Protected by API key middleware (same as all non-health endpoints).
+        Reads from the shared database so logs from all worker processes
+        (including the WebSocket worker) are visible.
         
         Query params:
             limit: Max entries to return (default 100, max 500)
             level: Filter by level - 'WARNING', 'ERROR', or omit for both
         """
-        from ..log_buffer import get_log_buffer
-
         # Validate limit parameter
         try:
             limit = int(request.query.get('limit', 100))
@@ -192,14 +192,32 @@ class APIRoutes:
                     status=400
                 )
 
-        buffer = get_log_buffer()
-        entries = buffer.get_entries(limit=limit, level=level)
+        # Read from database (shared across all processes)
+        source = 'database'
+        try:
+            if hasattr(self.storage, 'get_log_entries'):
+                entries = await asyncio.to_thread(
+                    self.storage.get_log_entries, limit=limit, level=level
+                )
+            else:
+                # Fallback to in-memory buffer if storage doesn't support logs
+                from ..log_buffer import get_log_buffer
+                buffer = get_log_buffer()
+                entries = buffer.get_entries(limit=limit, level=level)
+                source = 'memory'
+        except Exception as e:
+            # Fallback to in-memory buffer if DB read fails
+            from ..log_buffer import get_log_buffer
+            buffer = get_log_buffer()
+            entries = buffer.get_entries(limit=limit, level=level)
+            source = 'memory_fallback'
 
         return web.json_response({
             'entries': entries,
-            'total_buffered': buffer.count,
+            'returned_count': len(entries),
             'limit': limit,
             'level_filter': level,
+            'source': source,
         })
     
     # =========================================================================

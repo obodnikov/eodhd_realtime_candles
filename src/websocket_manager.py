@@ -362,6 +362,11 @@ class WebSocketManager:
 
     async def _connection_loop(self):
         """Main connection loop with automatic reconnection and exponential backoff."""
+        # Track whether last disconnect was due to a server error (500).
+        # If so, the next connection should use tight timeout immediately
+        # (the feed was proven active but broken, not legitimately quiet).
+        _last_failure_was_server_error = False
+        
         while self._running:
             try:
                 logger.info(f"Connecting to EODHD WebSocket...")
@@ -400,24 +405,29 @@ class WebSocketManager:
                             self._pending_subscribe.clear()
                         
                         # Process messages after authorization.
-                        # Use recv() with timeout to detect silent dead feeds.
                         # Two-phase timeout:
-                        #   1. Before first tick: use a longer first_data_timeout (5x data_timeout)
-                        #      to allow for slow subscription setup without hanging forever.
+                        #   1. Before first tick: use first_data_timeout (longer) unless
+                        #      the previous connection died from a 500 (then use tight timeout).
                         #   2. After first tick: use data_timeout to detect feed going silent.
                         received_tick_on_connection = False
                         tick_count_at_start = self._tick_count
-                        first_data_timeout = self.data_timeout * 5  # Generous initial window
+                        
+                        # If last failure was a server error, the feed was active —
+                        # use tight timeout to recover faster instead of waiting 5 minutes
+                        if _last_failure_was_server_error:
+                            first_data_timeout = self.data_timeout
+                        else:
+                            first_data_timeout = self.data_timeout * 5
+                        
+                        _last_failure_was_server_error = False  # Reset for this connection
+                        
                         while self._running:
                             try:
                                 if received_tick_on_connection:
-                                    # After first tick, enforce tight data timeout
                                     message = await asyncio.wait_for(
                                         ws.recv(), timeout=self.data_timeout
                                     )
                                 else:
-                                    # Before first tick, use longer timeout to avoid
-                                    # hanging forever while still preventing reconnect storms
                                     message = await asyncio.wait_for(
                                         ws.recv(), timeout=first_data_timeout
                                     )
@@ -455,6 +465,7 @@ class WebSocketManager:
             except EodhdServerError as e:
                 logger.warning(f"EODHD server error during stream, forcing reconnect: {e}")
                 self._consecutive_failures += 1
+                _last_failure_was_server_error = True
             except ConnectionClosed as e:
                 logger.warning(f"WebSocket connection closed: {e}")
                 self._consecutive_failures += 1

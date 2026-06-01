@@ -68,6 +68,10 @@ async def create_app(config: Config) -> web.Application:
     # Initialize components (read-only mode for API workers)
     config_manager = ConfigManager(config)
     storage = create_storage(config)
+
+    # Attach storage to log buffer for cross-process log persistence
+    from .log_buffer import get_log_buffer
+    get_log_buffer().set_storage(storage)
     
     # CandleEngine in read-only mode (no tick processing)
     candle_engine = CandleEngine(

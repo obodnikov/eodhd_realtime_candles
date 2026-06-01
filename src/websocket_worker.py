@@ -298,6 +298,10 @@ async def run_worker(config: Config):
     # Initialize components
     config_manager = ConfigManager(config)
     storage = create_storage(config)
+
+    # Attach storage to log buffer for cross-process log persistence
+    from .log_buffer import get_log_buffer
+    get_log_buffer().set_storage(storage)
     candle_engine = CandleEngine(
         storage=storage,
         interval_minutes=config.candle_interval_minutes,

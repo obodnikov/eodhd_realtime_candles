@@ -198,7 +198,7 @@ def create_app() -> Flask:
             return render_template(
                 'logs.html',
                 entries=log_data.get('entries', []),
-                total_buffered=log_data.get('total_buffered', 0),
+                total_buffered=log_data.get('returned_count', 0),
                 level_filter=level_filter
             )
         except Exception as e:
