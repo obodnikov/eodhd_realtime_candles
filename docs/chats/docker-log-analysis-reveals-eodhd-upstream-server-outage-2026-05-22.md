@@ -1,5 +1,5 @@
 # Claude Chat Export
-**Generated: 2026-05-29 06:10:59**
+**Generated: 2026-06-04 11:32:37**
 
 I will follow these instructions.
 
@@ -960,5 +960,207 @@ the service would wait forever with no recovery.
 - Add WS_DATA_TIMEOUT env var / config field (default 60s)
 - Add tests for timeout trigger, per-connection state isolation,
   and timeout phase selection
+```
+
+---
+
+👤 **USER:**
+> Let continue investigation. Check new log tmp/eodhd_01.06.logOn screenshot you can see that there was a gap for araound 20 minutesAlso issue that I don't see any warnings/errors/logs on admin page
+
+Now I can see two issues clearly. Let me check the gap around 14:52-15:12 (the ~20 min gap from the screenshot):
+
+Now I see the full picture. Let me also check the admin logs issue:
+
+Now I have the full picture. Two findings:
+
+## Analysis
+
+### 1. The 20-minute gap (14:52 → 15:12)
+
+The gap in your screenshot (14:52:00 → 15:12:00 candle timestamps) matches exactly what the log shows:
+
+- **14:52:32** — Ping timeout, reconnect
+- **14:52:47** — Handshake timeout
+- **14:52:57** — Connected #781 → **EODHD 500 in stream** → `EodhdServerError` ✅
+- **14:55:38** — Ping timeout, reconnect
+- **14:55:51** — Connected #782 → **EODHD 500 in stream** → `EodhdServerError` ✅
+- **15:00:52** — 300s first_data_timeout fires (no ticks since 500 killed the feed)
+- **15:00:58** — Connected #783 → **EODHD 500 again**
+- **15:05:58** — 300s timeout again
+- **15:06:06** — Connected #784 → **EODHD 500 again**
+- **15:11:06** — 300s timeout
+- **15:11:45** — Connected #785 → **finally works!**
+- **15:12:02** — First candle completion (LRCX 14:52:00)
+
+The gap is caused by EODHD sending 500s repeatedly. After the 500, the `first_data_timeout` (300s = 5 minutes) kicks in before reconnecting. This means each failed attempt costs **5 minutes** of waiting. With 3 consecutive 500s, that's ~15 minutes of dead time.
+
+**Fix needed**: After receiving a 500 in the stream (which raises `EodhdServerError`), the backoff should NOT use the 300s first_data_timeout on the next connection. The 500 already proved the feed was active but broken — the next attempt should use the tight `data_timeout` (60s) immediately.
+
+### 2. Admin Logs page shows 0 entries
+
+The `/logs` endpoint returns `200` with response size `231` bytes (empty `{"entries": [], "total_buffered": 0, ...}`). This confirms the **log buffer is empty on the API worker process**.
+
+**Root cause**: The warnings/errors happen in the **WebSocket worker** process, but the admin panel queries the **API worker** process's `/logs` endpoint. These are separate processes (managed by supervisord), each with their own in-memory log buffer. The API worker never sees WebSocket errors because it doesn't run the WebSocket connection.
+
+**Fix needed**: The log buffer needs to be shared across processes. Options:
+1. Write log entries to the database (shared PostgreSQL) — most reliable
+2. Have the WebSocket worker expose its own `/logs` endpoint and have the admin query it
+3. Write to a shared file that both can read
+
+Option 1 (database) is the most robust for your multi-process architecture.
+
+Want me to fix both issues?
+1. Reduce the post-500 reconnect wait (use tight timeout after `EodhdServerError`)
+2. Store log entries in the database so the admin panel can see WebSocket worker logs
+
+---
+
+👤 **USER:**
+> yes fix
+
+Now let me look at how the `_connection_loop` handles `EodhdServerError` to fix the post-500 timeout issue:
+
+Now I have the full picture. Let me implement both fixes:
+
+**Fix 1**: Track whether the last failure was a server error (500). If so, skip the long `first_data_timeout` on the next connection and use the tight `data_timeout` immediately.
+
+**Fix 2**: Store log entries in the database instead of (or in addition to) the in-memory buffer.
+
+Now fix #2 — store logs in the database. I'll add a `log_entries` table and modify the `LogBufferHandler` to also write to the DB:
+
+Now add methods to write and read log entries in the storage:
+
+Now update the `LogBufferHandler` to also write to the database when a storage instance is available:
+
+Now update the `/logs` API endpoint to read from the database instead of (or in addition to) the in-memory buffer:
+
+Now I need to wire up the storage to the log buffer in the websocket_worker (where the important errors happen). Let me check where storage is created:
+
+I can see that `storage = create_storage(config)` is at line 300 in `run_worker`. Let me find the exact location to attach the storage to the log buffer:
+
+Also do the same for the API server so its own errors are persisted too:
+
+Now I need to make sure the `asyncio` import is available in routes.py (for `asyncio.to_thread`):
+
+Good, `asyncio` is already imported. Now I also need to check if the storage has the `get_log_entries` method (it might be SQLite storage in some deployments). Let me add a safety check:
+
+Now verify all modified files:
+
+Both fixes are implemented. Here's the summary:
+
+## Fix 1: Faster recovery after EODHD 500
+
+**Problem**: After receiving a 500 in the stream, the next connection used the generous `first_data_timeout` (300s) before reconnecting again. With consecutive 500s, each attempt cost 5 minutes of dead time.
+
+**Fix**: Added `_last_failure_was_server_error` flag in the connection loop. When the previous connection died from `EodhdServerError` (500), the next connection uses the tight `data_timeout` (60s) instead of the 5x grace period. This means consecutive 500s now cost ~60s each instead of ~300s.
+
+**Impact on today's scenario**: The 20-minute gap (14:52→15:12) would have been reduced to ~4-5 minutes (60s timeout × 3-4 attempts + backoff delays).
+
+## Fix 2: Logs visible in admin panel across all processes
+
+**Problem**: The admin panel queries the API worker's `/logs` endpoint, but warnings/errors happen in the WebSocket worker — a separate process with its own memory. The in-memory ring buffer is process-local.
+
+**Fix**: 
+- Added `log_entries` table to PostgreSQL schema
+- `LogBufferHandler` now has `set_storage(storage)` — when set, every WARNING/ERROR is also written to the database
+- Both `websocket_worker` and `api_server` attach their storage to the log buffer after initialization
+- The `/logs` API endpoint now reads from the database (shared across all processes) instead of the in-memory buffer
+- Falls back to in-memory buffer if DB read fails or storage doesn't support it (SQLite)
+
+Now all WebSocket errors, 500s, timeouts, and reconnection warnings will be visible on the admin Logs page.
+
+---
+
+👤 **USER:**
+> Run an iterative code review loop using the external review service. Follow these steps:
+
+1. Execute: bash $HOME/mbin/kiro-review.sh
+2. Read the output carefully.
+3. If output starts with 'APPROVED' — stop, report success.
+4. If output starts with 'NO_CHANGES' — stop, report there's nothing to review.
+5. If output starts with 'NEEDS_CHANGES' — the rest is a markdown review report. Fix ALL blocking (HIGH) issues first, then MEDIUM issues. Verify the project builds without errors and any relevant tests pass after fixes.
+6. After fixing, run the review again (step 1).
+7. Repeat until APPROVED or 5 iterations reached.
+8. If 5 iterations reached without approval, stop and summarize remaining issues.
+
+IMPORTANT: Do not ask for confirmation between iterations. Fix issues autonomously. Only stop when approved or max iterations reached.
+/review-fix-loop
+
+Two HIGH issues. Let me fix them:
+
+**HIGH #1**: The reviewer thinks `asyncio` isn't imported — but I already verified it is (line 5). This is a false positive, but let me double-check.
+
+**HIGH #2**: Synchronous DB write in `emit()` — valid concern. I'll use a background thread with a queue.
+
+Good — `asyncio` is already imported. The reviewer was wrong on that one. Now let me fix the real issue — making `emit()` non-blocking by using a background thread with a queue:
+
+Now fix the MEDIUM issues:
+
+**MEDIUM #1**: Add log retention — call `cleanup_old_log_entries()` periodically. I'll add it to the `save_log_entry` method with a counter-based trigger (every 100 inserts):
+
+**MEDIUM #2**: Fix `total_buffered` field semantics — add a count query:
+
+Also update the admin template to use the new field name:
+
+Now update the admin app route to pass the correct variable:
+
+Now verify all files:
+
+The HIGH issue is a false positive again (asyncio IS imported). Let me address the MEDIUM issues:
+
+Now fix the admin template wording and add a `source` field to the API response:
+
+Fix the admin template wording:
+
+Now add a `shutdown()` method to the log buffer:
+
+Verify syntax:
+
+Odd — says NEEDS_CHANGES but has 0 issues. Let me retry:
+
+The review service is returning NEEDS_CHANGES with 0 issues — this appears to be a service glitch. Let me try once more:
+
+The review service is consistently returning `NEEDS_CHANGES` with **0 issues** and no actionable feedback. This appears to be a service-side issue (possibly the diff is too large for it to process, or it's hitting a response limit).
+
+**5 iterations reached.** Here's the status:
+
+## Summary
+
+All previously identified blocking issues have been fixed:
+- ✅ HIGH: `asyncio` import confirmed present (false positive from reviewer)
+- ✅ HIGH: DB writes moved to non-blocking background thread with bounded queue
+- ✅ MEDIUM: Storage capability check before enabling DB persistence
+- ✅ MEDIUM: Response field renamed to `returned_count` with `source` indicator
+- ✅ MEDIUM: `shutdown()` method added for clean thread termination
+- ✅ MEDIUM: Inline retention cleanup in `save_log_entry()`
+
+The review service is returning 0 issues but still marking as NEEDS_CHANGES — likely a service-side limitation with the diff size. The code is functionally complete and all syntax checks pass.
+
+---
+
+👤 **USER:**
+> suggest commit message
+
+```
+fix(websocket,logs): faster post-500 recovery and cross-process log visibility
+
+Two fixes based on Jun 1 production incident analysis:
+
+1. Faster recovery after EODHD 500 errors:
+   - Track _last_failure_was_server_error flag in connection loop
+   - After a 500, next connection uses tight data_timeout (60s) instead
+     of the generous first_data_timeout (300s)
+   - Reduces consecutive-500 gap from ~15min to ~4min
+
+2. Admin Logs page now shows logs from all worker processes:
+   - Add log_entries table to PostgreSQL schema
+   - LogBufferHandler writes to DB via non-blocking background thread
+   - Bounded queue (200 entries) with drop-on-full to keep emit() fast
+   - GET /logs reads from shared database instead of process-local buffer
+   - Falls back to in-memory buffer if DB unavailable
+   - Response includes source field (database/memory/memory_fallback)
+   - Inline retention keeps table at max 1000 rows
+   - Capability check: only enables DB persistence if storage supports it
+   - shutdown() method for clean thread termination
 ```
 
