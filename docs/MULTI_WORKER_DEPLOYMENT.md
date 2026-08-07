@@ -252,5 +252,5 @@ python -m src.main
 
 - Architecture: `ARCHITECTURE.md`
 - Implementation: `docs/chats/implementing-option-a-multiple-worker-processes-2026-01-30.md`
-- SQLite Rules: `AI_SQLite.md`
+- SQLite Rules: `AI_SQLITE.md`
 - Performance: `docs/chats/performance-optimization-for-high-volume-ticker-monitoring-system-2026-01-28.md`
