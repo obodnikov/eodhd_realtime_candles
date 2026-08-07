@@ -35,15 +35,20 @@ class WebSocketManager:
     
     def __init__(self, api_key: str, reconnect_delay: int = 5, ping_interval: int = 30, 
                  auth_timeout: int = 10, is_dummy: bool = False,
-                 max_reconnect_delay: int = 60, data_timeout: int = 60):
+                 max_reconnect_delay: int = 60, data_timeout: int = 60,
+                 max_silent_timeout: int = 900):
         if reconnect_delay < 1:
             raise ValueError(f"reconnect_delay must be >= 1, got {reconnect_delay}")
         if max_reconnect_delay < 1:
             raise ValueError(f"max_reconnect_delay must be >= 1, got {max_reconnect_delay}")
         if data_timeout < 1:
             raise ValueError(f"data_timeout must be >= 1, got {data_timeout}")
+        if max_silent_timeout < 1:
+            raise ValueError(f"max_silent_timeout must be >= 1, got {max_silent_timeout}")
         # Ensure max is at least as large as base delay
         max_reconnect_delay = max(max_reconnect_delay, reconnect_delay)
+        # The silent-feed ceiling can never be tighter than the first-data timeout
+        max_silent_timeout = max(max_silent_timeout, data_timeout * 5)
 
         self.api_key = api_key
         self.reconnect_delay = reconnect_delay
@@ -52,6 +57,7 @@ class WebSocketManager:
         self.data_timeout = data_timeout  # Max seconds to wait for data before forcing reconnect
         self.is_dummy = is_dummy  # Flag to identify dummy instances in API workers
         self.max_reconnect_delay = max_reconnect_delay  # Cap for exponential backoff
+        self.max_silent_timeout = max_silent_timeout  # Ceiling for the relaxed silent-feed watchdog
         
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._subscribed_tickers: Set[str] = set()
@@ -66,7 +72,11 @@ class WebSocketManager:
         self._tick_count = 0
         self._fire_and_forget_ticks = True
         self._consecutive_failures = 0  # Track consecutive failed connections for backoff
-        
+        # Consecutive connections that authorized fine but carried no ticks at all.
+        # Outside trading hours this is the normal state, so the watchdog relaxes
+        # rather than tearing down a healthy socket every few minutes.
+        self._silent_connections = 0
+
         # Callback for processing ticks (auto-detects sync vs async)
         self._on_tick: Optional[Callable[[str, float, int, int], Union[None, Awaitable[None]]]] = None
         
@@ -273,6 +283,9 @@ class WebSocketManager:
         except json.JSONDecodeError:
             logger.warning(f"Failed to parse message: {message[:100]}")
             return False
+        except EodhdServerError:
+            # Must reach _connection_loop to force a reconnect — never swallow it here.
+            raise
         except Exception as e:
             logger.error(f"Error processing message: {e}")
             return False
@@ -417,8 +430,17 @@ class WebSocketManager:
                         if _last_failure_was_server_error:
                             first_data_timeout = self.data_timeout
                         else:
-                            first_data_timeout = self.data_timeout * 5
-                        
+                            # Relax the watchdog while the feed keeps coming up empty.
+                            # A quiet feed with no error signal is the normal state
+                            # outside trading hours; reconnecting every 5 minutes all
+                            # night achieves nothing. Each consecutive silent
+                            # connection doubles the wait, up to max_silent_timeout,
+                            # and the first tick resets it (see below).
+                            first_data_timeout = min(
+                                self.data_timeout * 5 * (2 ** self._silent_connections),
+                                self.max_silent_timeout
+                            )
+
                         _last_failure_was_server_error = False  # Reset for this connection
                         
                         while self._running:
@@ -438,9 +460,13 @@ class WebSocketManager:
                                         f"previous activity — feed appears silent, forcing reconnect"
                                     )
                                 else:
+                                    # Nothing at all arrived on this connection.
+                                    # Count it so the next attempt waits longer.
+                                    self._silent_connections += 1
                                     logger.warning(
                                         f"No data received for {first_data_timeout}s since "
-                                        f"subscription — feed may be dead, forcing reconnect"
+                                        f"subscription — feed may be dead, forcing reconnect "
+                                        f"(silent connection #{self._silent_connections})"
                                     )
                                 self._consecutive_failures += 1
                                 break
@@ -450,6 +476,8 @@ class WebSocketManager:
                             # Detect first tick on this connection by comparing tick count
                             if not received_tick_on_connection and self._tick_count > tick_count_at_start:
                                 received_tick_on_connection = True
+                                # Data is flowing again — drop back to the tight watchdog
+                                self._silent_connections = 0
                             
                             # Handle pending operations
                             if self._pending_subscribe:
@@ -495,9 +523,21 @@ class WebSocketManager:
         """Start the WebSocket connection."""
         if self._running:
             return
-        
+
+        # Dummy managers live in API workers purely to satisfy the shared route
+        # handlers. Starting one opens a second EODHD connection that has no
+        # subscriptions and no tick callback, so it can never receive data — it
+        # just reconnects forever and burns an upstream connection slot.
+        if self.is_dummy:
+            logger.warning(
+                "Refusing to start a dummy WebSocketManager — only the WebSocket "
+                "worker owns the EODHD connection"
+            )
+            return
+
         self._running = True
         self._consecutive_failures = 0  # Fresh start with base reconnect timing
+        self._silent_connections = 0  # Fresh start with the tight data watchdog
         asyncio.create_task(self._connection_loop())
         logger.info("WebSocket manager started")
     
@@ -521,5 +561,10 @@ class WebSocketManager:
             'tick_count': self._tick_count,
             'last_message': self._last_message_time.isoformat() if self._last_message_time else None,
             'consecutive_failures': self._consecutive_failures,
+            'silent_connections': self._silent_connections,
+            'data_timeout_current': min(
+                self.data_timeout * 5 * (2 ** self._silent_connections),
+                self.max_silent_timeout
+            ),
             'backoff_delay_ceiling': self._get_backoff_delay_deterministic(),
         }

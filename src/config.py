@@ -63,6 +63,7 @@ class Config:
     ws_reconnect_delay: int = field(default_factory=lambda: int(os.environ.get('WS_RECONNECT_DELAY', '5')))
     ws_ping_interval: int = field(default_factory=lambda: int(os.environ.get('WS_PING_INTERVAL', '30')))
     ws_data_timeout: int = field(default_factory=lambda: int(os.environ.get('WS_DATA_TIMEOUT', '60')))
+    ws_max_silent_timeout: int = field(default_factory=lambda: int(os.environ.get('WS_MAX_SILENT_TIMEOUT', '900')))
     ws_status_stale_seconds: int = field(default_factory=lambda: int(os.environ.get('WS_STATUS_STALE_SECONDS', '30')))
     
     # Ticker Sync (multi-worker mode)

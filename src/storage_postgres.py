@@ -840,6 +840,52 @@ class PostgreSQLStorage:
     # WebSocket Status (Multi-Worker Status Sharing)
     # =========================================================================
     
+    RECONNECT_REQUEST_KEY = 'websocket_reconnect_requested_at'
+
+    def request_websocket_reconnect(self) -> str:
+        """
+        Record an operator request to reconnect the EODHD feed.
+
+        API workers hold a dummy WebSocketManager and cannot reconnect the feed
+        themselves, so the request travels through the database and the
+        WebSocket worker acts on it — the same route ticker changes take.
+
+        Returns the request timestamp (ISO 8601, UTC).
+        """
+        requested_at = datetime.now(timezone.utc).isoformat()
+
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO config (key, value, updated_at)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (key) DO UPDATE SET
+                    value = EXCLUDED.value,
+                    updated_at = EXCLUDED.updated_at
+            ''', (self.RECONNECT_REQUEST_KEY, requested_at, requested_at))
+            conn.commit()
+        finally:
+            self._put_connection(conn)
+
+        return requested_at
+
+    def get_websocket_reconnect_request(self) -> Optional[str]:
+        """
+        Read the most recent reconnect request timestamp, or None if never set.
+        """
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                'SELECT value FROM config WHERE key = %s',
+                (self.RECONNECT_REQUEST_KEY,)
+            )
+            row = cursor.fetchone()
+            return row[0] if row else None
+        finally:
+            self._put_connection(conn)
+
     def update_websocket_status(self, status: Dict[str, Any]):
         """Update WebSocket status in database for multi-worker visibility."""
         conn = self._get_connection()

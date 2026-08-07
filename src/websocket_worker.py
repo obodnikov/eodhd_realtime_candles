@@ -291,6 +291,55 @@ async def ticker_sync_task(storage: Storage, ws_manager: WebSocketManager, sync_
             logger.error(f"Error in ticker sync task: {e}")
 
 
+async def reconnect_request_task(storage: Storage, ws_manager: WebSocketManager,
+                                 poll_interval: int = 10):
+    """
+    Background task that acts on reconnect requests recorded by API workers.
+
+    API workers hold a dummy WebSocketManager and cannot reconnect the feed
+    themselves, so POST /reconnect writes a timestamp to the database and this
+    task carries it out on the real connection. Only requests newer than the
+    one seen at startup are acted on, so an old row cannot cause a reconnect
+    loop after a restart.
+
+    Args:
+        storage: Storage instance for database access
+        ws_manager: The real WebSocketManager owning the EODHD connection
+        poll_interval: Seconds between checks (default: 10)
+    """
+    logger = logging.getLogger(__name__)
+
+    # Treat whatever is already stored as handled — only newer requests count.
+    try:
+        last_seen = await asyncio.to_thread(storage.get_websocket_reconnect_request)
+    except Exception as e:
+        logger.error(f"Could not read initial reconnect request: {e}")
+        last_seen = None
+
+    logger.info(f"Reconnect request task started ({poll_interval}s interval)")
+
+    while True:
+        try:
+            await asyncio.sleep(poll_interval)
+
+            requested_at = await asyncio.to_thread(
+                storage.get_websocket_reconnect_request
+            )
+            if requested_at and requested_at != last_seen:
+                last_seen = requested_at
+                logger.info(
+                    f"Reconnect requested at {requested_at} — restarting EODHD connection"
+                )
+                await ws_manager.stop()
+                await ws_manager.start()
+
+        except asyncio.CancelledError:
+            logger.info("Reconnect request task cancelled")
+            break
+        except Exception as e:
+            logger.error(f"Error in reconnect request task: {e}")
+
+
 async def run_worker(config: Config):
     """Run the WebSocket worker."""
     logger = logging.getLogger(__name__)
@@ -316,7 +365,8 @@ async def run_worker(config: Config):
         api_key=config.eodhd_api_key,
         reconnect_delay=config.ws_reconnect_delay,
         ping_interval=config.ws_ping_interval,
-        data_timeout=config.ws_data_timeout
+        data_timeout=config.ws_data_timeout,
+        max_silent_timeout=config.ws_max_silent_timeout
     )
     
     # Bounded queue + fixed workers to apply backpressure under high tick volume
@@ -440,6 +490,11 @@ async def run_worker(config: Config):
         ticker_sync_task(storage, ws_manager, config.ticker_sync_interval_seconds)
     )
 
+    # Start reconnect request task (carries out /reconnect calls made on API workers)
+    reconnect_request_task_handle = asyncio.create_task(
+        reconnect_request_task(storage, ws_manager)
+    )
+
     # Start ticker status flush task
     ticker_status_flush_task_handle = asyncio.create_task(
         ticker_status_flush_task(
@@ -477,6 +532,7 @@ async def run_worker(config: Config):
     status_task_handle.cancel()
     active_candles_task_handle.cancel()
     ticker_sync_task_handle.cancel()
+    reconnect_request_task_handle.cancel()
     ticker_status_flush_task_handle.cancel()
     candle_write_flush_task_handle.cancel()
     for handle in tick_worker_handles:
@@ -499,6 +555,11 @@ async def run_worker(config: Config):
     
     try:
         await ticker_sync_task_handle
+    except asyncio.CancelledError:
+        pass
+
+    try:
+        await reconnect_request_task_handle
     except asyncio.CancelledError:
         pass
 

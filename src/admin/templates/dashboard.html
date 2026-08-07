@@ -211,8 +211,13 @@ async function reconnectWebSocket() {
         const data = await response.json();
 
         if (data.success) {
-            showAlert('WebSocket reconnection initiated', 'success');
-            setTimeout(() => location.reload(), 2000);
+            // In multi-worker mode the request is handed to the WebSocket
+            // worker through the database, so report what the API actually
+            // said and allow time for the worker to act before reloading.
+            const message = (data.result && data.result.message)
+                || 'WebSocket reconnection initiated';
+            showAlert(message, 'success');
+            setTimeout(() => location.reload(), 12000);
         } else {
             showAlert('Failed to reconnect: ' + (data.error || 'Unknown error'), 'danger');
         }

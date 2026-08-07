@@ -153,9 +153,23 @@ class APIRoutes:
     
     async def reconnect(self, request: web.Request) -> web.Response:
         """POST /reconnect - Force WebSocket reconnection."""
+        # An API worker holds a dummy WebSocketManager, not the live feed.
+        # Restarting it here would open a second EODHD connection that never
+        # receives data, and would leave the real feed untouched. Record the
+        # request instead; the WebSocket worker picks it up and acts on it.
+        if self.ws_manager.is_dummy:
+            requested_at = await asyncio.to_thread(
+                self.storage.request_websocket_reconnect
+            )
+            return web.json_response({
+                'message': 'Reconnection requested — the WebSocket worker will act on it shortly',
+                'requested_at': requested_at,
+                'timestamp': datetime.now(timezone.utc).isoformat()
+            }, status=202)
+
         await self.ws_manager.stop()
         await self.ws_manager.start()
-        
+
         return web.json_response({
             'message': 'Reconnection initiated',
             'timestamp': datetime.now(timezone.utc).isoformat()
