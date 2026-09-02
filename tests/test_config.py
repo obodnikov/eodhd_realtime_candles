@@ -82,5 +82,54 @@ class TestCandleCloseGraceSeconds(unittest.TestCase):
         self.assertEqual(manager.config.candle_close_grace_seconds, 2.0)
 
 
+
+class TestEmptyIntervalAudit(unittest.TestCase):
+    """empty_interval_audit: default, allowed values, runtime refusal."""
+
+    def _config(self, **overrides):
+        config = Config()
+        config.eodhd_api_key = 'test_key'
+        config.persist_config = False
+        for key, value in overrides.items():
+            setattr(config, key, value)
+        return config
+
+    def test_default_is_off(self):
+        """Measurement is opt-in; the service does nothing extra by default."""
+        self.assertEqual(self._config().empty_interval_audit, 'off')
+
+    def test_allowed_values(self):
+        for mode in ('off', 'regular', 'extended'):
+            errors = [e for e in self._config(empty_interval_audit=mode).validate()
+                      if 'empty_interval_audit' in e]
+            self.assertEqual(errors, [], mode)
+
+    def test_unknown_value_is_rejected(self):
+        errors = self._config(empty_interval_audit='sometimes').validate()
+        self.assertTrue(
+            any('empty_interval_audit must be one of' in e for e in errors),
+            errors
+        )
+
+    def test_environment_value_is_normalised(self):
+        with unittest.mock.patch.dict(
+            os.environ, {'EMPTY_INTERVAL_AUDIT': '  Regular  '}
+        ):
+            self.assertEqual(Config().empty_interval_audit, 'regular')
+
+    def test_appears_in_public_config(self):
+        public = self._config(empty_interval_audit='regular').get_public_config()
+        self.assertEqual(public['empty_interval_audit'], 'regular')
+
+    def test_cannot_be_changed_at_runtime(self):
+        manager = ConfigManager(self._config())
+
+        result = manager.update({'empty_interval_audit': 'extended'})
+
+        self.assertEqual(result['updated'], [])
+        self.assertIn('Cannot update empty_interval_audit', result['errors'][0])
+        self.assertEqual(manager.config.empty_interval_audit, 'off')
+
+
 if __name__ == '__main__':
     unittest.main()

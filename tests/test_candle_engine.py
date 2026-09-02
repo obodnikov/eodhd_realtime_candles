@@ -1263,5 +1263,143 @@ class TestCandleEngineTimeBasedClose(unittest.TestCase):
         self.assertEqual(closed[0].timestamp, past)
 
 
+
+class TestCandleEngineEmptyIntervalAudit(unittest.TestCase):
+    """audit_empty_interval: measurement only, writes nothing.
+
+    Mirrors TestCandleEngineTimeBasedClose: a fixed bucket, a 1-minute
+    interval, and no reliance on the clock.
+    """
+
+    INTERVAL_SECONDS = 60
+
+    def setUp(self):
+        self.temp_db = tempfile.NamedTemporaryFile(delete=False, suffix='.db')
+        self.temp_db.close()
+        self.storage = Storage(self.temp_db.name)
+        self.engine = CandleEngine(self.storage, interval_minutes=1, max_candles=100)
+        self.bucket = int(
+            datetime(2026, 3, 2, 14, 30, 0, tzinfo=timezone.utc).timestamp()
+        )
+
+    def tearDown(self):
+        try:
+            os.unlink(self.temp_db.name)
+        except Exception:
+            pass
+
+    def _tick(self, ticker, price, volume, offset_seconds):
+        self.engine.process_tick(
+            ticker, price, volume, (self.bucket + offset_seconds) * 1000
+        )
+
+    def _close_through(self, offset_seconds):
+        """Close every bucket that has ended by bucket start + offset."""
+        self.engine.close_due_candles(
+            now_timestamp=self.bucket + offset_seconds, grace_seconds=2.0
+        )
+
+    def _next_bucket(self, n=1):
+        return self.bucket + n * self.INTERVAL_SECONDS
+
+    def test_unknown_ticker_has_no_previous_candle(self):
+        result = self.engine.audit_empty_interval('AAPL', self.bucket)
+        self.assertFalse(result['eligible'])
+        self.assertEqual(result['reason'], 'no_previous_candle')
+
+    def test_interval_after_a_real_candle_would_be_filled(self):
+        """The chain is intact and the next interval produced nothing."""
+        self._tick('AAPL', 150.0, 100, 10)
+        self._tick('AAPL', 153.5, 200, 20)
+        self._close_through(self.INTERVAL_SECONDS + 2)
+
+        result = self.engine.audit_empty_interval('AAPL', self._next_bucket())
+
+        self.assertTrue(result['eligible'])
+        self.assertEqual(result['reason'], 'would_fill')
+        # A synthetic candle would carry the previous close, nothing invented.
+        self.assertEqual(result['price'], 153.5)
+
+    def test_audit_writes_nothing(self):
+        """The whole point: measurement must not create a candle."""
+        self._tick('AAPL', 150.0, 100, 10)
+        self._close_through(self.INTERVAL_SECONDS + 2)
+        self.engine.flush_pending_candle_writes()
+        before = self.storage.get_candles('AAPL', count=10, include_current=False)
+
+        for _ in range(3):
+            self.engine.audit_empty_interval('AAPL', self._next_bucket())
+
+        self.engine.flush_pending_candle_writes()
+        after = self.storage.get_candles('AAPL', count=10, include_current=False)
+
+        self.assertEqual(len(after), len(before))
+        self.assertEqual([c.timestamp for c in after], [c.timestamp for c in before])
+        self.assertEqual(self.engine.get_active_tickers(), [])
+
+    def test_interval_with_a_candle_in_progress_is_not_empty(self):
+        """An open current candle means the interval had trades."""
+        self._tick('AAPL', 150.0, 100, 10)
+        self._close_through(self.INTERVAL_SECONDS + 2)
+        # A trade lands in the following interval.
+        self._tick('AAPL', 151.0, 100, self.INTERVAL_SECONDS + 5)
+
+        result = self.engine.audit_empty_interval('AAPL', self._next_bucket())
+
+        self.assertFalse(result['eligible'])
+        self.assertEqual(result['reason'], 'candle_in_progress')
+
+    def test_interval_that_already_produced_a_candle(self):
+        self._tick('AAPL', 150.0, 100, 10)
+        self._close_through(self.INTERVAL_SECONDS + 2)
+
+        result = self.engine.audit_empty_interval('AAPL', self.bucket)
+
+        self.assertFalse(result['eligible'])
+        self.assertEqual(result['reason'], 'candle_completed')
+
+    def test_chain_broken_by_a_missing_interval(self):
+        """Two intervals of silence: only the first one is judgeable."""
+        self._tick('AAPL', 150.0, 100, 10)
+        self._close_through(self.INTERVAL_SECONDS + 2)
+
+        # The interval two steps later has a hole behind it.
+        result = self.engine.audit_empty_interval('AAPL', self._next_bucket(2))
+
+        self.assertFalse(result['eligible'])
+        self.assertEqual(result['reason'], 'chain_broken')
+        self.assertEqual(result['last_completed_start'], self.bucket)
+
+    def test_chain_is_broken_by_remove_ticker(self):
+        """A ticker re-added later has no chain, so nothing is filled."""
+        self._tick('AAPL', 150.0, 100, 10)
+        self._close_through(self.INTERVAL_SECONDS + 2)
+        self.engine.remove_ticker('AAPL')
+
+        result = self.engine.audit_empty_interval('AAPL', self._next_bucket())
+
+        self.assertFalse(result['eligible'])
+        self.assertEqual(result['reason'], 'no_previous_candle')
+
+    def test_chain_is_broken_by_an_interval_change(self):
+        self._tick('AAPL', 150.0, 100, 10)
+        self._close_through(self.INTERVAL_SECONDS + 2)
+        self.engine.set_interval(5)
+
+        result = self.engine.audit_empty_interval('AAPL', self._next_bucket())
+
+        self.assertFalse(result['eligible'])
+        self.assertEqual(result['reason'], 'no_previous_candle')
+
+    def test_ticker_symbol_is_case_insensitive(self):
+        self._tick('AAPL', 150.0, 100, 10)
+        self._close_through(self.INTERVAL_SECONDS + 2)
+
+        result = self.engine.audit_empty_interval('aapl', self._next_bucket())
+
+        self.assertTrue(result['eligible'])
+        self.assertEqual(result['price'], 150.0)
+
+
 if __name__ == '__main__':
     unittest.main()

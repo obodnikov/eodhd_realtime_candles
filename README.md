@@ -1,4 +1,4 @@
-# EODHD Real-Time Candle Aggregator v0.9.10
+# EODHD Real-Time Candle Aggregator v0.9.11
 
 > **Converts EODHD WebSocket tick data into configurable OHLCV candles with full REST API management**
 
@@ -19,7 +19,7 @@ This microservice solves the problem that EODHD's Intraday Historical API only p
 - ✅ **Multi-worker architecture** for high performance and scalability
 - ✅ **Admin Web UI** with real-time monitoring and Chart.js visualizations
 
-### Architecture (v0.9.10)
+### Architecture (v0.9.11)
 
 The service uses a **multi-worker architecture** for optimal performance and scalability:
 
@@ -487,6 +487,8 @@ Body:
 | `ADMIN_HOST` | `127.0.0.1` | Admin UI host (localhost only by default) |
 | `ADMIN_PORT` | `5000` | Admin UI port |
 | `CANDLE_CLOSE_GRACE_SECONDS` | `2.0` | Delay past an interval's end before its candle is closed. Environment only — `PATCH /config` refuses it, because the close task runs in the WebSocket worker |
+| `EMPTY_INTERVAL_AUDIT` | `off` | `off` / `regular` / `extended`. Measurement only: records which empty intervals *could* be filled, writing no candles. See [docs/EMPTY_INTERVAL_AUDIT.md](docs/EMPTY_INTERVAL_AUDIT.md) |
+| `EMPTY_INTERVAL_AUDIT_PATH` | next to the database | Where the audit appends its observations |
 
 ---
 

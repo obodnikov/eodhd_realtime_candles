@@ -19,11 +19,14 @@ Usage:
 """
 
 import asyncio
+import json
 import logging
 import signal
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
@@ -383,6 +386,197 @@ async def candle_close_task(
             logger.error(f"Error in candle close task: {e}")
 
 
+# Regular US equity session and the extended window the feed also carries.
+# Weekends are excluded here; holidays need no calendar, because on a holiday
+# the chain never starts and every interval fails the engine's chain test.
+_FILL_SESSIONS = {
+    'regular': ((9, 30), (16, 0)),
+    'extended': ((4, 0), (20, 0)),
+}
+
+
+def _inside_fill_session(bucket_start: int, mode: str) -> bool:
+    """
+    Is this interval inside the configured trading session?
+
+    Args:
+        bucket_start: Interval start, Unix seconds.
+        mode: 'off', 'regular' (09:30-16:00 ET) or 'extended' (04:00-20:00 ET).
+
+    Returns:
+        True when the interval starts inside the window on a weekday.
+        Always False for 'off' or an unknown mode.
+    """
+    window = _FILL_SESSIONS.get(mode)
+    if window is None:
+        return False
+
+    try:
+        eastern = ZoneInfo('America/New_York')
+    except Exception:
+        # Without a timezone database, silence cannot be judged. Say no.
+        logging.getLogger(__name__).warning(
+            "Timezone database unavailable; empty-interval audit disabled"
+        )
+        return False
+
+    moment = datetime.fromtimestamp(bucket_start, tz=timezone.utc).astimezone(eastern)
+    if moment.weekday() >= 5:
+        return False
+
+    (start_h, start_m), (end_h, end_m) = window
+    minutes = moment.hour * 60 + moment.minute
+    return (start_h * 60 + start_m) <= minutes < (end_h * 60 + end_m)
+
+
+async def empty_interval_audit_task(
+    candle_engine: CandleEngine,
+    ws_manager: WebSocketManager,
+    mode: str,
+    audit_path: str,
+    poll_interval_seconds: float = 1.0,
+    settle_seconds: float = 3.0
+):
+    """
+    Measure, without writing, which empty intervals could be filled.
+
+    MEASUREMENT ONLY. This task never creates a candle and never touches the
+    candles table. Once per interval it asks: for each subscribed ticker, did
+    this interval produce no candle, and would all the preconditions for
+    writing a zero-volume candle have held? Each answer is appended to a
+    newline-delimited JSON file so the question "should the service fill empty
+    intervals at all?" can be settled with observed numbers.
+
+    Feed continuity is judged by comparing two samples one interval apart: the
+    interval counts only if both show a live connection with an unchanged
+    connection count and the ticker subscribed throughout. A reconnect inside
+    the interval disqualifies it, because the ticks it may have missed are
+    indistinguishable from an interval in which nothing traded.
+
+    Args:
+        candle_engine: Engine to interrogate (read-only).
+        ws_manager: Source of connection and subscription samples.
+        mode: 'regular' or 'extended'. The task is not started for 'off'.
+        audit_path: File to append observations to.
+        poll_interval_seconds: How often to check whether an interval is due.
+        settle_seconds: Delay past an interval's end before judging it, so the
+            candle close task has certainly finished with it.
+    """
+    logger = logging.getLogger(__name__)
+    logger.info(
+        "Empty-interval audit started (mode=%s, writing observations to %s)",
+        mode,
+        audit_path
+    )
+    logger.info(
+        "Empty-interval audit is measurement only: no candle is ever written"
+    )
+
+    try:
+        Path(audit_path).parent.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        logger.error("Cannot create audit directory for %s: %s", audit_path, e)
+        return
+
+    previous_sample = None
+    last_audited_bucket = None
+
+    while True:
+        try:
+            await asyncio.sleep(poll_interval_seconds)
+
+            interval_seconds = candle_engine.interval_seconds
+            now = time.time()
+            current_bucket = int(now // interval_seconds) * interval_seconds
+            finished_bucket = current_bucket - interval_seconds
+
+            # Wait until the close task has certainly dealt with this bucket.
+            if now < current_bucket + settle_seconds:
+                continue
+            if last_audited_bucket == finished_bucket:
+                continue
+
+            status = ws_manager.get_status()
+            sample = (
+                bool(status.get('connected')),
+                status.get('connection_count'),
+                frozenset(t.upper() for t in status.get('subscribed_tickers', []))
+            )
+
+            earlier, previous_sample = previous_sample, sample
+            last_audited_bucket = finished_bucket
+
+            if earlier is None:
+                # No opening sample for this interval, so continuity is unknown.
+                continue
+
+            feed_steady = (
+                earlier[0] and sample[0] and earlier[1] == sample[1]
+            )
+            inside_session = _inside_fill_session(finished_bucket, mode)
+
+            rows = []
+            for ticker in sorted(sample[2]):
+                verdict = await asyncio.to_thread(
+                    candle_engine.audit_empty_interval, ticker, finished_bucket
+                )
+                if verdict['reason'] in ('candle_in_progress', 'candle_completed'):
+                    # The interval had trades; nothing to measure.
+                    continue
+
+                subscribed_throughout = ticker in earlier[2]
+                eligible = bool(
+                    verdict['eligible']
+                    and feed_steady
+                    and subscribed_throughout
+                    and inside_session
+                )
+
+                rows.append({
+                    'ticker': ticker,
+                    'bucket': finished_bucket,
+                    'bucket_utc': datetime.fromtimestamp(
+                        finished_bucket, tz=timezone.utc
+                    ).isoformat(),
+                    'interval_minutes': candle_engine.interval_minutes,
+                    'would_fill': eligible,
+                    'engine_reason': verdict['reason'],
+                    'feed_steady': feed_steady,
+                    'subscribed_throughout': subscribed_throughout,
+                    'inside_session': inside_session,
+                    'price': verdict.get('price'),
+                    'observed_at': datetime.now(timezone.utc).isoformat(),
+                })
+
+            if not rows:
+                continue
+
+            await asyncio.to_thread(_append_audit_rows, audit_path, rows)
+
+            would_fill = sum(1 for r in rows if r['would_fill'])
+            logger.info(
+                "Empty-interval audit %s: %d ticker(s) без свечи, %d прошли бы все условия",
+                datetime.fromtimestamp(finished_bucket, tz=timezone.utc).strftime(
+                    '%Y-%m-%d %H:%M UTC'
+                ),
+                len(rows),
+                would_fill
+            )
+
+        except asyncio.CancelledError:
+            logger.info("Empty-interval audit task cancelled")
+            break
+        except Exception as e:
+            logger.error(f"Error in empty-interval audit task: {e}")
+
+
+def _append_audit_rows(audit_path: str, rows: list):
+    """Append observation rows as newline-delimited JSON."""
+    with open(audit_path, 'a', encoding='utf-8') as handle:
+        for row in rows:
+            handle.write(json.dumps(row) + '\n')
+
+
 async def run_worker(config: Config):
     """Run the WebSocket worker."""
     logger = logging.getLogger(__name__)
@@ -555,6 +749,22 @@ async def run_worker(config: Config):
     candle_close_task_handle = asyncio.create_task(
         candle_close_task(candle_engine, config.candle_close_grace_seconds)
     )
+
+    # Start empty-interval audit, when asked for. Measurement only: it writes
+    # observations to a file and never creates a candle.
+    empty_interval_audit_handle = None
+    if config.empty_interval_audit != 'off':
+        audit_path = config.empty_interval_audit_path or str(
+            Path(config.database_path).parent / 'empty_interval_audit.jsonl'
+        )
+        empty_interval_audit_handle = asyncio.create_task(
+            empty_interval_audit_task(
+                candle_engine,
+                ws_manager,
+                config.empty_interval_audit,
+                audit_path
+            )
+        )
     
     logger.info("WebSocket worker running")
     
@@ -586,6 +796,8 @@ async def run_worker(config: Config):
     # Stop closing candles before the final flush, so nothing is enqueued
     # after the last write.
     candle_close_task_handle.cancel()
+    if empty_interval_audit_handle is not None:
+        empty_interval_audit_handle.cancel()
     for handle in tick_worker_handles:
         handle.cancel()
     
@@ -628,6 +840,12 @@ async def run_worker(config: Config):
         await candle_close_task_handle
     except asyncio.CancelledError:
         pass
+
+    if empty_interval_audit_handle is not None:
+        try:
+            await empty_interval_audit_handle
+        except asyncio.CancelledError:
+            pass
 
     for handle in tick_worker_handles:
         try:

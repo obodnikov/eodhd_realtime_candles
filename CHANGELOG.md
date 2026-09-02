@@ -14,6 +14,42 @@ compared against this file. See *Versioning and changelog* in
 > the commits they cover; they are not release notes written at the time, and
 > they may omit changes that left no trace in a commit message.
 
+## [0.9.11] - 2026-09-02
+
+### Added
+- **Empty-interval audit — measurement only, writes no candles.** An optional task in the
+  WebSocket worker (`empty_interval_audit_task` / `CandleEngine.audit_empty_interval`)
+  records, for every interval that produced no candle, whether a zero-volume candle
+  *could* have been written and at what price, appending one JSON line per observation to
+  a file. It never creates a candle, never enqueues a write and changes no engine state.
+  See [docs/EMPTY_INTERVAL_AUDIT.md](docs/EMPTY_INTERVAL_AUDIT.md).
+
+  The point is to settle a question with numbers. An interval can produce no candle for
+  two reasons: it had trades but the candle waited in memory for the ticker's next trade,
+  or nothing traded at all. Until 0.9.10 these were indistinguishable, and the only
+  estimate available — roughly half of missing minutes originating in the service —
+  was measured before the timer-based close existed and mixed both causes together. The
+  first cause is gone; this measures what remains, so filling empty intervals can be
+  decided on observed volume rather than a projection.
+
+- `EMPTY_INTERVAL_AUDIT` (default `off`): `off` / `regular` (09:30–16:00 ET) /
+  `extended` (04:00–20:00 ET). Weekends excluded; the window is evaluated in New York
+  local time, so daylight saving is handled. Holidays need no calendar — on a holiday the
+  chain never starts. The task is not created at all when the mode is `off`.
+- `EMPTY_INTERVAL_AUDIT_PATH` (default: `empty_interval_audit.jsonl` beside the database).
+- Both are environment-only, like `CANDLE_CLOSE_GRACE_SECONDS`: the task runs in the
+  WebSocket worker, so `PATCH /config` refuses them and names the variable to set instead.
+
+### Changed
+- The engine now keeps the last traded close per ticker in memory (`_last_close`), cleared
+  alongside `_last_completed_start` in `remove_ticker` and `set_interval`. It is reported
+  by the audit as the price a synthetic candle would carry; nothing writes it.
+
+### Unchanged
+- No candle is fabricated, no schema changes, and the *Candle correctness* rule in
+  [AI_WEBSOCKET_ENGINE.md](AI_WEBSOCKET_ENGINE.md) is untouched. Deciding whether to write
+  such candles is deliberately left until the measurement is in.
+
 ## [0.9.10] - 2026-09-02
 
 ### Added

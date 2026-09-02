@@ -7,7 +7,7 @@ data 2–3 hours after close; this service fills that gap with sub-100ms candle 
 defining characteristic is a multi-worker architecture (isolated WebSocket ingest + parallel API
 workers) sharing a single SQLite-WAL or PostgreSQL backend under supervisord.
 
-> Status: **implemented and in use** — v0.9.10. Multi-worker ingest/aggregation, REST API, admin UI,
+> Status: **implemented and in use** — v0.9.11. Multi-worker ingest/aggregation, REST API, admin UI,
 > and SQLite/PostgreSQL backends are built and covered by pytest.
 > [ARCHITECTURE.md](ARCHITECTURE.md) is the authoritative design source; [ROADMAP.md](ROADMAP.md)
 > tracks planned work.

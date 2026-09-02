@@ -86,6 +86,8 @@ class Config:
     tick_worker_concurrency: int = field(default_factory=lambda: int(os.environ.get('TICK_WORKER_CONCURRENCY', '100')))
     tick_max_age_seconds: int = field(default_factory=lambda: int(os.environ.get('TICK_MAX_AGE_SECONDS', '180')))
     candle_close_grace_seconds: float = field(default_factory=lambda: float(os.environ.get('CANDLE_CLOSE_GRACE_SECONDS', '2.0')))
+    empty_interval_audit: str = field(default_factory=lambda: os.environ.get('EMPTY_INTERVAL_AUDIT', 'off').strip().lower())
+    empty_interval_audit_path: str = field(default_factory=lambda: os.environ.get('EMPTY_INTERVAL_AUDIT_PATH', ''))
 
     # Persistence
     config_file: str = field(default_factory=lambda: os.environ.get('CONFIG_FILE', ''))
@@ -133,6 +135,12 @@ class Config:
                 f"({self.candle_interval_minutes * 60}s)"
             )
 
+        if self.empty_interval_audit not in ('off', 'regular', 'extended'):
+            errors.append(
+                "empty_interval_audit must be one of: off, regular, extended "
+                f"(got {self.empty_interval_audit!r})"
+            )
+
         return errors
     
     def to_dict(self, include_sensitive: bool = False) -> dict:
@@ -169,6 +177,7 @@ class Config:
             'candle_write_queue_maxsize': self.candle_write_queue_maxsize,
             'tick_max_age_seconds': self.tick_max_age_seconds,
             'candle_close_grace_seconds': self.candle_close_grace_seconds,
+            'empty_interval_audit': self.empty_interval_audit,
             'authentication_enabled': self.api_key is not None,
         }
 
@@ -293,6 +302,14 @@ class ConfigManager:
                 errors.append(
                     "Cannot update candle_close_grace_seconds at runtime; "
                     "set CANDLE_CLOSE_GRACE_SECONDS and restart"
+                )
+                continue
+
+            # Same reasoning: the audit task lives in the WebSocket worker.
+            if key in ('empty_interval_audit', 'empty_interval_audit_path'):
+                errors.append(
+                    f"Cannot update {key} at runtime; "
+                    f"set {key.upper()} and restart"
                 )
                 continue
 

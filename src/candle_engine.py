@@ -128,6 +128,10 @@ class CandleEngine:
         # Guards against a late tick reopening a bucket that is already closed.
         self._last_completed_start: Dict[str, int] = {}
         self._late_tick_dropped_count = 0
+
+        # Last traded close per ticker. A synthetic empty candle would carry this
+        # as all four of its prices; the audit reports it without writing it.
+        self._last_close: Dict[str, float] = {}
         
         # Callback for candle completion (for WebSocket notifications)
         self._on_candle_complete: Optional[Callable[[Candle], None]] = None
@@ -163,6 +167,7 @@ class CandleEngine:
             # Bucket boundaries move with the interval, so completed-bucket
             # markers recorded on the old grid no longer mean anything.
             self._last_completed_start.clear()
+            self._last_close.clear()
 
         self.interval_minutes = interval_minutes
         self.interval_seconds = interval_minutes * 60
@@ -222,6 +227,7 @@ class CandleEngine:
         # Record the bucket as completed before dropping it, so a late tick
         # cannot reopen it (see the late-tick guard in process_tick).
         self._last_completed_start[ticker] = current.start_timestamp
+        self._last_close[ticker] = current.close
 
         # Remove from current candles
         del self._current_candles[ticker]
@@ -512,6 +518,67 @@ class CandleEngine:
 
         self._pending_candle_writes[key] = candle
     
+    def audit_empty_interval(
+        self,
+        ticker: str,
+        bucket_start: int
+    ) -> Dict[str, object]:
+        """
+        Report whether an interval that produced no candle would be fillable.
+
+        MEASUREMENT ONLY -- this method writes nothing, enqueues nothing and
+        changes no state. It answers the question "if the service filled empty
+        intervals with a zero-volume candle, would it have filled this one, and
+        with what price?" so the decision can be made from observed numbers
+        rather than estimates.
+
+        Only the two conditions the engine can see are checked here:
+
+          chain   the immediately preceding interval produced a candle, so the
+                  ticker was demonstrably alive right up to this interval. This
+                  is what prevents filling after an outage or before a session's
+                  first trade, with no need for a holiday calendar.
+          empty   no candle exists for the bucket, completed or in progress. A
+                  bucket with an open current candle had ticks and is not empty.
+
+        Feed continuity, subscription and the session window are the caller's
+        to judge -- the engine keeps no notion of market hours.
+
+        Args:
+            ticker: Stock symbol.
+            bucket_start: Interval start (Unix seconds) to evaluate.
+
+        Returns:
+            A dict with 'eligible' (bool), 'reason' (str) and, when eligible,
+            'price' -- the previous close that a synthetic candle would carry.
+        """
+        ticker = ticker.upper()
+
+        with self._lock:
+            current = self._current_candles.get(ticker)
+            if current is not None and current.start_timestamp == bucket_start:
+                return {'eligible': False, 'reason': 'candle_in_progress'}
+
+            last_done = self._last_completed_start.get(ticker)
+            if last_done is None:
+                return {'eligible': False, 'reason': 'no_previous_candle'}
+
+            if last_done == bucket_start:
+                return {'eligible': False, 'reason': 'candle_completed'}
+
+            if last_done != bucket_start - self.interval_seconds:
+                return {
+                    'eligible': False,
+                    'reason': 'chain_broken',
+                    'last_completed_start': last_done
+                }
+
+            price = self._last_close.get(ticker)
+            if price is None:
+                return {'eligible': False, 'reason': 'no_known_close'}
+
+            return {'eligible': True, 'reason': 'would_fill', 'price': price}
+
     def get_current_candle(self, ticker: str) -> Optional[dict]:
         """Get the current in-progress candle for a ticker."""
         ticker = ticker.upper()
@@ -551,6 +618,7 @@ class CandleEngine:
             self._pending_ticker_status.pop(ticker, None)
             self._last_ticker_status_write.pop(ticker, None)
             self._last_completed_start.pop(ticker, None)
+            self._last_close.pop(ticker, None)
     
     def get_active_tickers(self) -> list:
         """Get list of tickers with active (in-progress) candles."""
