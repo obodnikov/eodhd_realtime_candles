@@ -12,17 +12,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import sys
-sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from aiohttp import web
 from aiohttp.test_utils import AioHTTPTestCase, unittest_run_loop
 
-from storage import Storage, Candle
-from config import Config, ConfigManager
-from api.routes import APIRoutes
-from api.middleware import setup_auth_middleware
-from candle_engine import CandleEngine
-from websocket_manager import WebSocketManager
+from src.storage import Storage, Candle
+from src.config import Config, ConfigManager
+from src.api.routes import APIRoutes
+from src.api.middleware import create_auth_middleware
+from src.candle_engine import CandleEngine
+from src.websocket_manager import WebSocketManager
 
 
 class TestCleanupAPIEndpoint(AioHTTPTestCase):
@@ -43,7 +43,8 @@ class TestCleanupAPIEndpoint(AioHTTPTestCase):
         config.database_path = self.temp_db.name
 
         self.storage = Storage(config.database_path)
-        config_manager = ConfigManager(config, self.storage)
+        config.persist_config = False
+        config_manager = ConfigManager(config)
 
         # Mock candle engine and websocket manager
         self.candle_engine = type('MockCandleEngine', (), {
@@ -70,7 +71,7 @@ class TestCleanupAPIEndpoint(AioHTTPTestCase):
         app['ws_manager'] = self.ws_manager
 
         # Setup middleware and routes
-        setup_auth_middleware(app, config)
+        app.middlewares.append(create_auth_middleware(config.api_key))
         APIRoutes(app)
 
         return app
@@ -294,7 +295,8 @@ class TestCleanupAPIIntegration(AioHTTPTestCase):
         config.allow_delete_all_tickers = True  # Enable for testing
 
         self.storage = Storage(config.database_path)
-        config_manager = ConfigManager(config, self.storage)
+        config.persist_config = False
+        config_manager = ConfigManager(config)
 
         self.candle_engine = type('MockCandleEngine', (), {
             'get_active_tickers': lambda: [],
@@ -318,7 +320,7 @@ class TestCleanupAPIIntegration(AioHTTPTestCase):
         app['candle_engine'] = self.candle_engine
         app['ws_manager'] = self.ws_manager
 
-        setup_auth_middleware(app, config)
+        app.middlewares.append(create_auth_middleware(config.api_key))
         APIRoutes(app)
 
         return app
@@ -388,7 +390,8 @@ class TestCleanupAPIEdgeCases(AioHTTPTestCase):
         config.database_path = self.temp_db.name
 
         self.storage = Storage(config.database_path)
-        config_manager = ConfigManager(config, self.storage)
+        config.persist_config = False
+        config_manager = ConfigManager(config)
 
         self.candle_engine = type('MockCandleEngine', (), {
             'get_active_tickers': lambda: [],
@@ -412,7 +415,7 @@ class TestCleanupAPIEdgeCases(AioHTTPTestCase):
         app['candle_engine'] = self.candle_engine
         app['ws_manager'] = self.ws_manager
 
-        setup_auth_middleware(app, config)
+        app.middlewares.append(create_auth_middleware(config.api_key))
         APIRoutes(app)
 
         return app

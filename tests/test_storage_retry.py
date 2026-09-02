@@ -103,7 +103,7 @@ class TestStorageRetryLogic:
                 is_critical=True
             )
         
-        assert operation.call_count == storage.MAX_RETRIES
+        assert operation.call_count == storage.max_retries
 
     def test_execute_with_retry_non_critical_returns_none_on_failure(self, storage):
         """Non-critical operations should return None after all retries fail."""
@@ -116,7 +116,7 @@ class TestStorageRetryLogic:
         )
         
         assert result is None
-        assert operation.call_count == storage.MAX_RETRIES
+        assert operation.call_count == storage.max_retries
 
     def test_execute_with_retry_custom_max_retries(self, storage):
         """Retry helper should respect custom max_retries parameter."""
@@ -193,7 +193,7 @@ class TestStorageRetryLogic:
             storage.update_ticker_last_request("AAPL")
         
         # Verify it tried multiple times
-        assert mock_cursor.execute.call_count == storage.MAX_RETRIES
+        assert mock_cursor.execute.call_count == storage.max_retries
 
     def test_cleanup_old_candles_with_lock_retry(self, storage, candle):
         """cleanup_old_candles should retry on database lock and not raise."""
@@ -211,12 +211,12 @@ class TestStorageRetryLogic:
             storage.cleanup_old_candles("AAPL", max_candles=100)
         
         # Verify it tried multiple times
-        assert mock_cursor.execute.call_count == storage.MAX_RETRIES
+        assert mock_cursor.execute.call_count == storage.max_retries
 
     def test_retry_configuration_constants(self, storage):
         """Verify retry configuration constants are set correctly."""
-        assert storage.MAX_RETRIES == 3
-        assert storage.RETRY_BASE_DELAY == 0.05  # 50ms
+        assert storage.max_retries == 3
+        assert storage.retry_base_delay == 0.05  # 50ms
 
     def test_concurrent_save_candle_operations(self, storage, candle):
         """Test that multiple concurrent save operations don't deadlock."""

@@ -6,6 +6,7 @@ Tests the dedicated worker that handles WebSocket connections and tick processin
 
 import pytest
 import asyncio
+import signal
 from unittest.mock import Mock, patch, AsyncMock, MagicMock
 from datetime import datetime, timezone
 
@@ -13,6 +14,52 @@ from src.websocket_worker import cleanup_task, ticker_sync_task, run_worker, set
 from src.config import Config
 from src.storage import Storage
 from src.candle_engine import CandleEngine
+
+
+def single_pass_sleep(interval):
+    """Replacement for asyncio.sleep that lets exactly one loop body run.
+
+    Worker tasks sleep at the top of their loop (cleanup_task waits 30s), so a
+    test that waits on the wall clock never reaches the body. Only the task's
+    own interval is intercepted -- the first such sleep returns at once and
+    every later one blocks until cancellation, giving exactly one iteration.
+    Any other duration falls through to the real sleep, so the test's own
+    waits keep working.
+    """
+    real_sleep = asyncio.sleep
+    calls = {'n': 0}
+
+    async def _sleep(seconds):
+        if seconds != interval:
+            await real_sleep(seconds)
+            return
+        calls['n'] += 1
+        if calls['n'] > 1:
+            await asyncio.Event().wait()
+
+    return _sleep
+
+
+async def run_worker_until_shutdown(config, settle=0.5, timeout=10):
+    """Start run_worker, let it settle, then trigger its graceful shutdown.
+
+    Cancelling the task interrupts `await shutdown_event.wait()` and unwinds
+    immediately, so the whole shutdown sequence -- completing candles, flushing
+    writes, draining pending cleanup -- never runs. Capture the SIGTERM handler
+    the worker registers and invoke it instead, which is the real path.
+    """
+    loop = asyncio.get_running_loop()
+    handlers = {}
+
+    def capture(sig, callback, *args):
+        handlers[sig] = callback
+
+    with patch.object(loop, 'add_signal_handler', capture):
+        task = asyncio.create_task(run_worker(config))
+        await asyncio.sleep(settle)
+        assert signal.SIGTERM in handlers, "worker registered no shutdown handler"
+        handlers[signal.SIGTERM]()
+        await asyncio.wait_for(task, timeout=timeout)
 
 
 class TestCleanupTask:
@@ -29,21 +76,23 @@ class TestCleanupTask:
         candle_engine.get_pending_cleanup.return_value = {'AAPL', 'MSFT'}
         candle_engine.remove_from_pending_cleanup = Mock()
         
-        # Run cleanup task for one iteration
-        task = asyncio.create_task(cleanup_task(storage, candle_engine))
-        
-        # Wait for first iteration
-        await asyncio.sleep(0.1)
-        
-        # Cancel task
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-        
+        # Run cleanup task for exactly one iteration
+        with patch('src.websocket_worker.asyncio.sleep', new=single_pass_sleep(30)):
+            task = asyncio.create_task(cleanup_task(storage, candle_engine))
+
+            # Let the single iteration run
+            await asyncio.sleep(0.05)
+
+            # Cancel task
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
         # Verify cleanup was called
         assert candle_engine.get_pending_cleanup.called
+        assert storage.cleanup_old_candles.call_count == 2
 
     @pytest.mark.asyncio
     async def test_cleanup_task_removes_ticker_after_success(self):
@@ -61,18 +110,19 @@ class TestCleanupTask:
         ]
         candle_engine.remove_from_pending_cleanup = Mock()
         
-        # Run cleanup task
-        task = asyncio.create_task(cleanup_task(storage, candle_engine))
-        
-        # Wait for processing
-        await asyncio.sleep(31)  # Wait for sleep(30) + processing
-        
-        # Cancel task
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        # Run cleanup task for exactly one iteration
+        with patch('src.websocket_worker.asyncio.sleep', new=single_pass_sleep(30)):
+            task = asyncio.create_task(cleanup_task(storage, candle_engine))
+
+            # Let the single iteration run
+            await asyncio.sleep(0.05)
+
+            # Cancel task
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         
         # Verify ticker was removed after successful cleanup
         candle_engine.remove_from_pending_cleanup.assert_called_with('AAPL')
@@ -88,18 +138,19 @@ class TestCleanupTask:
         candle_engine.get_pending_cleanup.return_value = {'AAPL'}
         candle_engine.remove_from_pending_cleanup = Mock()
         
-        # Run cleanup task
-        task = asyncio.create_task(cleanup_task(storage, candle_engine))
-        
-        # Wait for processing
-        await asyncio.sleep(31)
-        
-        # Cancel task
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        # Run cleanup task for exactly one iteration
+        with patch('src.websocket_worker.asyncio.sleep', new=single_pass_sleep(30)):
+            task = asyncio.create_task(cleanup_task(storage, candle_engine))
+
+            # Let the single iteration run
+            await asyncio.sleep(0.05)
+
+            # Cancel task
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         
         # Verify ticker was NOT removed (kept for retry)
         candle_engine.remove_from_pending_cleanup.assert_not_called()
@@ -111,18 +162,19 @@ class TestCleanupTask:
         candle_engine = Mock(spec=CandleEngine)
         candle_engine.get_pending_cleanup.return_value = set()
         
-        # Run cleanup task
-        task = asyncio.create_task(cleanup_task(storage, candle_engine))
-        
-        # Wait for one iteration
-        await asyncio.sleep(31)
-        
-        # Cancel task
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        # Run cleanup task for exactly one iteration
+        with patch('src.websocket_worker.asyncio.sleep', new=single_pass_sleep(30)):
+            task = asyncio.create_task(cleanup_task(storage, candle_engine))
+
+            # Let the single iteration run
+            await asyncio.sleep(0.05)
+
+            # Cancel task
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         
         # Verify no cleanup was attempted
         assert not storage.cleanup_old_candles.called
@@ -394,7 +446,7 @@ class TestWebSocketWorkerIntegration:
         storage.add_ticker('AAPL')
         storage.add_ticker('MSFT')
         
-        with patch('src.websocket_worker.Storage', return_value=storage):
+        with patch('src.websocket_worker.create_storage', return_value=storage):
             with patch('src.websocket_worker.WebSocketManager') as mock_ws:
                 mock_ws_instance = Mock()
                 mock_ws_instance.start = AsyncMock()
@@ -476,17 +528,9 @@ class TestWebSocketWorkerShutdown:
                 mock_ws_instance.stop = AsyncMock()
                 mock_ws.return_value = mock_ws_instance
                 
-                # Run worker briefly
-                task = asyncio.create_task(run_worker(config))
-                await asyncio.sleep(0.5)
-                
-                # Send shutdown signal
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-                
+                # Run worker, then trigger its real graceful shutdown
+                await run_worker_until_shutdown(config)
+
                 # Verify candles were completed
                 mock_engine_instance.complete_all_candles.assert_called_once()
 
@@ -503,7 +547,7 @@ class TestWebSocketWorkerShutdown:
         storage.get_ticker_symbols = Mock(return_value=[])
         storage.add_ticker = Mock()
         
-        with patch('src.websocket_worker.Storage', return_value=storage):
+        with patch('src.websocket_worker.create_storage', return_value=storage):
             with patch('src.websocket_worker.CandleEngine') as mock_engine:
                 mock_engine_instance = Mock()
                 mock_engine_instance.complete_all_candles = Mock()
@@ -519,17 +563,9 @@ class TestWebSocketWorkerShutdown:
                     mock_ws_instance.stop = AsyncMock()
                     mock_ws.return_value = mock_ws_instance
                     
-                    # Run worker briefly
-                    task = asyncio.create_task(run_worker(config))
-                    await asyncio.sleep(0.5)
-                    
-                    # Send shutdown signal
-                    task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
-                    
+                    # Run worker, then trigger its real graceful shutdown
+                    await run_worker_until_shutdown(config)
+
                     # Verify pending cleanup was processed
                     assert storage.cleanup_old_candles.call_count == 2  # AAPL + MSFT
 

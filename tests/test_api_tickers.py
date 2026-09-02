@@ -11,15 +11,15 @@ import unittest
 from pathlib import Path
 
 import sys
-sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from aiohttp import web
 from aiohttp.test_utils import AioHTTPTestCase, unittest_run_loop
 
-from storage import Storage
-from config import Config, ConfigManager
-from api.routes import APIRoutes
-from api.middleware import setup_auth_middleware
+from src.storage import Storage
+from src.config import Config, ConfigManager
+from src.api.routes import APIRoutes
+from src.api.middleware import create_auth_middleware
 
 
 class TestGetSingleTickerEndpoint(AioHTTPTestCase):
@@ -40,7 +40,8 @@ class TestGetSingleTickerEndpoint(AioHTTPTestCase):
         config.database_path = self.temp_db.name
 
         self.storage = Storage(config.database_path)
-        config_manager = ConfigManager(config, self.storage)
+        config.persist_config = False
+        config_manager = ConfigManager(config)
 
         # Mock candle engine and websocket manager
         self.candle_engine = type('MockCandleEngine', (), {
@@ -68,7 +69,7 @@ class TestGetSingleTickerEndpoint(AioHTTPTestCase):
         app['ws_manager'] = self.ws_manager
 
         # Setup middleware and routes
-        setup_auth_middleware(app, config)
+        app.middlewares.append(create_auth_middleware(config.api_key))
         APIRoutes(app)
 
         return app

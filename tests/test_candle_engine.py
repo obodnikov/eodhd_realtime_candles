@@ -104,11 +104,13 @@ class TestCandleEngineActiveTickers(unittest.TestCase):
         self.assertIsInstance(candle_summary['started'], int)
         self.assertIsInstance(candle_summary['started_ago'], str)
 
-        # Verify started_ago format (should be in minutes since timestamp is 5 minutes ago)
+        # started_ago counts from the candle's bucket start, not from the tick that
+        # created it, so derive the expected value from the reported bucket start.
         self.assertTrue(candle_summary['started_ago'].endswith('m ago'))
         minutes = int(candle_summary['started_ago'].split('m')[0])
-        self.assertGreaterEqual(minutes, 4)  # At least 4 minutes
-        self.assertLessEqual(minutes, 6)  # At most 6 minutes
+        elapsed = datetime.now(timezone.utc).timestamp() - candle_summary['started']
+        expected_minutes = int(elapsed) // 60
+        self.assertIn(minutes, (expected_minutes - 1, expected_minutes))
 
     def test_get_active_tickers_summary_multiple_tickers(self):
         """Test get_active_tickers_summary() with multiple active tickers."""
@@ -583,7 +585,12 @@ class TestCandleEngineSaveFrequency(unittest.TestCase):
         self.engine.process_tick(ticker, price, volume, timestamp_ms)
 
     def _get_db_candle(self, ticker: str):
-        """Helper to get current candle from database."""
+        """Helper to get current candle from database.
+
+        Candle writes are queued by the engine and persisted by a background
+        flush task, so flush explicitly before reading.
+        """
+        self.engine.flush_pending_candle_writes()
         return self.storage.get_current_candle(ticker)
 
     def test_first_tick_saves_to_db(self):
@@ -610,7 +617,7 @@ class TestCandleEngineSaveFrequency(unittest.TestCase):
         initial_tick_count = db_candle.tick_count
 
         # Process N-1 more ticks (should not trigger save)
-        for i in range(1, self.engine.SAVE_EVERY_N_TICKS - 1):
+        for i in range(1, self.engine.save_every_n_ticks - 1):
             self._simulate_tick('AAPL', 150.0 + i, 100, timestamp + i * 1000)
 
         # DB should still show initial tick count
@@ -625,13 +632,13 @@ class TestCandleEngineSaveFrequency(unittest.TestCase):
         self._simulate_tick('AAPL', 150.0, 100, timestamp)
 
         # Process exactly N-1 more ticks to reach threshold
-        for i in range(1, self.engine.SAVE_EVERY_N_TICKS):
+        for i in range(1, self.engine.save_every_n_ticks):
             self._simulate_tick('AAPL', 150.0 + i, 100, timestamp + i * 1000)
 
         # DB should now show all ticks
         db_candle = self._get_db_candle('AAPL')
-        self.assertEqual(db_candle.tick_count, self.engine.SAVE_EVERY_N_TICKS)
-        self.assertEqual(db_candle.close, 150.0 + self.engine.SAVE_EVERY_N_TICKS - 1)
+        self.assertEqual(db_candle.tick_count, self.engine.save_every_n_ticks)
+        self.assertEqual(db_candle.close, 150.0 + self.engine.save_every_n_ticks - 1)
 
     def test_time_threshold_triggers_save(self):
         """Test that SAVE_EVERY_M_SECONDS threshold triggers DB save."""
@@ -641,7 +648,7 @@ class TestCandleEngineSaveFrequency(unittest.TestCase):
         self._simulate_tick('AAPL', 150.0, 100, timestamp)
 
         # Wait for time threshold
-        sleep(self.engine.SAVE_EVERY_M_SECONDS + 0.5)
+        sleep(self.engine.save_every_m_seconds + 0.5)
 
         # Process one more tick (should trigger time-based save)
         self._simulate_tick('AAPL', 151.0, 100, timestamp + 1000)
@@ -659,27 +666,27 @@ class TestCandleEngineSaveFrequency(unittest.TestCase):
         self._simulate_tick('AAPL', 150.0, 100, timestamp)
 
         # Process N ticks to trigger first save
-        for i in range(1, self.engine.SAVE_EVERY_N_TICKS):
+        for i in range(1, self.engine.save_every_n_ticks):
             self._simulate_tick('AAPL', 150.0 + i, 100, timestamp + i * 1000)
 
         # Verify save happened
         db_candle = self._get_db_candle('AAPL')
-        self.assertEqual(db_candle.tick_count, self.engine.SAVE_EVERY_N_TICKS)
+        self.assertEqual(db_candle.tick_count, self.engine.save_every_n_ticks)
 
         # Process N-1 more ticks (should not save yet)
-        for i in range(self.engine.SAVE_EVERY_N_TICKS - 1):
-            self._simulate_tick('AAPL', 160.0 + i, 100, timestamp + (self.engine.SAVE_EVERY_N_TICKS + i) * 1000)
+        for i in range(self.engine.save_every_n_ticks - 1):
+            self._simulate_tick('AAPL', 160.0 + i, 100, timestamp + (self.engine.save_every_n_ticks + i) * 1000)
 
         # DB should still show old tick count
         db_candle = self._get_db_candle('AAPL')
-        self.assertEqual(db_candle.tick_count, self.engine.SAVE_EVERY_N_TICKS)
+        self.assertEqual(db_candle.tick_count, self.engine.save_every_n_ticks)
 
         # One more tick should trigger next save
-        self._simulate_tick('AAPL', 170.0, 100, timestamp + (self.engine.SAVE_EVERY_N_TICKS * 2) * 1000)
+        self._simulate_tick('AAPL', 170.0, 100, timestamp + (self.engine.save_every_n_ticks * 2) * 1000)
 
         # DB should now show updated tick count
         db_candle = self._get_db_candle('AAPL')
-        self.assertEqual(db_candle.tick_count, self.engine.SAVE_EVERY_N_TICKS * 2)
+        self.assertEqual(db_candle.tick_count, self.engine.save_every_n_ticks * 2)
 
     def test_candle_completion_always_saves(self):
         """Test that candle completion always saves to DB regardless of thresholds."""
@@ -695,7 +702,8 @@ class TestCandleEngineSaveFrequency(unittest.TestCase):
         timestamp2 = int(datetime(2025, 1, 1, 12, 5, 0, tzinfo=timezone.utc).timestamp() * 1000)
         self._simulate_tick('AAPL', 153.0, 100, timestamp2)
 
-        # Get completed candles from DB
+        # Get completed candles from DB (writes are queued, so flush first)
+        self.engine.flush_pending_candle_writes()
         candles = self.storage.get_candles('AAPL', count=10, include_current=False)
 
         # Should have 1 completed candle with 3 ticks
@@ -708,7 +716,7 @@ class TestCandleEngineSaveFrequency(unittest.TestCase):
         timestamp = int(datetime(2025, 1, 1, 12, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
 
         # AAPL: Process N ticks (should trigger save)
-        for i in range(self.engine.SAVE_EVERY_N_TICKS):
+        for i in range(self.engine.save_every_n_ticks):
             self._simulate_tick('AAPL', 150.0 + i, 100, timestamp + i * 1000)
 
         # MSFT: Process only 2 ticks (should not trigger save after first)
@@ -717,7 +725,7 @@ class TestCandleEngineSaveFrequency(unittest.TestCase):
 
         # AAPL should be saved with N ticks
         aapl_candle = self._get_db_candle('AAPL')
-        self.assertEqual(aapl_candle.tick_count, self.engine.SAVE_EVERY_N_TICKS)
+        self.assertEqual(aapl_candle.tick_count, self.engine.save_every_n_ticks)
 
         # MSFT should only show first tick in DB
         msft_candle = self._get_db_candle('MSFT')
@@ -728,12 +736,12 @@ class TestCandleEngineSaveFrequency(unittest.TestCase):
         timestamp = int(datetime(2025, 1, 1, 12, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
 
         # Process ticks rapidly (no time delay)
-        for i in range(self.engine.SAVE_EVERY_N_TICKS + 5):
+        for i in range(self.engine.save_every_n_ticks + 5):
             self._simulate_tick('AAPL', 150.0 + i, 100, timestamp + i * 100)  # 100ms apart
 
         # Should have saved at tick threshold (N) but not the extra 5
         db_candle = self._get_db_candle('AAPL')
-        self.assertEqual(db_candle.tick_count, self.engine.SAVE_EVERY_N_TICKS)
+        self.assertEqual(db_candle.tick_count, self.engine.save_every_n_ticks)
 
     def test_slow_ticks_respect_time_threshold(self):
         """Test that slow ticks (exceeding time threshold) save based on time."""
@@ -743,7 +751,7 @@ class TestCandleEngineSaveFrequency(unittest.TestCase):
         self._simulate_tick('AAPL', 150.0, 100, timestamp)
 
         # Wait for time threshold
-        sleep(self.engine.SAVE_EVERY_M_SECONDS + 0.5)
+        sleep(self.engine.save_every_m_seconds + 0.5)
 
         # Second tick (should trigger time-based save)
         self._simulate_tick('AAPL', 151.0, 100, timestamp + 1000)
@@ -758,7 +766,7 @@ class TestCandleEngineSaveFrequency(unittest.TestCase):
         timestamp1 = int(datetime(2025, 1, 1, 12, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
 
         # Process many ticks in first candle
-        for i in range(self.engine.SAVE_EVERY_N_TICKS * 2):
+        for i in range(self.engine.save_every_n_ticks * 2):
             self._simulate_tick('AAPL', 150.0 + i, 100, timestamp1 + i * 1000)
 
         # Move to next interval (completes candle and starts new one)
@@ -782,7 +790,7 @@ class TestCandleEngineSaveFrequency(unittest.TestCase):
             self._simulate_tick('AAPL', price, 100, timestamp + i * 1000)
 
         # Force save by reaching threshold
-        for i in range(self.engine.SAVE_EVERY_N_TICKS - len(prices)):
+        for i in range(self.engine.save_every_n_ticks - len(prices)):
             self._simulate_tick('AAPL', 150.0, 100, timestamp + (len(prices) + i) * 1000)
 
         # Verify OHLCV is correct
@@ -802,12 +810,12 @@ class TestCandleEngineSaveFrequency(unittest.TestCase):
             self._simulate_tick('AAPL', 150.0, volume, timestamp + i * 1000)
 
         # Force save
-        for i in range(self.engine.SAVE_EVERY_N_TICKS - len(volumes)):
+        for i in range(self.engine.save_every_n_ticks - len(volumes)):
             self._simulate_tick('AAPL', 150.0, 100, timestamp + (len(volumes) + i) * 1000)
 
         # Verify volume is correct sum
         db_candle = self._get_db_candle('AAPL')
-        expected_volume = sum(volumes) + (100 * (self.engine.SAVE_EVERY_N_TICKS - len(volumes)))
+        expected_volume = sum(volumes) + (100 * (self.engine.save_every_n_ticks - len(volumes)))
         self.assertEqual(db_candle.volume, expected_volume)
 
 
