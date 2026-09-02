@@ -5,4 +5,6 @@ This module provides a Flask-based web interface for managing
 the candle aggregator service.
 """
 
-__version__ = '0.6.0'
+from .. import __version__
+
+__all__ = ['__version__']

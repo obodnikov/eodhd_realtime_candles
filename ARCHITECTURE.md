@@ -1,7 +1,7 @@
 # ARCHITECTURE.md
 
-**Version**: 0.9.4
-**Last Updated**: 2026-02-20
+**Version**: 0.9.9
+**Last Updated**: 2026-09-02
 **Project**: EODHD Real-Time Candle Aggregator
 
 ---
@@ -62,7 +62,7 @@ Architecture pattern (multi-worker):
 └─────────────────────────────────────────────────────────────┘
 ```
 
-Key benefits (v0.9.4):
+Key benefits (v0.9.9):
 - Isolated tick ingestion and aggregation in dedicated worker
 - Backpressure via bounded tick queue to avoid unbounded async task growth
 - Reduced lock hold time by asynchronous candle/status flush paths
@@ -158,7 +158,7 @@ WebSocket worker background tasks:
 REST request -> auth middleware (`X-API-Key` / bearer / query) -> route -> storage/service.
 `/health` remains low-cost and should avoid DB dependency.
 
-### 5.2 Tick-to-Candle Flow (v0.9.4)
+### 5.2 Tick-to-Candle Flow (v0.9.9)
 
 ```
 EODHD message

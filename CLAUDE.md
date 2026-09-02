@@ -7,7 +7,7 @@ data 2–3 hours after close; this service fills that gap with sub-100ms candle 
 defining characteristic is a multi-worker architecture (isolated WebSocket ingest + parallel API
 workers) sharing a single SQLite-WAL or PostgreSQL backend under supervisord.
 
-> Status: **implemented and in use** — v0.9.4. Multi-worker ingest/aggregation, REST API, admin UI,
+> Status: **implemented and in use** — v0.9.9. Multi-worker ingest/aggregation, REST API, admin UI,
 > and SQLite/PostgreSQL backends are built and covered by pytest.
 > [ARCHITECTURE.md](ARCHITECTURE.md) is the authoritative design source; [ROADMAP.md](ROADMAP.md)
 > tracks planned work.
@@ -33,6 +33,29 @@ workers) sharing a single SQLite-WAL or PostgreSQL backend under supervisord.
 | [AI_POSTGRESQL.md](AI_POSTGRESQL.md) | PostgreSQL persistence + migrations — `src/storage_postgres.py`, `scripts/init_postgres.sql` |
 
 `ARCHITECTURE.md` and the `AI_*.md` files must not redefine or duplicate each other's content.
+
+## Versioning and changelog
+
+The service version lives in **one place**: `__version__` in
+[src/\_\_init\_\_.py](src/__init__.py). Nothing else defines a version number — no
+second constant in a submodule, no number hard-coded in a document. `GET /health`
+and `GET /status` both return it, so a running deployment can always be compared
+against this repository.
+
+- **Semantic versioning.** Patch for fixes, minor for backwards-compatible
+  features, major for a breaking change to the REST contract or the schema.
+- **Every user-visible change adds its [CHANGELOG.md](CHANGELOG.md) entry in the
+  same commit as the change** — not afterwards, not at release time. A change
+  nobody outside the repository can observe (a refactor, a test repair) may be
+  folded into the next release's entry instead of getting its own.
+- **A release bumps `__version__`, updates the version headers in
+  [README.md](README.md) and [ARCHITECTURE.md](ARCHITECTURE.md), and creates a
+  matching git tag**, together, in one commit.
+- **Never invent history.** If entries have to be reconstructed after the fact,
+  say so and cite the commits, as the 0.9.5–0.9.8 entries do.
+
+This rule exists because it was not written down before: versions 0.9.5 through
+0.9.8 shipped to production while the documentation still said 0.9.4.
 
 ## Working agreement
 

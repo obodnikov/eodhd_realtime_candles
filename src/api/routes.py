@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 from aiohttp import web
 
+from .. import __version__
+
 if TYPE_CHECKING:
     from ..config import ConfigManager
     from ..storage import Storage
@@ -87,6 +89,7 @@ class APIRoutes:
         logger.debug("Health check endpoint called")
         return web.json_response({
             'status': 'healthy',
+            'version': __version__,
             'timestamp': datetime.now(timezone.utc).isoformat()
         })
     
@@ -141,6 +144,7 @@ class APIRoutes:
         overrides = self.config_manager.get_overrides()
 
         return web.json_response({
+            'version': __version__,
             'websocket': ws_status,
             'database': db_stats,
             'config': self.config_manager.config.get_public_config(
