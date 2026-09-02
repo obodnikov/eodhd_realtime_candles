@@ -184,6 +184,28 @@ def create_app() -> Flask:
             flash(f'Error loading configuration: {str(e)}', 'danger')
             return render_template('config.html', config=None)
 
+    @app.route('/logs')
+    @login_required
+    def logs():
+        """Log viewer page - shows recent warnings and errors."""
+        try:
+            level_filter = request.args.get('level', None)
+            if level_filter:
+                level_filter = level_filter.upper().strip()
+                if level_filter not in ('WARNING', 'ERROR'):
+                    level_filter = None
+            log_data = api_client.get_logs(limit=200, level=level_filter)
+            return render_template(
+                'logs.html',
+                entries=log_data.get('entries', []),
+                total_buffered=log_data.get('returned_count', 0),
+                level_filter=level_filter
+            )
+        except Exception as e:
+            logger.error(f"Failed to load logs: {e}")
+            flash(f'Error loading logs: {str(e)}', 'danger')
+            return render_template('logs.html', entries=[], total_buffered=0, level_filter=None)
+
     # =========================================================================
     # API Routes - AJAX endpoints
     # =========================================================================
@@ -258,6 +280,27 @@ def create_app() -> Flask:
             return jsonify({'success': True, 'result': result})
         except Exception as e:
             logger.error(f"Failed to reconnect: {e}")
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    @app.route('/api/logs')
+    @login_required
+    def api_logs():
+        """Get logs via AJAX (for auto-refresh)."""
+        try:
+            level_filter = request.args.get('level', None)
+            if level_filter:
+                level_filter = level_filter.upper().strip()
+                if level_filter not in ('WARNING', 'ERROR'):
+                    return jsonify({'success': False, 'error': 'Invalid level, must be WARNING or ERROR'}), 400
+            try:
+                limit = int(request.args.get('limit', 100))
+            except (ValueError, TypeError):
+                return jsonify({'success': False, 'error': 'Invalid limit parameter'}), 400
+            limit = max(1, min(limit, 500))
+            result = api_client.get_logs(limit=limit, level=level_filter)
+            return jsonify({'success': True, 'result': result})
+        except Exception as e:
+            logger.error(f"Failed to get logs: {e}")
             return jsonify({'success': False, 'error': str(e)}), 500
 
     @app.route('/api/candles/<ticker>')

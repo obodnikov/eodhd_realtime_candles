@@ -45,6 +45,10 @@ def setup_logging(level: str):
     # Reduce noise from libraries
     logging.getLogger('aiohttp').setLevel(logging.WARNING)
 
+    # Install in-memory log buffer for admin panel
+    from .log_buffer import install_log_buffer
+    install_log_buffer()
+
 
 async def create_app(config: Config) -> web.Application:
     """Create and configure the API application."""
@@ -64,6 +68,10 @@ async def create_app(config: Config) -> web.Application:
     # Initialize components (read-only mode for API workers)
     config_manager = ConfigManager(config)
     storage = create_storage(config)
+
+    # Attach storage to log buffer for cross-process log persistence
+    from .log_buffer import get_log_buffer
+    get_log_buffer().set_storage(storage)
     
     # CandleEngine in read-only mode (no tick processing)
     candle_engine = CandleEngine(

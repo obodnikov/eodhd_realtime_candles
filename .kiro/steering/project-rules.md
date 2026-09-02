@@ -17,7 +17,7 @@ This project uses AI*.md files for coding guidelines. The specific files vary by
 
 Before any code changes:
 - Find all `AI*.md` files in project root
-- Read each one relevant to the task (e.g., AI_SQLite.md for database work)
+- Read each one relevant to the task (e.g., AI_SQLITE.md for database work)
 - Follow stack-specific rules strictly
 - Do not redefine or duplicate rules from these files
 

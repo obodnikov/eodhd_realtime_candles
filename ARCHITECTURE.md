@@ -251,12 +251,13 @@ This document does not define coding standards; it references rule sources.
 Primary rule files:
 - `~/.codex/AGENTS.md` (confirm-before-action workflow)
 - `.kiro/steering/project-rules.md` (rule discovery/priority contract)
-- `CLAUDE.md` (assistant behavior contract)
+- `CLAUDE.md` (assistant behavior contract + rule-file index)
 - `AI.md` (general Python rules)
-- `AI-PYTHON-REST-API.md` (REST patterns)
-- `AI_FLASK.md` (Flask patterns)
-- `AI_SQLite.md` (SQLite performance rules)
-- `AI_PostgreSQL.md` (PostgreSQL migration/runtime rules)
+- `AI_REST_API.md` (aiohttp REST layer: `src/api/**`, `src/api_server.py`, `src/main.py`)
+- `AI_WEBSOCKET_ENGINE.md` (tick ingest + aggregation: `src/websocket_worker.py`, `src/websocket_manager.py`, `src/candle_engine.py`, `src/candle_aggregator.py`)
+- `AI_FLASK.md` (admin UI: `src/admin/**`)
+- `AI_SQLITE.md` (SQLite performance rules: `src/storage.py`)
+- `AI_POSTGRESQL.md` (PostgreSQL migration/runtime rules: `src/storage_postgres.py`, `scripts/init_postgres.sql`)
 
 Precedence (high -> low):
 1. Explicit user instruction

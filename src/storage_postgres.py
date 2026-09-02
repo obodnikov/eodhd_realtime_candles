@@ -250,6 +250,18 @@ class PostgreSQLStorage:
                 updated_at TEXT NOT NULL
             )
         ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS log_entries (
+                id BIGSERIAL PRIMARY KEY,
+                timestamp TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                level VARCHAR(10) NOT NULL,
+                logger VARCHAR(200) NOT NULL,
+                message TEXT NOT NULL
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_log_entries_timestamp ON log_entries(timestamp DESC)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_log_entries_level ON log_entries(level)')
     
     def close(self):
         """Close connection pool."""
@@ -828,6 +840,52 @@ class PostgreSQLStorage:
     # WebSocket Status (Multi-Worker Status Sharing)
     # =========================================================================
     
+    RECONNECT_REQUEST_KEY = 'websocket_reconnect_requested_at'
+
+    def request_websocket_reconnect(self) -> str:
+        """
+        Record an operator request to reconnect the EODHD feed.
+
+        API workers hold a dummy WebSocketManager and cannot reconnect the feed
+        themselves, so the request travels through the database and the
+        WebSocket worker acts on it — the same route ticker changes take.
+
+        Returns the request timestamp (ISO 8601, UTC).
+        """
+        requested_at = datetime.now(timezone.utc).isoformat()
+
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO config (key, value, updated_at)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (key) DO UPDATE SET
+                    value = EXCLUDED.value,
+                    updated_at = EXCLUDED.updated_at
+            ''', (self.RECONNECT_REQUEST_KEY, requested_at, requested_at))
+            conn.commit()
+        finally:
+            self._put_connection(conn)
+
+        return requested_at
+
+    def get_websocket_reconnect_request(self) -> Optional[str]:
+        """
+        Read the most recent reconnect request timestamp, or None if never set.
+        """
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                'SELECT value FROM config WHERE key = %s',
+                (self.RECONNECT_REQUEST_KEY,)
+            )
+            row = cursor.fetchone()
+            return row[0] if row else None
+        finally:
+            self._put_connection(conn)
+
     def update_websocket_status(self, status: Dict[str, Any]):
         """Update WebSocket status in database for multi-worker visibility."""
         conn = self._get_connection()
@@ -1055,5 +1113,91 @@ class PostgreSQLStorage:
             except (json.JSONDecodeError, TypeError) as e:
                 logger.error(f"Failed to parse active candles JSON: {e}")
                 return None
+        finally:
+            self._put_connection(conn)
+
+    def save_log_entry(self, level: str, logger_name: str, message: str):
+        """Save a log entry to the database for cross-process visibility."""
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                '''INSERT INTO log_entries (level, logger, message)
+                   VALUES (%s, %s, %s)''',
+                (level, logger_name, message)
+            )
+            # Periodic cleanup: keep only last 1000 entries
+            # Use a probabilistic approach (1 in 50 inserts) to avoid overhead
+            import random
+            if random.randint(1, 50) == 1:
+                cursor.execute(
+                    '''DELETE FROM log_entries
+                       WHERE id NOT IN (
+                           SELECT id FROM log_entries ORDER BY timestamp DESC LIMIT 1000
+                       )'''
+                )
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            # Don't log here to avoid recursion
+        finally:
+            self._put_connection(conn)
+
+    def get_log_entries(self, limit: int = 100, level: str = None) -> list:
+        """
+        Get recent log entries from the database, newest first.
+        
+        Args:
+            limit: Max entries to return.
+            level: Filter by level ('WARNING', 'ERROR') or None for both.
+        """
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor(cursor_factory=extras.RealDictCursor)
+            if level:
+                cursor.execute(
+                    '''SELECT timestamp, level, logger, message
+                       FROM log_entries
+                       WHERE level = %s
+                       ORDER BY timestamp DESC
+                       LIMIT %s''',
+                    (level.upper(), limit)
+                )
+            else:
+                cursor.execute(
+                    '''SELECT timestamp, level, logger, message
+                       FROM log_entries
+                       ORDER BY timestamp DESC
+                       LIMIT %s''',
+                    (limit,)
+                )
+            rows = cursor.fetchall()
+            return [
+                {
+                    'timestamp': row['timestamp'].isoformat() if row['timestamp'] else '',
+                    'level': row['level'],
+                    'logger': row['logger'],
+                    'message': row['message'],
+                }
+                for row in rows
+            ]
+        finally:
+            self._put_connection(conn)
+
+    def cleanup_old_log_entries(self, max_entries: int = 1000):
+        """Keep only the most recent N log entries."""
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                '''DELETE FROM log_entries
+                   WHERE id NOT IN (
+                       SELECT id FROM log_entries ORDER BY timestamp DESC LIMIT %s
+                   )''',
+                (max_entries,)
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
         finally:
             self._put_connection(conn)

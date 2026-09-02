@@ -1,0 +1,140 @@
+{% extends "base.html" %}
+
+{% block title %}Logs{% endblock %}
+
+{% block content %}
+<section class="section">
+    <div class="container">
+        <div class="section-header">
+            <h1>System Logs</h1>
+            <p>Recent warnings and errors (showing {{ total_buffered }} entries)</p>
+        </div>
+
+        <!-- Filter Controls -->
+        <div class="card" style="margin-bottom: 1.5rem;">
+            <div class="card-header" style="display: flex; align-items: center; gap: 1rem; flex-wrap: wrap;">
+                <h3 class="card-title" style="margin: 0;">Filter</h3>
+                <a href="{{ url_for('logs') }}" class="btn btn-small {% if not level_filter %}btn-primary{% else %}btn-secondary{% endif %}">All</a>
+                <a href="{{ url_for('logs', level='WARNING') }}" class="btn btn-small {% if level_filter == 'WARNING' %}btn-primary{% else %}btn-secondary{% endif %}">Warnings</a>
+                <a href="{{ url_for('logs', level='ERROR') }}" class="btn btn-small {% if level_filter == 'ERROR' %}btn-primary{% else %}btn-secondary{% endif %}">Errors</a>
+                <span style="margin-left: auto; color: var(--text-muted); font-size: 0.85rem;" id="auto-refresh-status">Auto-refresh: 10s</span>
+            </div>
+        </div>
+
+        <!-- Log Entries -->
+        <div class="card">
+            <div class="card-header">
+                <h3 class="card-title">Log Entries (<span id="log-count">{{ entries|length }}</span> shown)</h3>
+            </div>
+            <div class="table-responsive">
+                <table class="table" id="log-table">
+                    <thead>
+                        <tr>
+                            <th style="width: 180px;">Timestamp</th>
+                            <th style="width: 80px;">Level</th>
+                            <th style="width: 180px;">Logger</th>
+                            <th>Message</th>
+                        </tr>
+                    </thead>
+                    <tbody id="log-tbody">
+                        {% if entries %}
+                        {% for entry in entries %}
+                        <tr class="log-{{ entry.level|lower }}">
+                            <td class="text-muted" style="font-size: 0.85rem; white-space: nowrap;">{{ entry.timestamp[:19] }}</td>
+                            <td>
+                                <span class="status-badge status-{{ 'danger' if entry.level == 'ERROR' else 'warning' }}">
+                                    {{ entry.level }}
+                                </span>
+                            </td>
+                            <td class="text-muted" style="font-size: 0.85rem;">{{ entry.logger }}</td>
+                            <td style="font-family: monospace; font-size: 0.85rem; word-break: break-word;">{{ entry.message }}</td>
+                        </tr>
+                        {% endfor %}
+                        {% else %}
+                        <tr id="empty-row">
+                            <td colspan="4" style="text-align: center; padding: 2rem; color: var(--text-muted);">
+                                No log entries found{% if level_filter %} for level "{{ level_filter }}"{% endif %}. Warnings and errors will appear here when they occur.
+                            </td>
+                        </tr>
+                        {% endif %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</section>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+// Auto-refresh logs every 10 seconds
+let refreshInterval = null;
+const REFRESH_SECONDS = 10;
+
+async function refreshLogs() {
+    try {
+        const params = new URLSearchParams();
+        params.set('limit', '200');
+        {% if level_filter %}
+        params.set('level', '{{ level_filter }}');
+        {% endif %}
+
+        const response = await fetch('/api/logs?' + params.toString());
+        const data = await response.json();
+
+        if (data.success && data.result && data.result.entries) {
+            updateLogTable(data.result.entries);
+        }
+    } catch (error) {
+        console.error('Failed to refresh logs:', error);
+    }
+}
+
+function updateLogTable(entries) {
+    const tbody = document.getElementById('log-tbody');
+    const countEl = document.getElementById('log-count');
+    if (!tbody) return;
+
+    if (countEl) countEl.textContent = entries.length;
+
+    if (entries.length === 0) {
+        tbody.innerHTML = '<tr id="empty-row"><td colspan="4" style="text-align: center; padding: 2rem; color: var(--text-muted);">No entries</td></tr>';
+        return;
+    }
+
+    tbody.innerHTML = entries.map(entry => {
+        const levelClass = entry.level === 'ERROR' ? 'danger' : 'warning';
+        return `<tr class="log-${entry.level.toLowerCase()}">
+            <td class="text-muted" style="font-size: 0.85rem; white-space: nowrap;">${entry.timestamp.substring(0, 19)}</td>
+            <td><span class="status-badge status-${levelClass}">${entry.level}</span></td>
+            <td class="text-muted" style="font-size: 0.85rem;">${escapeHtml(entry.logger)}</td>
+            <td style="font-family: monospace; font-size: 0.85rem; word-break: break-word;">${escapeHtml(entry.message)}</td>
+        </tr>`;
+    }).join('');
+}
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+// Start auto-refresh
+document.addEventListener('DOMContentLoaded', function() {
+    refreshInterval = setInterval(refreshLogs, REFRESH_SECONDS * 1000);
+});
+</script>
+
+<style>
+.log-error td {
+    background-color: rgba(220, 53, 69, 0.05);
+}
+.log-warning td {
+    background-color: rgba(255, 193, 7, 0.05);
+}
+.status-warning {
+    background-color: #ffc107;
+    color: #212529;
+}
+</style>
+{% endblock %}

@@ -85,6 +85,19 @@ class APIClient:
         """Get detailed system status."""
         return self._request('GET', '/status')
 
+    def get_logs(self, limit: int = 100, level: str = None) -> Dict[str, Any]:
+        """
+        Get recent WARNING/ERROR log entries.
+        
+        Args:
+            limit: Max entries to return.
+            level: Filter by level ('WARNING', 'ERROR', or None for both).
+        """
+        params = {'limit': limit}
+        if level:
+            params['level'] = level
+        return self._request('GET', '/logs', params=params)
+
     def reconnect_websocket(self) -> Dict[str, Any]:
         """Force WebSocket reconnection."""
         return self._request('POST', '/reconnect')
