@@ -559,10 +559,6 @@ class TestCandleEngineBasicFunctionality(unittest.TestCase):
         self.assertIn('MSFT', active)
 
 
-if __name__ == '__main__':
-    unittest.main()
-
-
 class TestCandleEngineSaveFrequency(unittest.TestCase):
     """Test cases for tick-save frequency optimization."""
 
@@ -1035,6 +1031,236 @@ class TestCandleEngineTickGuards(unittest.TestCase):
         self.assertEqual(current.close, 91.57)
         metrics = self.engine.get_candle_write_metrics()
         self.assertEqual(metrics["out_of_order_tick_dropped_count"], 1)
+
+
+class TestCandleEngineTimeBasedClose(unittest.TestCase):
+    """Time-based candle closing (close_due_candles) and the late-tick guard.
+
+    Every case passes now_timestamp explicitly, so nothing depends on the clock.
+    """
+
+    INTERVAL_MINUTES = 1
+    INTERVAL_SECONDS = 60
+
+    def setUp(self):
+        self.temp_db = tempfile.NamedTemporaryFile(delete=False, suffix='.db')
+        self.temp_db.close()
+        self.storage = Storage(self.temp_db.name)
+        self.engine = CandleEngine(
+            self.storage,
+            interval_minutes=self.INTERVAL_MINUTES,
+            max_candles=100
+        )
+        # A fixed bucket boundary to build every case around.
+        self.bucket = int(
+            datetime(2026, 3, 2, 14, 30, 0, tzinfo=timezone.utc).timestamp()
+        )
+
+    def tearDown(self):
+        try:
+            os.unlink(self.temp_db.name)
+        except Exception:
+            pass
+
+    def _tick(self, ticker, price, volume, offset_seconds):
+        """Send a tick at bucket start + offset_seconds."""
+        self.engine.process_tick(
+            ticker, price, volume, (self.bucket + offset_seconds) * 1000
+        )
+
+    def _completed(self, ticker):
+        """Completed candles as persisted, flushing the write queue first."""
+        self.engine.flush_pending_candle_writes()
+        return self.storage.get_candles(ticker, count=10, include_current=False)
+
+    def test_ended_bucket_is_closed_without_a_following_tick(self):
+        """A bucket with ticks and no next tick is completed on time."""
+        self._tick('AAPL', 150.0, 100, 10)
+        self._tick('AAPL', 152.0, 200, 20)
+
+        # Nothing is complete while the bucket is still open.
+        self.assertEqual(self._completed('AAPL'), [])
+
+        closed = self.engine.close_due_candles(
+            now_timestamp=self.bucket + self.INTERVAL_SECONDS + 2,
+            grace_seconds=2.0
+        )
+
+        self.assertEqual(len(closed), 1)
+        self.assertEqual(closed[0].ticker, 'AAPL')
+        self.assertEqual(closed[0].timestamp, self.bucket)
+
+        candles = self._completed('AAPL')
+        self.assertEqual(len(candles), 1)
+        self.assertEqual(candles[0].open, 150.0)
+        self.assertEqual(candles[0].close, 152.0)
+        self.assertEqual(candles[0].volume, 300)
+        self.assertEqual(candles[0].tick_count, 2)
+        self.assertTrue(candles[0].is_complete)
+
+        # And it is no longer an in-progress candle.
+        self.assertNotIn('AAPL', self.engine.get_active_tickers())
+
+    def test_no_close_inside_the_grace_window(self):
+        """The bucket has ended but the grace period has not elapsed."""
+        self._tick('AAPL', 150.0, 100, 10)
+
+        closed = self.engine.close_due_candles(
+            now_timestamp=self.bucket + self.INTERVAL_SECONDS + 1,
+            grace_seconds=2.0
+        )
+
+        self.assertEqual(closed, [])
+        self.assertEqual(self._completed('AAPL'), [])
+        self.assertIn('AAPL', self.engine.get_active_tickers())
+
+        # One second later it is due.
+        closed = self.engine.close_due_candles(
+            now_timestamp=self.bucket + self.INTERVAL_SECONDS + 2,
+            grace_seconds=2.0
+        )
+        self.assertEqual(len(closed), 1)
+
+    def test_open_bucket_is_left_alone(self):
+        """A bucket whose interval has not ended is never closed."""
+        self._tick('AAPL', 150.0, 100, 10)
+
+        closed = self.engine.close_due_candles(
+            now_timestamp=self.bucket + 30,
+            grace_seconds=0.0
+        )
+
+        self.assertEqual(closed, [])
+        self.assertIn('AAPL', self.engine.get_active_tickers())
+
+    def test_second_call_does_not_reclose_or_duplicate(self):
+        """Closing is idempotent; a second call finds nothing to do."""
+        self._tick('AAPL', 150.0, 100, 10)
+        now = self.bucket + self.INTERVAL_SECONDS + 2
+
+        first = self.engine.close_due_candles(now_timestamp=now, grace_seconds=2.0)
+        second = self.engine.close_due_candles(now_timestamp=now, grace_seconds=2.0)
+
+        self.assertEqual(len(first), 1)
+        self.assertEqual(second, [])
+        self.assertEqual(len(self._completed('AAPL')), 1)
+
+    def test_late_tick_for_a_closed_bucket_is_dropped(self):
+        """A late tick must not replace a properly closed bar."""
+        self._tick('AAPL', 150.0, 100, 10)
+        self._tick('AAPL', 152.0, 200, 20)
+        self.engine.close_due_candles(
+            now_timestamp=self.bucket + self.INTERVAL_SECONDS + 2,
+            grace_seconds=2.0
+        )
+
+        before = self._completed('AAPL')[0]
+
+        # A trade stamped inside the closed bucket arrives afterwards.
+        self._tick('AAPL', 999.0, 5000, 30)
+
+        after = self._completed('AAPL')
+        self.assertEqual(len(after), 1)
+        self.assertEqual(after[0].open, before.open)
+        self.assertEqual(after[0].high, before.high)
+        self.assertEqual(after[0].low, before.low)
+        self.assertEqual(after[0].close, before.close)
+        self.assertEqual(after[0].volume, before.volume)
+        self.assertEqual(after[0].tick_count, before.tick_count)
+
+        # No candle was resurrected, and the drop was counted.
+        self.assertNotIn('AAPL', self.engine.get_active_tickers())
+        metrics = self.engine.get_candle_write_metrics()
+        self.assertEqual(metrics['late_tick_dropped_count'], 1)
+
+    def test_tick_for_the_next_bucket_is_processed_normally(self):
+        """Closing one bucket must not block the bucket that follows it."""
+        self._tick('AAPL', 150.0, 100, 10)
+        self.engine.close_due_candles(
+            now_timestamp=self.bucket + self.INTERVAL_SECONDS + 2,
+            grace_seconds=2.0
+        )
+
+        # A tick in the next interval.
+        self._tick('AAPL', 160.0, 300, self.INTERVAL_SECONDS + 5)
+
+        current = self.engine.get_current_candle('AAPL')
+        self.assertIsNotNone(current)
+        self.assertEqual(current['timestamp'], self.bucket + self.INTERVAL_SECONDS)
+        self.assertEqual(current['open'], 160.0)
+        self.assertEqual(current['tick_count'], 1)
+
+        metrics = self.engine.get_candle_write_metrics()
+        self.assertEqual(metrics['late_tick_dropped_count'], 0)
+
+    def test_only_due_tickers_are_closed(self):
+        """Tickers are closed independently, by their own bucket."""
+        self._tick('AAPL', 150.0, 100, 10)
+        # MSFT trades in the following interval, so its bucket is still open.
+        self._tick('MSFT', 300.0, 100, self.INTERVAL_SECONDS + 10)
+
+        closed = self.engine.close_due_candles(
+            now_timestamp=self.bucket + self.INTERVAL_SECONDS + 20,
+            grace_seconds=2.0
+        )
+
+        self.assertEqual([c.ticker for c in closed], ['AAPL'])
+        self.assertIn('MSFT', self.engine.get_active_tickers())
+
+    def test_completion_callback_fires_for_a_timer_closed_candle(self):
+        """A timer-closed candle is indistinguishable from a tick-closed one."""
+        seen = []
+        self.engine.set_on_candle_complete(seen.append)
+
+        self._tick('AAPL', 150.0, 100, 10)
+        self.engine.close_due_candles(
+            now_timestamp=self.bucket + self.INTERVAL_SECONDS + 2,
+            grace_seconds=2.0
+        )
+
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0].ticker, 'AAPL')
+        self.assertTrue(seen[0].is_complete)
+
+    def test_remove_ticker_clears_the_completed_marker(self):
+        """A re-added ticker starts clean, with no bucket marked completed."""
+        self._tick('AAPL', 150.0, 100, 10)
+        self.engine.close_due_candles(
+            now_timestamp=self.bucket + self.INTERVAL_SECONDS + 2,
+            grace_seconds=2.0
+        )
+        self.assertIn('AAPL', self.engine._last_completed_start)
+
+        self.engine.remove_ticker('AAPL')
+
+        self.assertNotIn('AAPL', self.engine._last_completed_start)
+
+    def test_set_interval_clears_completed_markers(self):
+        """Bucket boundaries move with the interval, so the markers must go."""
+        self._tick('AAPL', 150.0, 100, 10)
+        self.engine.close_due_candles(
+            now_timestamp=self.bucket + self.INTERVAL_SECONDS + 2,
+            grace_seconds=2.0
+        )
+        self.assertIn('AAPL', self.engine._last_completed_start)
+
+        self.engine.set_interval(5)
+
+        self.assertEqual(self.engine._last_completed_start, {})
+
+    def test_default_now_timestamp_uses_the_clock(self):
+        """Called with no arguments, an ended bucket is still closed."""
+        now = int(datetime.now(timezone.utc).timestamp())
+        # A tick two intervals ago, so its bucket has certainly ended.
+        past = (now // self.INTERVAL_SECONDS) * self.INTERVAL_SECONDS - (
+            2 * self.INTERVAL_SECONDS
+        )
+        self.engine.process_tick('AAPL', 150.0, 100, (past + 10) * 1000)
+
+        closed = self.engine.close_due_candles()
+
+        self.assertEqual(len(closed), 1)
+        self.assertEqual(closed[0].timestamp, past)
 
 
 if __name__ == '__main__':

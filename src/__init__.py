@@ -9,4 +9,4 @@ define a version number -- see the "Versioning and changelog" section in
 CLAUDE.md.
 """
 
-__version__ = '0.9.9'
+__version__ = '0.9.10'

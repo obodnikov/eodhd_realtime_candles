@@ -10,7 +10,13 @@ import signal
 from unittest.mock import Mock, patch, AsyncMock, MagicMock
 from datetime import datetime, timezone
 
-from src.websocket_worker import cleanup_task, ticker_sync_task, run_worker, setup_logging
+from src.websocket_worker import (
+    cleanup_task,
+    ticker_sync_task,
+    candle_close_task,
+    run_worker,
+    setup_logging,
+)
 from src.config import Config
 from src.storage import Storage
 from src.candle_engine import CandleEngine
@@ -568,6 +574,110 @@ class TestWebSocketWorkerShutdown:
 
                     # Verify pending cleanup was processed
                     assert storage.cleanup_old_candles.call_count == 2  # AAPL + MSFT
+
+
+class TestCandleCloseTask:
+    """Time-based candle closing task."""
+
+    @pytest.mark.asyncio
+    async def test_close_task_calls_engine_with_configured_grace(self):
+        """Each pass asks the engine to close due candles at the set grace."""
+        candle_engine = Mock(spec=CandleEngine)
+        candle_engine.close_due_candles = Mock(return_value=[])
+
+        with patch('src.websocket_worker.asyncio.sleep', new=single_pass_sleep(1.0)):
+            task = asyncio.create_task(candle_close_task(candle_engine, 2.0, 1.0))
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        candle_engine.close_due_candles.assert_called_once_with(None, 2.0)
+
+    @pytest.mark.asyncio
+    async def test_close_task_survives_an_engine_error(self):
+        """A failing pass is logged and the task keeps running."""
+        candle_engine = Mock(spec=CandleEngine)
+        candle_engine.close_due_candles = Mock(side_effect=RuntimeError('boom'))
+
+        with patch('src.websocket_worker.asyncio.sleep', new=single_pass_sleep(1.0)):
+            task = asyncio.create_task(candle_close_task(candle_engine, 2.0, 1.0))
+            await asyncio.sleep(0.05)
+            assert not task.done()
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        candle_engine.close_due_candles.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_close_task_exits_on_cancellation(self):
+        """Cancellation ends the task rather than raising out of it."""
+        candle_engine = Mock(spec=CandleEngine)
+        candle_engine.close_due_candles = Mock(return_value=[])
+
+        task = asyncio.create_task(candle_close_task(candle_engine, 2.0, 1.0))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        assert task.done()
+
+
+class TestCandleCloseTaskShutdownOrdering:
+    """The close task must stop before the worker's final flush."""
+
+    @pytest.mark.asyncio
+    async def test_close_task_stops_before_final_flush(self):
+        """No candle may be enqueued after the last write is flushed."""
+        config = Config()
+        config.eodhd_api_key = 'test_key'
+        config.default_tickers = []
+
+        storage = Mock(spec=Storage)
+        storage.get_ticker_symbols = Mock(return_value=[])
+        storage.add_ticker = Mock()
+        storage.cleanup_old_candles = Mock()
+
+        # Record the order of the calls that matter during shutdown.
+        calls = []
+        candle_engine = Mock(spec=CandleEngine)
+        candle_engine.max_candles = 100
+        candle_engine.get_pending_cleanup.return_value = set()
+        candle_engine.close_due_candles = Mock(
+            side_effect=lambda *a: calls.append('close') or []
+        )
+        candle_engine.complete_all_candles = Mock(
+            side_effect=lambda: calls.append('complete_all')
+        )
+        candle_engine.flush_pending_candle_writes = Mock(
+            side_effect=lambda: calls.append('flush')
+        )
+        candle_engine.flush_pending_ticker_statuses = Mock()
+
+        with patch('src.websocket_worker.create_storage', return_value=storage):
+            with patch('src.websocket_worker.CandleEngine', return_value=candle_engine):
+                with patch('src.websocket_worker.WebSocketManager') as mock_ws:
+                    mock_ws_instance = Mock()
+                    mock_ws_instance.start = AsyncMock()
+                    mock_ws_instance.subscribe = AsyncMock()
+                    mock_ws_instance.stop = AsyncMock()
+                    mock_ws.return_value = mock_ws_instance
+
+                    await run_worker_until_shutdown(config)
+
+        # The shutdown sequence ran...
+        assert 'complete_all' in calls
+        assert 'flush' in calls
+        # ...and nothing tried to close a candle after it began.
+        assert 'close' not in calls[calls.index('complete_all'):]
 
 
 if __name__ == '__main__':

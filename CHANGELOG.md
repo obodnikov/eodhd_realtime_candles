@@ -14,6 +14,46 @@ compared against this file. See *Versioning and changelog* in
 > the commits they cover; they are not release notes written at the time, and
 > they may omit changes that left no trace in a commit message.
 
+## [0.9.10] - 2026-09-02
+
+### Added
+- **Candles are completed when their interval ends, not when the next tick
+  arrives.** A background task in the WebSocket worker
+  (`candle_close_task` / `CandleEngine.close_due_candles`) completes any
+  in-memory candle whose bucket has ended. Previously a finished bucket sat in
+  memory until that ticker traded again, so a bar could be invisible to
+  `include_current=false` readers for minutes — the delay scaling with how
+  illiquid the ticker was. Timer-closed and tick-closed candles take the same
+  completion path and are indistinguishable downstream.
+- `CANDLE_CLOSE_GRACE_SECONDS` (default `2.0`): how long to wait past an
+  interval's end before closing its candle. The grace exists because tick
+  timestamps trail wall clock — a trade stamped `:59.8` may arrive at `:00.3`,
+  and closing at exactly `:00.000` would drop it from its own bucket. Must be
+  at least 0 and less than the candle interval. It is environment-only:
+  `PATCH /config` refuses it, because the close task runs in the WebSocket
+  worker and would never see a change made on an API worker.
+- `late_tick_dropped_count` in `GET /status`, alongside the existing tick-drop
+  counters.
+
+### Changed
+- **Behaviour change: a tick for an already-completed bucket is now dropped.**
+  Ticks up to `TICK_MAX_AGE_SECONDS` (default 180) old are no longer guaranteed
+  to be aggregated. This is required, not incidental: candle writes upsert on
+  `(ticker, timestamp, interval_minutes)`, so once buckets close on a timer a
+  late tick would start a fresh candle at the old bucket start and replace a
+  properly closed bar with a one-tick one. That is silent data loss. The two
+  situations that produce such ticks are a delayed feed — which the grace period
+  covers in the normal case — and a burst of buffered ticks after a reconnect,
+  where the affected intervals are of unknown quality anyway. Watch
+  `late_tick_dropped_count`: if it is non-trivial in production, raise
+  `CANDLE_CLOSE_GRACE_SECONDS` rather than removing the guard.
+- The admin dashboard's active-candle panel now empties between intervals for
+  quiet tickers, because there genuinely is no candle in progress. See
+  [docs/ADMIN_UI.md](docs/ADMIN_UI.md).
+- Aggregated candles (`GET /candles/{ticker}/{minutes}`) benefit automatically:
+  aggregation reads completed base candles, so a period is no longer assembled
+  from a partial set merely because its final bars had not been closed yet.
+
 ## [0.9.9] - 2026-09-02
 
 ### Fixed

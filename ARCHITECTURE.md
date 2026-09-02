@@ -1,6 +1,6 @@
 # ARCHITECTURE.md
 
-**Version**: 0.9.9
+**Version**: 0.9.10
 **Last Updated**: 2026-09-02
 **Project**: EODHD Real-Time Candle Aggregator
 
@@ -62,7 +62,7 @@ Architecture pattern (multi-worker):
 └─────────────────────────────────────────────────────────────┘
 ```
 
-Key benefits (v0.9.9):
+Key benefits (v0.9.10):
 - Isolated tick ingestion and aggregation in dedicated worker
 - Backpressure via bounded tick queue to avoid unbounded async task growth
 - Reduced lock hold time by asynchronous candle/status flush paths
@@ -143,6 +143,7 @@ WebSocket worker background tasks:
 - Active candles task (dashboard sharing)
 - Ticker status flush task (interval-based persistence)
 - Candle write flush task (short interval async DB flush)
+- Candle close task (completes candles whose interval has ended, independently of tick arrival)
 - Tick workers consuming bounded queue
 
 ### 4.4 External Integrations
@@ -158,7 +159,7 @@ WebSocket worker background tasks:
 REST request -> auth middleware (`X-API-Key` / bearer / query) -> route -> storage/service.
 `/health` remains low-cost and should avoid DB dependency.
 
-### 5.2 Tick-to-Candle Flow (v0.9.9)
+### 5.2 Tick-to-Candle Flow (v0.9.10)
 
 ```
 EODHD message
@@ -176,6 +177,14 @@ Bounded tick queue (maxsize = TICK_QUEUE_MAXSIZE)
 CandleEngine.process_tick()
    │ updates in-memory candle state
    │ enqueues candle/status writes (no direct hot-path DB write)
+   │
+   │   A bucket is completed by whichever comes first:
+   │     - the next tick for that ticker crossing the boundary, or
+   │     - candle_close_task, once the interval has ended plus
+   │       CANDLE_CLOSE_GRACE_SECONDS (CandleEngine.close_due_candles)
+   │   Both take the same completion path, so the result is identical.
+   │   A tick for an already-completed bucket is dropped and counted as
+   │   late_tick_dropped_count, so it cannot overwrite a closed bar.
    ▼
 Flush tasks (interval-based)
    ├─ flush_pending_ticker_statuses()

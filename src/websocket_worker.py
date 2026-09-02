@@ -340,6 +340,49 @@ async def reconnect_request_task(storage: Storage, ws_manager: WebSocketManager,
             logger.error(f"Error in reconnect request task: {e}")
 
 
+async def candle_close_task(
+    candle_engine: CandleEngine,
+    grace_seconds: float,
+    poll_interval_seconds: float = 1.0
+):
+    """
+    Periodically complete candles whose interval has ended.
+
+    Without this, a candle is only completed when the next tick for that ticker
+    arrives, so a bucket that has ended can sit in memory indefinitely and stays
+    invisible to include_current=False readers. For a ticker that trades every
+    second this is imperceptible; for one that trades every few minutes it is
+    the dominant source of delay.
+
+    close_due_candles takes the engine's threading.Lock, which tick workers
+    hold, so it runs in a thread rather than blocking the event loop.
+    """
+    logger = logging.getLogger(__name__)
+    logger.info(
+        "Candle close task started (%.2fs poll, %.2fs grace)",
+        poll_interval_seconds,
+        grace_seconds
+    )
+
+    while True:
+        try:
+            await asyncio.sleep(poll_interval_seconds)
+            closed = await asyncio.to_thread(
+                candle_engine.close_due_candles, None, grace_seconds
+            )
+            if closed:
+                logger.debug(
+                    "Closed %d candle(s) on time: %s",
+                    len(closed),
+                    ", ".join(c.ticker for c in closed)
+                )
+        except asyncio.CancelledError:
+            logger.info("Candle close task cancelled")
+            break
+        except Exception as e:
+            logger.error(f"Error in candle close task: {e}")
+
+
 async def run_worker(config: Config):
     """Run the WebSocket worker."""
     logger = logging.getLogger(__name__)
@@ -507,6 +550,11 @@ async def run_worker(config: Config):
     candle_write_flush_task_handle = asyncio.create_task(
         candle_write_flush_task(candle_engine)
     )
+
+    # Start candle close task (completes candles whose interval has ended)
+    candle_close_task_handle = asyncio.create_task(
+        candle_close_task(candle_engine, config.candle_close_grace_seconds)
+    )
     
     logger.info("WebSocket worker running")
     
@@ -535,6 +583,9 @@ async def run_worker(config: Config):
     reconnect_request_task_handle.cancel()
     ticker_status_flush_task_handle.cancel()
     candle_write_flush_task_handle.cancel()
+    # Stop closing candles before the final flush, so nothing is enqueued
+    # after the last write.
+    candle_close_task_handle.cancel()
     for handle in tick_worker_handles:
         handle.cancel()
     
@@ -570,6 +621,11 @@ async def run_worker(config: Config):
 
     try:
         await candle_write_flush_task_handle
+    except asyncio.CancelledError:
+        pass
+
+    try:
+        await candle_close_task_handle
     except asyncio.CancelledError:
         pass
 

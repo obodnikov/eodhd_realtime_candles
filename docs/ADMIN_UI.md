@@ -152,6 +152,15 @@ The dashboard provides real-time monitoring of:
 - List of tickers with candles currently being built
 - Real-time tick counts
 
+> A ticker only appears here while it has a candle in progress. Since v0.9.10
+> candles are completed as soon as their interval ends, rather than waiting for
+> the ticker's next tick, so a quiet ticker drops out of this panel between
+> intervals and reappears when it next trades. That is accurate — there is no
+> candle in progress — but it is a visible change from earlier versions, where a
+> finished candle lingered here until the next trade arrived. The completed
+> candle is available immediately through
+> `GET /candles/{ticker}?include_current=false`.
+
 ### 2. Ticker Management
 
 **URL**: `http://localhost:5000/tickers`
