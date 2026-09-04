@@ -85,6 +85,10 @@ class Config:
     tick_queue_maxsize: int = field(default_factory=lambda: int(os.environ.get('TICK_QUEUE_MAXSIZE', '50000')))
     tick_worker_concurrency: int = field(default_factory=lambda: int(os.environ.get('TICK_WORKER_CONCURRENCY', '100')))
     tick_max_age_seconds: int = field(default_factory=lambda: int(os.environ.get('TICK_MAX_AGE_SECONDS', '180')))
+    candle_close_grace_seconds: float = field(default_factory=lambda: float(os.environ.get('CANDLE_CLOSE_GRACE_SECONDS', '2.0')))
+    empty_interval_audit: str = field(default_factory=lambda: os.environ.get('EMPTY_INTERVAL_AUDIT', 'off').strip().lower())
+    empty_interval_audit_path: str = field(default_factory=lambda: os.environ.get('EMPTY_INTERVAL_AUDIT_PATH', ''))
+    subscription_silence_minutes: float = field(default_factory=lambda: float(os.environ.get('SUBSCRIPTION_SILENCE_MINUTES', '15')))
 
     # Persistence
     config_file: str = field(default_factory=lambda: os.environ.get('CONFIG_FILE', ''))
@@ -123,7 +127,24 @@ class Config:
 
         if self.tick_max_age_seconds < 0:
             errors.append("tick_max_age_seconds must be >= 0")
-        
+
+        if self.candle_close_grace_seconds < 0:
+            errors.append("candle_close_grace_seconds must be >= 0")
+        elif self.candle_close_grace_seconds >= self.candle_interval_minutes * 60:
+            errors.append(
+                "candle_close_grace_seconds must be less than the candle interval "
+                f"({self.candle_interval_minutes * 60}s)"
+            )
+
+        if self.subscription_silence_minutes <= 0:
+            errors.append("subscription_silence_minutes must be > 0")
+
+        if self.empty_interval_audit not in ('off', 'regular', 'extended'):
+            errors.append(
+                "empty_interval_audit must be one of: off, regular, extended "
+                f"(got {self.empty_interval_audit!r})"
+            )
+
         return errors
     
     def to_dict(self, include_sensitive: bool = False) -> dict:
@@ -159,6 +180,9 @@ class Config:
             'ticker_status_update_interval_seconds': self.ticker_status_update_interval_seconds,
             'candle_write_queue_maxsize': self.candle_write_queue_maxsize,
             'tick_max_age_seconds': self.tick_max_age_seconds,
+            'candle_close_grace_seconds': self.candle_close_grace_seconds,
+            'empty_interval_audit': self.empty_interval_audit,
+            'subscription_silence_minutes': self.subscription_silence_minutes,
             'authentication_enabled': self.api_key is not None,
         }
 
@@ -273,6 +297,25 @@ class ConfigManager:
             # Don't allow updating sensitive fields via API
             if key in ['eodhd_api_key', 'api_key', 'database_path', 'http_host', 'http_port', 'config_file', 'persist_config']:
                 errors.append(f"Cannot update {key} at runtime")
+                continue
+
+            # The candle close task lives in the WebSocket worker and reads this
+            # once when it starts, but PATCH /config is served by an API worker.
+            # Accepting the change here would record a value that never reaches
+            # the running task, so refuse it rather than appear to work.
+            if key == 'candle_close_grace_seconds':
+                errors.append(
+                    "Cannot update candle_close_grace_seconds at runtime; "
+                    "set CANDLE_CLOSE_GRACE_SECONDS and restart"
+                )
+                continue
+
+            # Same reasoning: the audit task lives in the WebSocket worker.
+            if key in ('empty_interval_audit', 'empty_interval_audit_path'):
+                errors.append(
+                    f"Cannot update {key} at runtime; "
+                    f"set {key.upper()} and restart"
+                )
                 continue
 
             # Apply update

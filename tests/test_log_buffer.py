@@ -181,7 +181,9 @@ class TestGetLogsEndpoint:
         # Setup a minimal app
         app = web.Application()
         app['config_manager'] = MagicMock()
-        app['storage'] = MagicMock()
+        storage_mock = MagicMock()
+        del storage_mock.get_log_entries  # force the in-memory buffer fallback
+        app['storage'] = storage_mock
         app['candle_engine'] = MagicMock()
         app['ws_manager'] = MagicMock()
         routes = APIRoutes(app)
@@ -207,7 +209,8 @@ class TestGetLogsEndpoint:
 
         assert response.status == 200
         assert 'entries' in data
-        assert 'total_buffered' in data
+        assert 'returned_count' in data
+        assert 'source' in data
         assert 'limit' in data
         assert 'level_filter' in data
         assert len(data['entries']) >= 1
@@ -221,7 +224,9 @@ class TestGetLogsEndpoint:
 
         app = web.Application()
         app['config_manager'] = MagicMock()
-        app['storage'] = MagicMock()
+        storage_mock = MagicMock()
+        del storage_mock.get_log_entries  # force the in-memory buffer fallback
+        app['storage'] = storage_mock
         app['candle_engine'] = MagicMock()
         app['ws_manager'] = MagicMock()
         routes = APIRoutes(app)
@@ -241,7 +246,9 @@ class TestGetLogsEndpoint:
 
         app = web.Application()
         app['config_manager'] = MagicMock()
-        app['storage'] = MagicMock()
+        storage_mock = MagicMock()
+        del storage_mock.get_log_entries  # force the in-memory buffer fallback
+        app['storage'] = storage_mock
         app['candle_engine'] = MagicMock()
         app['ws_manager'] = MagicMock()
         routes = APIRoutes(app)
@@ -261,7 +268,9 @@ class TestGetLogsEndpoint:
 
         app = web.Application()
         app['config_manager'] = MagicMock()
-        app['storage'] = MagicMock()
+        storage_mock = MagicMock()
+        del storage_mock.get_log_entries  # force the in-memory buffer fallback
+        app['storage'] = storage_mock
         app['candle_engine'] = MagicMock()
         app['ws_manager'] = MagicMock()
         routes = APIRoutes(app)
@@ -284,7 +293,9 @@ class TestGetLogsEndpoint:
 
         app = web.Application()
         app['config_manager'] = MagicMock()
-        app['storage'] = MagicMock()
+        storage_mock = MagicMock()
+        del storage_mock.get_log_entries  # force the in-memory buffer fallback
+        app['storage'] = storage_mock
         app['candle_engine'] = MagicMock()
         app['ws_manager'] = MagicMock()
         routes = APIRoutes(app)

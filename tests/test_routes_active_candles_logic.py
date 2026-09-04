@@ -23,6 +23,10 @@ def mock_app():
     app['config_manager'].config.get_public_config.return_value = {}
     
     app['storage'] = Mock()
+    # /status now also reports subscription freshness; these tests are about
+    # active candles, so give it an empty watchlist.
+    app['storage'].get_tickers.return_value = []
+    app['config_manager'].config.subscription_silence_minutes = 15
     app['candle_engine'] = Mock()
     app['ws_manager'] = Mock()
     

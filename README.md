@@ -1,10 +1,27 @@
-# EODHD Real-Time Candle Aggregator v0.9.4
+# EODHD Real-Time Candle Aggregator v0.9.14
 
 > **Converts EODHD WebSocket tick data into configurable OHLCV candles with full REST API management**
 
 ## Overview
 
 This microservice solves the problem that EODHD's Intraday Historical API only provides data **2-3 hours after market close**. By connecting to the real-time WebSocket feed (included in your EOD+Intraday Extended plan), it aggregates ticks into OHLCV candles that you can query during market hours.
+
+> ### Know what the feed is before you use the numbers
+>
+> The EODHD US stream is **Cboe EDGX — one exchange**, not the consolidated (SIP) tape. It
+> carries no executions from other venues, no off-exchange trades and no FINRA TRF prints.
+> Measured against the same provider's Intraday Historical API over 51 tickers on
+> 3 September 2026:
+>
+> - **Volume is about 2.8% of market volume** (0.7–5.6% per ticker, median 2.8%). Use it to
+>   compare a ticker against *its own* history — relative volume, volume profile by
+>   minute-of-session. Do not read it as shares traded on the market.
+> - **A minute with no candle usually still traded.** 88.7% of the main-session minutes with
+>   no candle had trades on other venues. An absent candle means "no EDGX print this minute",
+>   not "nobody traded".
+>
+> Prices are real executions, so OHLC is sound. It is volume and the presence of a candle
+> that are partial. See [ARCHITECTURE.md](ARCHITECTURE.md) §4.4.
 
 ### Features
 
@@ -19,7 +36,7 @@ This microservice solves the problem that EODHD's Intraday Historical API only p
 - ✅ **Multi-worker architecture** for high performance and scalability
 - ✅ **Admin Web UI** with real-time monitoring and Chart.js visualizations
 
-### Architecture (v0.9.4)
+### Architecture (v0.9.14)
 
 The service uses a **multi-worker architecture** for optimal performance and scalability:
 
@@ -486,6 +503,10 @@ Body:
 | `ADMIN_ENABLED` | `true` | Enable admin web UI |
 | `ADMIN_HOST` | `127.0.0.1` | Admin UI host (localhost only by default) |
 | `ADMIN_PORT` | `5000` | Admin UI port |
+| `CANDLE_CLOSE_GRACE_SECONDS` | `2.0` | Delay past an interval's end before its candle is closed. Environment only — `PATCH /config` refuses it, because the close task runs in the WebSocket worker |
+| `EMPTY_INTERVAL_AUDIT` | `off` | `off` / `regular` / `extended`. Measurement only: records which empty intervals *could* be filled, writing no candles. See [docs/EMPTY_INTERVAL_AUDIT.md](docs/EMPTY_INTERVAL_AUDIT.md) |
+| `EMPTY_INTERVAL_AUDIT_PATH` | next to the database | Where the audit appends its observations |
+| `SUBSCRIPTION_SILENCE_MINUTES` | `15` | A subscribed ticker silent this long is listed in `subscription_health` in `GET /status`. Reporting only |
 
 ---
 
@@ -533,58 +554,8 @@ docker-compose up -d
 
 ## Changelog
 
-### v0.9.4 (2026-01-30)
-- **Multi-Worker Architecture**: Implemented separate API and WebSocket processes for better scalability
-  - **2 API Workers**: Handle HTTP requests in parallel (ports 8765, 8766)
-  - **1 WebSocket Worker**: Dedicated tick processing and candle aggregation
-  - **Performance**: 50% faster API response time under load, better CPU utilization across cores
-  - **Reliability**: Eliminated database locking errors by isolating writes to WebSocket worker
-- **Code Quality**: Fixed cleanup task data loss risk with individual ticker processing
-- **Testing**: Added comprehensive test coverage (19 new tests for API server and WebSocket worker)
-- **Documentation**: Added complete multi-worker deployment guide
-- **Configuration**: Updated supervisord.conf with explicit worker definitions and correct port allocation
+See [CHANGELOG.md](CHANGELOG.md) for the full release history.
 
-### v0.4.3 (2026-01-20)
-- **Premarket Volume Script Enhancement**: Updated `scripts/premarket_volume.py`
-  - Removed interval parameter (now hardcoded to 1m - only interval with premarket data)
-  - Increased data retrieval from 30 to 90 days for maximum premarket data points
-  - Improved error messages explaining EODHD API premarket data limitations
-  - Updated documentation to clarify that only 1-minute intervals include premarket hours (4:00-9:30 AM ET)
-  - Simplified CLI usage: `python premarket_volume.py AAPL.US` (no interval parameter needed)
-
-### v0.4.2 (2025-12-26)
-- **Bug Fix**: Fixed `delete_all_tickers()` to consistently delete candle data
-  - **⚠️ BREAKING CHANGE**: `DELETE /tickers?confirm=true` now deletes candles (previously preserved them)
-  - This brings batch ticker deletion in line with single ticker deletion behavior
-  - Migration: Use new `POST /candles/cleanup` endpoint to remove orphaned candles from legacy data
-- **New Endpoint**: Added `POST /candles/cleanup` to remove orphaned candles
-- **Documentation**: Added comprehensive breaking change notice and migration guide
-- **Tooling**: Added `scripts/cleanup_orphaned_candles.sh` for automated cleanup
-
-### v0.4.2 (2025-12-13)
-- **Admin UI Improvements**: Enhanced admin dashboard user experience
-  - Removed unused `ADMIN_SESSION_SECRET` from configuration (auto-generated internally)
-  - Fixed Configuration display to show human-readable format (e.g., "5 minutes" instead of "5 min")
-  - Added oldest/newest candle timestamps to Database statistics display
-  - Candle data now sorted with newest candles on top for better usability
-  - Config form inputs now show current values as placeholders for better UX
-
-### v0.4.1 (2025-12-13)
-- **New Endpoint**: Added `GET /candles/all` to retrieve candles for ALL tracked tickers
-  - Requires `confirm=true` and `max_tickers=N` parameters for safety
-  - Returns flat list with ticker field included in each candle
-  - Supports same filters as single ticker endpoint (count, timestamps, include_current)
-
-### v0.4.0 (2025-12-13)
-- **Admin Web UI**: Added Flask-based admin panel with sqowe branding
-- **Interactive Dashboard**: Real-time system monitoring with Chart.js visualizations
-- **Ticker Management UI**: Visual interface for managing tickers
-- **Candle Data Viewer**: Browse and visualize OHLCV candles with interactive charts
-- **Configuration UI**: Web interface for updating service configuration
-- **Multi-process Container**: Supervisord manages both REST API and admin UI
-- **Configurable Access**: Admin UI host configurable for localhost or external access
-
-### v0.3.1 (2025-12-11)
-- **SQLite performance tuning**: Added WAL mode, `synchronous=NORMAL`, and `busy_timeout=5000` for better read/write concurrency
-- **Stats caching**: `get_stats()` now caches results for 5 seconds to reduce database load from `/status` polling
-- **Documentation**: Added `docs/sqlite-performance-tuning.md` with implementation details
+The running service reports its own version: `GET /health` and `GET /status`
+both return a `version` field, so a deployment can be compared against this
+repository without guessing.

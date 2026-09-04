@@ -978,7 +978,7 @@ class Storage:
                 candle_write_queue_size, candle_write_queue_maxsize, candle_write_dropped_count,
                 stale_tick_dropped_count, out_of_order_tick_dropped_count,
                 last_message, last_update
-            ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             1 if status.get('connected') else 0,
             json.dumps(status.get('subscribed_tickers', [])),

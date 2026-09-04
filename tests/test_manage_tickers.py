@@ -5,9 +5,12 @@ Tests API interactions, deduplication, capacity management, and error handling.
 
 import unittest
 from unittest.mock import Mock, patch, MagicMock
+import os
 import sys
 import json
 from pathlib import Path
+
+import requests
 
 # Add scripts directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent / 'scripts'))
@@ -211,13 +214,17 @@ class TestTickerManagerExecute(unittest.TestCase):
     @patch.object(TickerManager, 'get_current_tickers')
     def test_execute_removal_priority_null_first(self, mock_get):
         """Test removal prioritizes NULL last_candle_request_at."""
+        # Removal only happens at capacity, so fill all MAX_TICKERS slots.
         mock_get.return_value = [
             {'symbol': 'TICK1', 'last_candle_request_at': '2025-01-05T10:00:00Z'},
             {'symbol': 'TICK2', 'last_candle_request_at': None},
             {'symbol': 'TICK3', 'last_candle_request_at': '2025-01-01T10:00:00Z'},
             {'symbol': 'TICK4', 'last_candle_request_at': None}
+        ] + [
+            {'symbol': f'FILL{i}', 'last_candle_request_at': '2025-06-01T10:00:00Z'}
+            for i in range(TickerManager.MAX_TICKERS - 4)
         ]
-        
+
         result = self.manager.execute(
             ['NEW1', 'NEW2', 'NEW3'],
             force=False,
@@ -234,12 +241,17 @@ class TestTickerManagerExecute(unittest.TestCase):
     @patch.object(TickerManager, 'get_current_tickers')
     def test_execute_removal_priority_oldest_timestamp(self, mock_get):
         """Test removal prioritizes oldest timestamps after NULLs."""
+        # Removal only happens at capacity, and every ticker here has a
+        # timestamp, so the oldest is the one that must go.
         mock_get.return_value = [
             {'symbol': 'TICK1', 'last_candle_request_at': '2025-01-05T10:00:00Z'},
             {'symbol': 'TICK2', 'last_candle_request_at': '2025-01-01T10:00:00Z'},
             {'symbol': 'TICK3', 'last_candle_request_at': '2025-01-03T10:00:00Z'}
+        ] + [
+            {'symbol': f'FILL{i}', 'last_candle_request_at': '2025-06-01T10:00:00Z'}
+            for i in range(TickerManager.MAX_TICKERS - 3)
         ]
-        
+
         result = self.manager.execute(['NEW1'], force=False, dry_run=True)
         
         # Should remove oldest: TICK2 (2025-01-01)

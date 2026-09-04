@@ -8,7 +8,7 @@ import threading
 import time
 from collections import OrderedDict
 from datetime import datetime, timezone
-from typing import Dict, Optional, Callable, Set, Tuple
+from typing import Dict, List, Optional, Callable, Set, Tuple
 from dataclasses import dataclass
 
 from .storage import Storage, Candle
@@ -123,6 +123,15 @@ class CandleEngine:
         self._candle_write_dropped_count = 0
         self._stale_tick_dropped_count = 0
         self._out_of_order_tick_dropped_count = 0
+
+        # Start timestamp of the most recently completed bucket per ticker.
+        # Guards against a late tick reopening a bucket that is already closed.
+        self._last_completed_start: Dict[str, int] = {}
+        self._late_tick_dropped_count = 0
+
+        # Last traded close per ticker. A synthetic empty candle would carry this
+        # as all four of its prices; the audit reports it without writing it.
+        self._last_close: Dict[str, float] = {}
         
         # Callback for candle completion (for WebSocket notifications)
         self._on_candle_complete: Optional[Callable[[Candle], None]] = None
@@ -154,7 +163,12 @@ class CandleEngine:
         with self._lock:
             for ticker in list(self._current_candles.keys()):
                 self._complete_current_candle_locked(ticker, force=True)
-        
+
+            # Bucket boundaries move with the interval, so completed-bucket
+            # markers recorded on the old grid no longer mean anything.
+            self._last_completed_start.clear()
+            self._last_close.clear()
+
         self.interval_minutes = interval_minutes
         self.interval_seconds = interval_minutes * 60
         logger.info(f"Candle interval changed to {interval_minutes} minutes")
@@ -210,6 +224,11 @@ class CandleEngine:
         # Cleanup will be processed by background task
         self._pending_cleanup.add(ticker)
         
+        # Record the bucket as completed before dropping it, so a late tick
+        # cannot reopen it (see the late-tick guard in process_tick).
+        self._last_completed_start[ticker] = current.start_timestamp
+        self._last_close[ticker] = current.close
+
         # Remove from current candles
         del self._current_candles[ticker]
         
@@ -232,6 +251,58 @@ class CandleEngine:
         """Complete the current candle and save to storage. Acquires lock."""
         with self._lock:
             return self._complete_current_candle_locked(ticker, force)
+
+    def close_due_candles(
+        self,
+        now_timestamp: Optional[int] = None,
+        grace_seconds: float = 0.0
+    ) -> List[Candle]:
+        """
+        Complete every in-memory candle whose interval has ended.
+
+        Without this, a candle is only completed when the next tick for that
+        ticker arrives, so a bucket that has ended can sit in memory
+        indefinitely and stays invisible to include_current=False readers.
+
+        A bucket is closed once wall clock has passed its end plus
+        grace_seconds. The grace exists because tick timestamps trail wall
+        clock: a trade stamped :59.8 may reach the queue at :00.3, and closing
+        at exactly :00.000 would drop it from its own bucket.
+
+        Completion uses the same path as tick-driven completion, so writes are
+        queued here rather than performed; no I/O happens under the lock.
+
+        Args:
+            now_timestamp: Unix seconds to evaluate against (default: now).
+            grace_seconds: Seconds to wait past a bucket's end before closing.
+
+        Returns:
+            The candles completed by this call. An empty list is the normal case.
+        """
+        if now_timestamp is None:
+            now_timestamp = int(time.time())
+
+        # Every bucket strictly before the one containing (now - grace) has
+        # ended and is past its grace period.
+        cutoff_bucket = int(
+            (now_timestamp - grace_seconds) // self.interval_seconds
+        ) * self.interval_seconds
+
+        completed: List[Candle] = []
+
+        with self._lock:
+            due = [
+                ticker
+                for ticker, current in self._current_candles.items()
+                if current.start_timestamp < cutoff_bucket
+            ]
+
+            for ticker in due:
+                candle = self._complete_current_candle_locked(ticker)
+                if candle is not None:
+                    completed.append(candle)
+
+        return completed
     
     def process_tick(self, ticker: str, price: float, volume: int, timestamp_ms: int):
         """
@@ -272,6 +343,17 @@ class CandleEngine:
 
         # Lock for thread-safe access to _current_candles and _pending_cleanup
         with self._lock:
+            # A bucket that has already been completed must not be reopened.
+            # save_candle upserts on (ticker, timestamp, interval_minutes), so a
+            # tick arriving for a closed bucket would start a fresh candle at the
+            # old start timestamp and replace a properly closed bar with a
+            # one-tick one. Drop it and count it instead; a non-trivial count
+            # here means candle_close_grace_seconds is too short.
+            last_done = self._last_completed_start.get(ticker)
+            if last_done is not None and candle_start <= last_done:
+                self._late_tick_dropped_count += 1
+                return
+
             # Track latest status in memory and throttle DB writes.
             self._pending_ticker_status[ticker] = (status_timestamp, price)
             last_write = self._last_ticker_status_write.get(ticker, 0.0)
@@ -436,6 +518,63 @@ class CandleEngine:
 
         self._pending_candle_writes[key] = candle
     
+    def inspect_interval(
+        self,
+        ticker: str,
+        bucket_start: int
+    ) -> Dict[str, object]:
+        """
+        Report what the engine knows about one interval. Changes nothing.
+
+        READ-ONLY. This writes nothing, enqueues nothing and touches no state.
+        It exists so a caller can measure how many intervals produced no candle
+        without the engine having to know why that might matter.
+
+        The engine is the mechanism here and holds no policy: it does not judge
+        whether an empty interval could be filled. Chain continuity, feed
+        continuity, subscription and market hours are the caller's to decide --
+        and the chain in particular cannot be judged here, because a caller
+        simulating a fill needs the chain to advance across intervals that were
+        never actually written.
+
+        Intended for the interval that has just ended, which is how the audit
+        task uses it. The engine remembers only the most recently completed
+        bucket per ticker, so asking about an older interval reports 'empty'
+        whether or not a candle was written for it at the time.
+
+        Args:
+            ticker: Stock symbol.
+            bucket_start: Interval start (Unix seconds) to describe.
+
+        Returns:
+            state       'in_progress' (ticks arrived, bucket still open),
+                        'completed' (this bucket produced a candle), or
+                        'empty' (no candle for this bucket).
+            last_close  The most recent traded close for this ticker, or None
+                        if it has never produced a candle. A synthetic candle
+                        would carry this as all four of its prices.
+            last_completed_start
+                        Start of the most recently completed bucket, or None.
+        """
+        ticker = ticker.upper()
+
+        with self._lock:
+            current = self._current_candles.get(ticker)
+            last_done = self._last_completed_start.get(ticker)
+
+            if current is not None and current.start_timestamp == bucket_start:
+                state = 'in_progress'
+            elif last_done == bucket_start:
+                state = 'completed'
+            else:
+                state = 'empty'
+
+            return {
+                'state': state,
+                'last_close': self._last_close.get(ticker),
+                'last_completed_start': last_done,
+            }
+
     def get_current_candle(self, ticker: str) -> Optional[dict]:
         """Get the current in-progress candle for a ticker."""
         ticker = ticker.upper()
@@ -474,6 +613,8 @@ class CandleEngine:
                 logger.info(f"Stopped tracking {ticker}")
             self._pending_ticker_status.pop(ticker, None)
             self._last_ticker_status_write.pop(ticker, None)
+            self._last_completed_start.pop(ticker, None)
+            self._last_close.pop(ticker, None)
     
     def get_active_tickers(self) -> list:
         """Get list of tickers with active (in-progress) candles."""
@@ -601,7 +742,8 @@ class CandleEngine:
                 'candle_write_queue_maxsize': self.candle_write_queue_maxsize,
                 'candle_write_dropped_count': self._candle_write_dropped_count,
                 'stale_tick_dropped_count': self._stale_tick_dropped_count,
-                'out_of_order_tick_dropped_count': self._out_of_order_tick_dropped_count
+                'out_of_order_tick_dropped_count': self._out_of_order_tick_dropped_count,
+                'late_tick_dropped_count': self._late_tick_dropped_count
             }
 
     def get_pending_cleanup(self) -> Set[str]:

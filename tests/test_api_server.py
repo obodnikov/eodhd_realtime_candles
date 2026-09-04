@@ -4,6 +4,9 @@ Tests for API server entry point.
 Tests the API-only worker that handles HTTP requests without WebSocket processing.
 """
 
+import os
+import tempfile
+
 import pytest
 from unittest.mock import patch
 from aiohttp import web
@@ -21,7 +24,9 @@ class TestAPIServer(AioHTTPTestCase):
         config = Config()
         config.eodhd_api_key = 'test_key'
         config.api_key = 'test_api_key'
-        config.database_path = ':memory:'
+        self.temp_db = tempfile.NamedTemporaryFile(delete=False, suffix='.db')
+        self.temp_db.close()
+        config.database_path = self.temp_db.name
         app = await create_app(config)
         return app
 
@@ -78,7 +83,9 @@ class TestAPIServerStatusEndpoint(AioHTTPTestCase):
         config = Config()
         config.eodhd_api_key = 'test_key'
         config.api_key = 'test_api_key'
-        config.database_path = ':memory:'
+        self.temp_db = tempfile.NamedTemporaryFile(delete=False, suffix='.db')
+        self.temp_db.close()
+        config.database_path = self.temp_db.name
         app = await create_app(config)
         return app
 
@@ -97,11 +104,11 @@ class TestAPIServerStatusEndpoint(AioHTTPTestCase):
         
         # Verify WebSocket status structure for dummy manager
         ws_status = data['websocket']
-        assert ws_status['connected'] is None  # None indicates unavailable
+        assert ws_status['connected'] is False  # no status row written yet
         assert 'AAPL' in ws_status['subscribed_tickers']
         assert ws_status['subscribed_count'] == 1
         assert 'note' in ws_status
-        assert 'API worker' in ws_status['note']
+        assert 'WebSocket worker not started' in ws_status['note']
 
     @unittest_run_loop
     async def test_status_with_no_tickers(self):
@@ -114,7 +121,7 @@ class TestAPIServerStatusEndpoint(AioHTTPTestCase):
         
         # Verify WebSocket status with no tickers
         ws_status = data['websocket']
-        assert ws_status['connected'] is None
+        assert ws_status['connected'] is False
         assert ws_status['subscribed_tickers'] == []
         assert ws_status['subscribed_count'] == 0
 
@@ -127,9 +134,9 @@ class TestAPIServerStatusEndpoint(AioHTTPTestCase):
         assert resp.status == 200
         data = await resp.json()
         
-        # Verify connected field is None (not string 'unknown')
+        # Verify connected field is a bool, not the string 'unknown'
         ws_status = data['websocket']
-        assert ws_status['connected'] is None
+        assert ws_status['connected'] is False
         assert not isinstance(ws_status['connected'], str)
 
     @unittest_run_loop
@@ -183,7 +190,9 @@ class TestAPIServerMiddleware(AioHTTPTestCase):
         config = Config()
         config.eodhd_api_key = 'test_key'
         config.api_key = 'test_api_key'
-        config.database_path = ':memory:'
+        self.temp_db = tempfile.NamedTemporaryFile(delete=False, suffix='.db')
+        self.temp_db.close()
+        config.database_path = self.temp_db.name
         app = await create_app(config)
         return app
 
@@ -199,12 +208,17 @@ class TestAPIServerMiddleware(AioHTTPTestCase):
         config = Config()
         config.eodhd_api_key = 'test_key'
         config.api_key = None
-        config.database_path = ':memory:'
-        
-        app = await create_app(config)
-        
-        # Check middleware count (no auth)
-        assert len(app.middlewares) == 2  # error + logging only
+        temp_db = tempfile.NamedTemporaryFile(delete=False, suffix='.db')
+        temp_db.close()
+        config.database_path = temp_db.name
+
+        try:
+            app = await create_app(config)
+
+            # Check middleware count (no auth)
+            assert len(app.middlewares) == 2  # error + logging only
+        finally:
+            os.unlink(temp_db.name)
 
 
 if __name__ == '__main__':

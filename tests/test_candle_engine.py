@@ -104,11 +104,13 @@ class TestCandleEngineActiveTickers(unittest.TestCase):
         self.assertIsInstance(candle_summary['started'], int)
         self.assertIsInstance(candle_summary['started_ago'], str)
 
-        # Verify started_ago format (should be in minutes since timestamp is 5 minutes ago)
+        # started_ago counts from the candle's bucket start, not from the tick that
+        # created it, so derive the expected value from the reported bucket start.
         self.assertTrue(candle_summary['started_ago'].endswith('m ago'))
         minutes = int(candle_summary['started_ago'].split('m')[0])
-        self.assertGreaterEqual(minutes, 4)  # At least 4 minutes
-        self.assertLessEqual(minutes, 6)  # At most 6 minutes
+        elapsed = datetime.now(timezone.utc).timestamp() - candle_summary['started']
+        expected_minutes = int(elapsed) // 60
+        self.assertIn(minutes, (expected_minutes - 1, expected_minutes))
 
     def test_get_active_tickers_summary_multiple_tickers(self):
         """Test get_active_tickers_summary() with multiple active tickers."""
@@ -557,10 +559,6 @@ class TestCandleEngineBasicFunctionality(unittest.TestCase):
         self.assertIn('MSFT', active)
 
 
-if __name__ == '__main__':
-    unittest.main()
-
-
 class TestCandleEngineSaveFrequency(unittest.TestCase):
     """Test cases for tick-save frequency optimization."""
 
@@ -583,7 +581,12 @@ class TestCandleEngineSaveFrequency(unittest.TestCase):
         self.engine.process_tick(ticker, price, volume, timestamp_ms)
 
     def _get_db_candle(self, ticker: str):
-        """Helper to get current candle from database."""
+        """Helper to get current candle from database.
+
+        Candle writes are queued by the engine and persisted by a background
+        flush task, so flush explicitly before reading.
+        """
+        self.engine.flush_pending_candle_writes()
         return self.storage.get_current_candle(ticker)
 
     def test_first_tick_saves_to_db(self):
@@ -610,7 +613,7 @@ class TestCandleEngineSaveFrequency(unittest.TestCase):
         initial_tick_count = db_candle.tick_count
 
         # Process N-1 more ticks (should not trigger save)
-        for i in range(1, self.engine.SAVE_EVERY_N_TICKS - 1):
+        for i in range(1, self.engine.save_every_n_ticks - 1):
             self._simulate_tick('AAPL', 150.0 + i, 100, timestamp + i * 1000)
 
         # DB should still show initial tick count
@@ -625,13 +628,13 @@ class TestCandleEngineSaveFrequency(unittest.TestCase):
         self._simulate_tick('AAPL', 150.0, 100, timestamp)
 
         # Process exactly N-1 more ticks to reach threshold
-        for i in range(1, self.engine.SAVE_EVERY_N_TICKS):
+        for i in range(1, self.engine.save_every_n_ticks):
             self._simulate_tick('AAPL', 150.0 + i, 100, timestamp + i * 1000)
 
         # DB should now show all ticks
         db_candle = self._get_db_candle('AAPL')
-        self.assertEqual(db_candle.tick_count, self.engine.SAVE_EVERY_N_TICKS)
-        self.assertEqual(db_candle.close, 150.0 + self.engine.SAVE_EVERY_N_TICKS - 1)
+        self.assertEqual(db_candle.tick_count, self.engine.save_every_n_ticks)
+        self.assertEqual(db_candle.close, 150.0 + self.engine.save_every_n_ticks - 1)
 
     def test_time_threshold_triggers_save(self):
         """Test that SAVE_EVERY_M_SECONDS threshold triggers DB save."""
@@ -641,7 +644,7 @@ class TestCandleEngineSaveFrequency(unittest.TestCase):
         self._simulate_tick('AAPL', 150.0, 100, timestamp)
 
         # Wait for time threshold
-        sleep(self.engine.SAVE_EVERY_M_SECONDS + 0.5)
+        sleep(self.engine.save_every_m_seconds + 0.5)
 
         # Process one more tick (should trigger time-based save)
         self._simulate_tick('AAPL', 151.0, 100, timestamp + 1000)
@@ -659,27 +662,27 @@ class TestCandleEngineSaveFrequency(unittest.TestCase):
         self._simulate_tick('AAPL', 150.0, 100, timestamp)
 
         # Process N ticks to trigger first save
-        for i in range(1, self.engine.SAVE_EVERY_N_TICKS):
+        for i in range(1, self.engine.save_every_n_ticks):
             self._simulate_tick('AAPL', 150.0 + i, 100, timestamp + i * 1000)
 
         # Verify save happened
         db_candle = self._get_db_candle('AAPL')
-        self.assertEqual(db_candle.tick_count, self.engine.SAVE_EVERY_N_TICKS)
+        self.assertEqual(db_candle.tick_count, self.engine.save_every_n_ticks)
 
         # Process N-1 more ticks (should not save yet)
-        for i in range(self.engine.SAVE_EVERY_N_TICKS - 1):
-            self._simulate_tick('AAPL', 160.0 + i, 100, timestamp + (self.engine.SAVE_EVERY_N_TICKS + i) * 1000)
+        for i in range(self.engine.save_every_n_ticks - 1):
+            self._simulate_tick('AAPL', 160.0 + i, 100, timestamp + (self.engine.save_every_n_ticks + i) * 1000)
 
         # DB should still show old tick count
         db_candle = self._get_db_candle('AAPL')
-        self.assertEqual(db_candle.tick_count, self.engine.SAVE_EVERY_N_TICKS)
+        self.assertEqual(db_candle.tick_count, self.engine.save_every_n_ticks)
 
         # One more tick should trigger next save
-        self._simulate_tick('AAPL', 170.0, 100, timestamp + (self.engine.SAVE_EVERY_N_TICKS * 2) * 1000)
+        self._simulate_tick('AAPL', 170.0, 100, timestamp + (self.engine.save_every_n_ticks * 2) * 1000)
 
         # DB should now show updated tick count
         db_candle = self._get_db_candle('AAPL')
-        self.assertEqual(db_candle.tick_count, self.engine.SAVE_EVERY_N_TICKS * 2)
+        self.assertEqual(db_candle.tick_count, self.engine.save_every_n_ticks * 2)
 
     def test_candle_completion_always_saves(self):
         """Test that candle completion always saves to DB regardless of thresholds."""
@@ -695,7 +698,8 @@ class TestCandleEngineSaveFrequency(unittest.TestCase):
         timestamp2 = int(datetime(2025, 1, 1, 12, 5, 0, tzinfo=timezone.utc).timestamp() * 1000)
         self._simulate_tick('AAPL', 153.0, 100, timestamp2)
 
-        # Get completed candles from DB
+        # Get completed candles from DB (writes are queued, so flush first)
+        self.engine.flush_pending_candle_writes()
         candles = self.storage.get_candles('AAPL', count=10, include_current=False)
 
         # Should have 1 completed candle with 3 ticks
@@ -708,7 +712,7 @@ class TestCandleEngineSaveFrequency(unittest.TestCase):
         timestamp = int(datetime(2025, 1, 1, 12, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
 
         # AAPL: Process N ticks (should trigger save)
-        for i in range(self.engine.SAVE_EVERY_N_TICKS):
+        for i in range(self.engine.save_every_n_ticks):
             self._simulate_tick('AAPL', 150.0 + i, 100, timestamp + i * 1000)
 
         # MSFT: Process only 2 ticks (should not trigger save after first)
@@ -717,7 +721,7 @@ class TestCandleEngineSaveFrequency(unittest.TestCase):
 
         # AAPL should be saved with N ticks
         aapl_candle = self._get_db_candle('AAPL')
-        self.assertEqual(aapl_candle.tick_count, self.engine.SAVE_EVERY_N_TICKS)
+        self.assertEqual(aapl_candle.tick_count, self.engine.save_every_n_ticks)
 
         # MSFT should only show first tick in DB
         msft_candle = self._get_db_candle('MSFT')
@@ -728,12 +732,12 @@ class TestCandleEngineSaveFrequency(unittest.TestCase):
         timestamp = int(datetime(2025, 1, 1, 12, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
 
         # Process ticks rapidly (no time delay)
-        for i in range(self.engine.SAVE_EVERY_N_TICKS + 5):
+        for i in range(self.engine.save_every_n_ticks + 5):
             self._simulate_tick('AAPL', 150.0 + i, 100, timestamp + i * 100)  # 100ms apart
 
         # Should have saved at tick threshold (N) but not the extra 5
         db_candle = self._get_db_candle('AAPL')
-        self.assertEqual(db_candle.tick_count, self.engine.SAVE_EVERY_N_TICKS)
+        self.assertEqual(db_candle.tick_count, self.engine.save_every_n_ticks)
 
     def test_slow_ticks_respect_time_threshold(self):
         """Test that slow ticks (exceeding time threshold) save based on time."""
@@ -743,7 +747,7 @@ class TestCandleEngineSaveFrequency(unittest.TestCase):
         self._simulate_tick('AAPL', 150.0, 100, timestamp)
 
         # Wait for time threshold
-        sleep(self.engine.SAVE_EVERY_M_SECONDS + 0.5)
+        sleep(self.engine.save_every_m_seconds + 0.5)
 
         # Second tick (should trigger time-based save)
         self._simulate_tick('AAPL', 151.0, 100, timestamp + 1000)
@@ -758,7 +762,7 @@ class TestCandleEngineSaveFrequency(unittest.TestCase):
         timestamp1 = int(datetime(2025, 1, 1, 12, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
 
         # Process many ticks in first candle
-        for i in range(self.engine.SAVE_EVERY_N_TICKS * 2):
+        for i in range(self.engine.save_every_n_ticks * 2):
             self._simulate_tick('AAPL', 150.0 + i, 100, timestamp1 + i * 1000)
 
         # Move to next interval (completes candle and starts new one)
@@ -782,7 +786,7 @@ class TestCandleEngineSaveFrequency(unittest.TestCase):
             self._simulate_tick('AAPL', price, 100, timestamp + i * 1000)
 
         # Force save by reaching threshold
-        for i in range(self.engine.SAVE_EVERY_N_TICKS - len(prices)):
+        for i in range(self.engine.save_every_n_ticks - len(prices)):
             self._simulate_tick('AAPL', 150.0, 100, timestamp + (len(prices) + i) * 1000)
 
         # Verify OHLCV is correct
@@ -802,12 +806,12 @@ class TestCandleEngineSaveFrequency(unittest.TestCase):
             self._simulate_tick('AAPL', 150.0, volume, timestamp + i * 1000)
 
         # Force save
-        for i in range(self.engine.SAVE_EVERY_N_TICKS - len(volumes)):
+        for i in range(self.engine.save_every_n_ticks - len(volumes)):
             self._simulate_tick('AAPL', 150.0, 100, timestamp + (len(volumes) + i) * 1000)
 
         # Verify volume is correct sum
         db_candle = self._get_db_candle('AAPL')
-        expected_volume = sum(volumes) + (100 * (self.engine.SAVE_EVERY_N_TICKS - len(volumes)))
+        expected_volume = sum(volumes) + (100 * (self.engine.save_every_n_ticks - len(volumes)))
         self.assertEqual(db_candle.volume, expected_volume)
 
 
@@ -1027,6 +1031,376 @@ class TestCandleEngineTickGuards(unittest.TestCase):
         self.assertEqual(current.close, 91.57)
         metrics = self.engine.get_candle_write_metrics()
         self.assertEqual(metrics["out_of_order_tick_dropped_count"], 1)
+
+
+class TestCandleEngineTimeBasedClose(unittest.TestCase):
+    """Time-based candle closing (close_due_candles) and the late-tick guard.
+
+    Every case passes now_timestamp explicitly, so nothing depends on the clock.
+    """
+
+    INTERVAL_MINUTES = 1
+    INTERVAL_SECONDS = 60
+
+    def setUp(self):
+        self.temp_db = tempfile.NamedTemporaryFile(delete=False, suffix='.db')
+        self.temp_db.close()
+        self.storage = Storage(self.temp_db.name)
+        self.engine = CandleEngine(
+            self.storage,
+            interval_minutes=self.INTERVAL_MINUTES,
+            max_candles=100
+        )
+        # A fixed bucket boundary to build every case around.
+        self.bucket = int(
+            datetime(2026, 3, 2, 14, 30, 0, tzinfo=timezone.utc).timestamp()
+        )
+
+    def tearDown(self):
+        try:
+            os.unlink(self.temp_db.name)
+        except Exception:
+            pass
+
+    def _tick(self, ticker, price, volume, offset_seconds):
+        """Send a tick at bucket start + offset_seconds."""
+        self.engine.process_tick(
+            ticker, price, volume, (self.bucket + offset_seconds) * 1000
+        )
+
+    def _completed(self, ticker):
+        """Completed candles as persisted, flushing the write queue first."""
+        self.engine.flush_pending_candle_writes()
+        return self.storage.get_candles(ticker, count=10, include_current=False)
+
+    def test_ended_bucket_is_closed_without_a_following_tick(self):
+        """A bucket with ticks and no next tick is completed on time."""
+        self._tick('AAPL', 150.0, 100, 10)
+        self._tick('AAPL', 152.0, 200, 20)
+
+        # Nothing is complete while the bucket is still open.
+        self.assertEqual(self._completed('AAPL'), [])
+
+        closed = self.engine.close_due_candles(
+            now_timestamp=self.bucket + self.INTERVAL_SECONDS + 2,
+            grace_seconds=2.0
+        )
+
+        self.assertEqual(len(closed), 1)
+        self.assertEqual(closed[0].ticker, 'AAPL')
+        self.assertEqual(closed[0].timestamp, self.bucket)
+
+        candles = self._completed('AAPL')
+        self.assertEqual(len(candles), 1)
+        self.assertEqual(candles[0].open, 150.0)
+        self.assertEqual(candles[0].close, 152.0)
+        self.assertEqual(candles[0].volume, 300)
+        self.assertEqual(candles[0].tick_count, 2)
+        self.assertTrue(candles[0].is_complete)
+
+        # And it is no longer an in-progress candle.
+        self.assertNotIn('AAPL', self.engine.get_active_tickers())
+
+    def test_no_close_inside_the_grace_window(self):
+        """The bucket has ended but the grace period has not elapsed."""
+        self._tick('AAPL', 150.0, 100, 10)
+
+        closed = self.engine.close_due_candles(
+            now_timestamp=self.bucket + self.INTERVAL_SECONDS + 1,
+            grace_seconds=2.0
+        )
+
+        self.assertEqual(closed, [])
+        self.assertEqual(self._completed('AAPL'), [])
+        self.assertIn('AAPL', self.engine.get_active_tickers())
+
+        # One second later it is due.
+        closed = self.engine.close_due_candles(
+            now_timestamp=self.bucket + self.INTERVAL_SECONDS + 2,
+            grace_seconds=2.0
+        )
+        self.assertEqual(len(closed), 1)
+
+    def test_open_bucket_is_left_alone(self):
+        """A bucket whose interval has not ended is never closed."""
+        self._tick('AAPL', 150.0, 100, 10)
+
+        closed = self.engine.close_due_candles(
+            now_timestamp=self.bucket + 30,
+            grace_seconds=0.0
+        )
+
+        self.assertEqual(closed, [])
+        self.assertIn('AAPL', self.engine.get_active_tickers())
+
+    def test_second_call_does_not_reclose_or_duplicate(self):
+        """Closing is idempotent; a second call finds nothing to do."""
+        self._tick('AAPL', 150.0, 100, 10)
+        now = self.bucket + self.INTERVAL_SECONDS + 2
+
+        first = self.engine.close_due_candles(now_timestamp=now, grace_seconds=2.0)
+        second = self.engine.close_due_candles(now_timestamp=now, grace_seconds=2.0)
+
+        self.assertEqual(len(first), 1)
+        self.assertEqual(second, [])
+        self.assertEqual(len(self._completed('AAPL')), 1)
+
+    def test_late_tick_for_a_closed_bucket_is_dropped(self):
+        """A late tick must not replace a properly closed bar."""
+        self._tick('AAPL', 150.0, 100, 10)
+        self._tick('AAPL', 152.0, 200, 20)
+        self.engine.close_due_candles(
+            now_timestamp=self.bucket + self.INTERVAL_SECONDS + 2,
+            grace_seconds=2.0
+        )
+
+        before = self._completed('AAPL')[0]
+
+        # A trade stamped inside the closed bucket arrives afterwards.
+        self._tick('AAPL', 999.0, 5000, 30)
+
+        after = self._completed('AAPL')
+        self.assertEqual(len(after), 1)
+        self.assertEqual(after[0].open, before.open)
+        self.assertEqual(after[0].high, before.high)
+        self.assertEqual(after[0].low, before.low)
+        self.assertEqual(after[0].close, before.close)
+        self.assertEqual(after[0].volume, before.volume)
+        self.assertEqual(after[0].tick_count, before.tick_count)
+
+        # No candle was resurrected, and the drop was counted.
+        self.assertNotIn('AAPL', self.engine.get_active_tickers())
+        metrics = self.engine.get_candle_write_metrics()
+        self.assertEqual(metrics['late_tick_dropped_count'], 1)
+
+    def test_tick_for_the_next_bucket_is_processed_normally(self):
+        """Closing one bucket must not block the bucket that follows it."""
+        self._tick('AAPL', 150.0, 100, 10)
+        self.engine.close_due_candles(
+            now_timestamp=self.bucket + self.INTERVAL_SECONDS + 2,
+            grace_seconds=2.0
+        )
+
+        # A tick in the next interval.
+        self._tick('AAPL', 160.0, 300, self.INTERVAL_SECONDS + 5)
+
+        current = self.engine.get_current_candle('AAPL')
+        self.assertIsNotNone(current)
+        self.assertEqual(current['timestamp'], self.bucket + self.INTERVAL_SECONDS)
+        self.assertEqual(current['open'], 160.0)
+        self.assertEqual(current['tick_count'], 1)
+
+        metrics = self.engine.get_candle_write_metrics()
+        self.assertEqual(metrics['late_tick_dropped_count'], 0)
+
+    def test_only_due_tickers_are_closed(self):
+        """Tickers are closed independently, by their own bucket."""
+        self._tick('AAPL', 150.0, 100, 10)
+        # MSFT trades in the following interval, so its bucket is still open.
+        self._tick('MSFT', 300.0, 100, self.INTERVAL_SECONDS + 10)
+
+        closed = self.engine.close_due_candles(
+            now_timestamp=self.bucket + self.INTERVAL_SECONDS + 20,
+            grace_seconds=2.0
+        )
+
+        self.assertEqual([c.ticker for c in closed], ['AAPL'])
+        self.assertIn('MSFT', self.engine.get_active_tickers())
+
+    def test_completion_callback_fires_for_a_timer_closed_candle(self):
+        """A timer-closed candle is indistinguishable from a tick-closed one."""
+        seen = []
+        self.engine.set_on_candle_complete(seen.append)
+
+        self._tick('AAPL', 150.0, 100, 10)
+        self.engine.close_due_candles(
+            now_timestamp=self.bucket + self.INTERVAL_SECONDS + 2,
+            grace_seconds=2.0
+        )
+
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0].ticker, 'AAPL')
+        self.assertTrue(seen[0].is_complete)
+
+    def test_remove_ticker_clears_the_completed_marker(self):
+        """A re-added ticker starts clean, with no bucket marked completed."""
+        self._tick('AAPL', 150.0, 100, 10)
+        self.engine.close_due_candles(
+            now_timestamp=self.bucket + self.INTERVAL_SECONDS + 2,
+            grace_seconds=2.0
+        )
+        self.assertIn('AAPL', self.engine._last_completed_start)
+
+        self.engine.remove_ticker('AAPL')
+
+        self.assertNotIn('AAPL', self.engine._last_completed_start)
+
+    def test_set_interval_clears_completed_markers(self):
+        """Bucket boundaries move with the interval, so the markers must go."""
+        self._tick('AAPL', 150.0, 100, 10)
+        self.engine.close_due_candles(
+            now_timestamp=self.bucket + self.INTERVAL_SECONDS + 2,
+            grace_seconds=2.0
+        )
+        self.assertIn('AAPL', self.engine._last_completed_start)
+
+        self.engine.set_interval(5)
+
+        self.assertEqual(self.engine._last_completed_start, {})
+
+    def test_default_now_timestamp_uses_the_clock(self):
+        """Called with no arguments, an ended bucket is still closed."""
+        now = int(datetime.now(timezone.utc).timestamp())
+        # A tick two intervals ago, so its bucket has certainly ended.
+        past = (now // self.INTERVAL_SECONDS) * self.INTERVAL_SECONDS - (
+            2 * self.INTERVAL_SECONDS
+        )
+        self.engine.process_tick('AAPL', 150.0, 100, (past + 10) * 1000)
+
+        closed = self.engine.close_due_candles()
+
+        self.assertEqual(len(closed), 1)
+        self.assertEqual(closed[0].timestamp, past)
+
+
+
+
+class TestCandleEngineInspectInterval(unittest.TestCase):
+    """inspect_interval: read-only report on one interval.
+
+    The engine holds no policy here -- it says what it knows and nothing else.
+    Chain continuity lives in the audit task, not in these answers.
+    """
+
+    INTERVAL_SECONDS = 60
+
+    def setUp(self):
+        self.temp_db = tempfile.NamedTemporaryFile(delete=False, suffix='.db')
+        self.temp_db.close()
+        self.storage = Storage(self.temp_db.name)
+        self.engine = CandleEngine(self.storage, interval_minutes=1, max_candles=100)
+        self.bucket = int(
+            datetime(2026, 3, 2, 14, 30, 0, tzinfo=timezone.utc).timestamp()
+        )
+
+    def tearDown(self):
+        try:
+            os.unlink(self.temp_db.name)
+        except Exception:
+            pass
+
+    def _tick(self, ticker, price, volume, offset_seconds):
+        self.engine.process_tick(
+            ticker, price, volume, (self.bucket + offset_seconds) * 1000
+        )
+
+    def _close_through(self, offset_seconds):
+        self.engine.close_due_candles(
+            now_timestamp=self.bucket + offset_seconds, grace_seconds=2.0
+        )
+
+    def _next_bucket(self, n=1):
+        return self.bucket + n * self.INTERVAL_SECONDS
+
+    def test_unknown_ticker_is_empty_with_no_price(self):
+        result = self.engine.inspect_interval('AAPL', self.bucket)
+        self.assertEqual(result['state'], 'empty')
+        self.assertIsNone(result['last_close'])
+        self.assertIsNone(result['last_completed_start'])
+
+    def test_completed_interval(self):
+        self._tick('AAPL', 150.0, 100, 10)
+        self._tick('AAPL', 153.5, 200, 20)
+        self._close_through(self.INTERVAL_SECONDS + 2)
+
+        result = self.engine.inspect_interval('AAPL', self.bucket)
+
+        self.assertEqual(result['state'], 'completed')
+        self.assertEqual(result['last_close'], 153.5)
+        self.assertEqual(result['last_completed_start'], self.bucket)
+
+    def test_interval_in_progress(self):
+        self._tick('AAPL', 150.0, 100, 10)
+
+        result = self.engine.inspect_interval('AAPL', self.bucket)
+
+        self.assertEqual(result['state'], 'in_progress')
+
+    def test_empty_interval_reports_the_last_traded_close(self):
+        """The price a synthetic candle would carry -- reported, never written."""
+        self._tick('AAPL', 150.0, 100, 10)
+        self._tick('AAPL', 153.5, 200, 20)
+        self._close_through(self.INTERVAL_SECONDS + 2)
+
+        result = self.engine.inspect_interval('AAPL', self._next_bucket())
+
+        self.assertEqual(result['state'], 'empty')
+        self.assertEqual(result['last_close'], 153.5)
+        self.assertEqual(result['last_completed_start'], self.bucket)
+
+    def test_engine_does_not_judge_the_chain(self):
+        """Two intervals on: still 'empty', with no verdict about the gap.
+
+        A caller simulating a fill needs to treat this as fillable, because a
+        real fill would have covered the interval in between. Deciding that is
+        the caller's job, so the engine must not pre-empt it.
+        """
+        self._tick('AAPL', 150.0, 100, 10)
+        self._close_through(self.INTERVAL_SECONDS + 2)
+
+        far = self.engine.inspect_interval('AAPL', self._next_bucket(5))
+
+        self.assertEqual(far['state'], 'empty')
+        self.assertEqual(far['last_close'], 150.0)
+        # It reports where the chain actually stands and stops there.
+        self.assertEqual(far['last_completed_start'], self.bucket)
+
+    def test_inspect_writes_nothing(self):
+        """The whole point: measurement must not create a candle."""
+        self._tick('AAPL', 150.0, 100, 10)
+        self._close_through(self.INTERVAL_SECONDS + 2)
+        self.engine.flush_pending_candle_writes()
+        before = self.storage.get_candles('AAPL', count=10, include_current=False)
+
+        for n in range(1, 6):
+            self.engine.inspect_interval('AAPL', self._next_bucket(n))
+
+        self.engine.flush_pending_candle_writes()
+        after = self.storage.get_candles('AAPL', count=10, include_current=False)
+
+        self.assertEqual(len(after), len(before))
+        self.assertEqual([c.timestamp for c in after], [c.timestamp for c in before])
+        self.assertEqual(self.engine.get_active_tickers(), [])
+
+    def test_remove_ticker_forgets_the_price(self):
+        self._tick('AAPL', 150.0, 100, 10)
+        self._close_through(self.INTERVAL_SECONDS + 2)
+        self.engine.remove_ticker('AAPL')
+
+        result = self.engine.inspect_interval('AAPL', self._next_bucket())
+
+        self.assertEqual(result['state'], 'empty')
+        self.assertIsNone(result['last_close'])
+        self.assertIsNone(result['last_completed_start'])
+
+    def test_interval_change_forgets_the_price(self):
+        self._tick('AAPL', 150.0, 100, 10)
+        self._close_through(self.INTERVAL_SECONDS + 2)
+        self.engine.set_interval(5)
+
+        result = self.engine.inspect_interval('AAPL', self._next_bucket())
+
+        self.assertIsNone(result['last_close'])
+        self.assertIsNone(result['last_completed_start'])
+
+    def test_ticker_symbol_is_case_insensitive(self):
+        self._tick('AAPL', 150.0, 100, 10)
+        self._close_through(self.INTERVAL_SECONDS + 2)
+
+        self.assertEqual(
+            self.engine.inspect_interval('aapl', self.bucket),
+            self.engine.inspect_interval('AAPL', self.bucket)
+        )
 
 
 if __name__ == '__main__':
