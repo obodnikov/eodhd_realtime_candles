@@ -518,66 +518,62 @@ class CandleEngine:
 
         self._pending_candle_writes[key] = candle
     
-    def audit_empty_interval(
+    def inspect_interval(
         self,
         ticker: str,
         bucket_start: int
     ) -> Dict[str, object]:
         """
-        Report whether an interval that produced no candle would be fillable.
+        Report what the engine knows about one interval. Changes nothing.
 
-        MEASUREMENT ONLY -- this method writes nothing, enqueues nothing and
-        changes no state. It answers the question "if the service filled empty
-        intervals with a zero-volume candle, would it have filled this one, and
-        with what price?" so the decision can be made from observed numbers
-        rather than estimates.
+        READ-ONLY. This writes nothing, enqueues nothing and touches no state.
+        It exists so a caller can measure how many intervals produced no candle
+        without the engine having to know why that might matter.
 
-        Only the two conditions the engine can see are checked here:
+        The engine is the mechanism here and holds no policy: it does not judge
+        whether an empty interval could be filled. Chain continuity, feed
+        continuity, subscription and market hours are the caller's to decide --
+        and the chain in particular cannot be judged here, because a caller
+        simulating a fill needs the chain to advance across intervals that were
+        never actually written.
 
-          chain   the immediately preceding interval produced a candle, so the
-                  ticker was demonstrably alive right up to this interval. This
-                  is what prevents filling after an outage or before a session's
-                  first trade, with no need for a holiday calendar.
-          empty   no candle exists for the bucket, completed or in progress. A
-                  bucket with an open current candle had ticks and is not empty.
-
-        Feed continuity, subscription and the session window are the caller's
-        to judge -- the engine keeps no notion of market hours.
+        Intended for the interval that has just ended, which is how the audit
+        task uses it. The engine remembers only the most recently completed
+        bucket per ticker, so asking about an older interval reports 'empty'
+        whether or not a candle was written for it at the time.
 
         Args:
             ticker: Stock symbol.
-            bucket_start: Interval start (Unix seconds) to evaluate.
+            bucket_start: Interval start (Unix seconds) to describe.
 
         Returns:
-            A dict with 'eligible' (bool), 'reason' (str) and, when eligible,
-            'price' -- the previous close that a synthetic candle would carry.
+            state       'in_progress' (ticks arrived, bucket still open),
+                        'completed' (this bucket produced a candle), or
+                        'empty' (no candle for this bucket).
+            last_close  The most recent traded close for this ticker, or None
+                        if it has never produced a candle. A synthetic candle
+                        would carry this as all four of its prices.
+            last_completed_start
+                        Start of the most recently completed bucket, or None.
         """
         ticker = ticker.upper()
 
         with self._lock:
             current = self._current_candles.get(ticker)
-            if current is not None and current.start_timestamp == bucket_start:
-                return {'eligible': False, 'reason': 'candle_in_progress'}
-
             last_done = self._last_completed_start.get(ticker)
-            if last_done is None:
-                return {'eligible': False, 'reason': 'no_previous_candle'}
 
-            if last_done == bucket_start:
-                return {'eligible': False, 'reason': 'candle_completed'}
+            if current is not None and current.start_timestamp == bucket_start:
+                state = 'in_progress'
+            elif last_done == bucket_start:
+                state = 'completed'
+            else:
+                state = 'empty'
 
-            if last_done != bucket_start - self.interval_seconds:
-                return {
-                    'eligible': False,
-                    'reason': 'chain_broken',
-                    'last_completed_start': last_done
-                }
-
-            price = self._last_close.get(ticker)
-            if price is None:
-                return {'eligible': False, 'reason': 'no_known_close'}
-
-            return {'eligible': True, 'reason': 'would_fill', 'price': price}
+            return {
+                'state': state,
+                'last_close': self._last_close.get(ticker),
+                'last_completed_start': last_done,
+            }
 
     def get_current_candle(self, ticker: str) -> Optional[dict]:
         """Get the current in-progress candle for a ticker."""

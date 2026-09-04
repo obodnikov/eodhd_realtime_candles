@@ -53,7 +53,8 @@ produced a candle are not recorded — there is nothing to measure about them.
   "bucket_utc": "2026-09-02T09:17:00+00:00",
   "interval_minutes": 1,
   "would_fill": true,
-  "engine_reason": "would_fill",
+  "reason": "would_fill",
+  "chain_intact": true,
   "feed_steady": true,
   "subscribed_throughout": true,
   "inside_session": true,
@@ -64,25 +65,42 @@ produced a candle are not recorded — there is nothing to measure about them.
 
 `would_fill` is the answer: true only when every condition below held.
 
-| Field | Judged by | Meaning |
-| --- | --- | --- |
-| `engine_reason` | engine | `would_fill`, or why not — see below |
-| `feed_steady` | worker | the feed was connected at both ends of the interval with an unchanged connection count |
-| `subscribed_throughout` | worker | the ticker was subscribed at both ends |
-| `inside_session` | worker | the interval starts inside the configured window |
-| `price` | engine | the previous candle's close — what a synthetic candle would carry in all four price fields |
+| Field | Meaning |
+| --- | --- |
+| `reason` | `would_fill`, or the first condition that failed — see below |
+| `chain_intact` | the preceding interval was covered, by a real candle or by one this audit judged fillable |
+| `feed_steady` | the feed was connected at both ends of the interval with an unchanged connection count |
+| `subscribed_throughout` | the ticker was subscribed at both ends |
+| `inside_session` | the interval starts inside the configured window |
+| `price` | the last traded close — what a synthetic candle would carry in all four price fields |
 
-`engine_reason` values:
+`reason` values, in the order they are tested:
 
 | Value | Meaning |
 | --- | --- |
-| `would_fill` | the chain is intact and no candle exists for this interval |
 | `no_previous_candle` | this ticker has produced no candle yet, so there is no chain and no known price |
-| `chain_broken` | the immediately preceding interval produced no candle either — after a hole of unknown cause, silence is not evidence |
+| `chain_broken` | the preceding interval was not covered — after a hole of unknown cause, silence is not evidence |
 | `no_known_close` | a chain exists but no close was recorded (should not occur in practice) |
+| `outside_session` | the interval falls outside the configured window |
+| `feed_unsteady` | the connection dropped or was remade during the interval |
+| `subscription_changed` | the ticker was not subscribed at both ends |
+| `would_fill` | every condition held |
 
 A reconnect inside the interval sets `feed_steady` to false, because ticks the service may
 have missed during it are indistinguishable from an interval in which nothing traded.
+
+## How the chain is tracked, and why it is not the engine's job
+
+A real fill writes a candle for an empty interval, so the chain carries forward and a run
+of silent intervals is filled end to end. The audit therefore keeps its own record of the
+latest interval covered per ticker, advancing it both for real candles and for intervals it
+judges fillable — exactly as a real fill would.
+
+This matters for the count, not just for tidiness. Asking the engine about the chain
+instead would break it after the first silent interval, because nothing was actually
+written: a run of five silent minutes would be counted as one. In the first measurement
+run that understated the extended session roughly fivefold. Fixed in v0.9.12; numbers
+gathered before that release are floors, not totals.
 
 ## Reading the results
 
@@ -95,13 +113,12 @@ jq -r 'select(.would_fill) | "\(.bucket_utc[0:10]) \(.ticker)"' \
   empty_interval_audit.jsonl | sort | uniq -c
 
 # Why were intervals rejected?
-jq -r 'select(.would_fill | not) | .engine_reason' \
+jq -r 'select(.would_fill | not) | .reason' \
   empty_interval_audit.jsonl | sort | uniq -c | sort -rn
 
-# Which conditions did the worker refuse on, where the engine said yes?
-jq -r 'select(.engine_reason == "would_fill" and (.would_fill | not))
-       | "feed=\(.feed_steady) sub=\(.subscribed_throughout) session=\(.inside_session)"' \
-  empty_interval_audit.jsonl | sort | uniq -c
+# How long are the runs of silence, per ticker?
+jq -r 'select(.would_fill) | .ticker' empty_interval_audit.jsonl \
+  | sort | uniq -c | sort -rn | head -20
 ```
 
 The number that decides the question is the first one, read as a share of the session:

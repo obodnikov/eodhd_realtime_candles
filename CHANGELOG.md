@@ -14,6 +14,38 @@ compared against this file. See *Versioning and changelog* in
 > the commits they cover; they are not release notes written at the time, and
 > they may omit changes that left no trace in a commit message.
 
+## [0.9.12] - 2026-09-04
+
+### Fixed
+- **The empty-interval audit counted one interval per run of silence instead of
+  all of them, understating the extended session roughly fivefold.** The chain
+  rule was asked of the engine, which only advances when a candle is actually
+  written. Since the audit deliberately writes nothing, every interval after the
+  first in a run was reported as `chain_broken` — but a real fill would have
+  written a candle for the first, carrying the chain forward and filling the run
+  end to end.
+
+  The chain is now tracked by the audit task itself, which advances its own
+  record both for real candles and for intervals it judges fillable, exactly as
+  a real fill would. `CandleEngine.audit_empty_interval` is replaced by
+  `CandleEngine.inspect_interval`, which reports only what the engine knows —
+  the interval's state and the last traded close — and holds no policy, in
+  keeping with "the engine is the mechanism, the worker is the policy".
+
+  Numbers gathered with 0.9.11 are floors, not totals. In the first measurement
+  run, against 51 tickers over two days, the audit reported 9.2% of extended
+  session minutes as fillable where 45.0% of minutes had no candle at all; the
+  main session showed 7.9% against 13.7%. The second figure of each pair is the
+  one to act on.
+
+### Changed
+- Observation rows: `engine_reason` becomes `reason` and gains a `chain_intact`
+  field. `reason` now reports the first failing condition rather than only the
+  engine's view, with values `no_previous_candle`, `chain_broken`,
+  `no_known_close`, `outside_session`, `feed_unsteady`, `subscription_changed`
+  and `would_fill`. Existing observation files are not migrated — start a fresh
+  file for a run on this version.
+
 ## [0.9.11] - 2026-09-02
 
 ### Added

@@ -884,20 +884,45 @@ def advancing_clock(start_timestamp, step_seconds, max_passes, poll_interval=0.0
     return now, sleep
 
 
+
 class TestEmptyIntervalAuditObservations:
-    """What the task actually records, driven by a controlled clock."""
+    """What the task records, driven by a controlled clock."""
 
     BUCKET = int(datetime(2026, 3, 2, 15, 0, 0, tzinfo=timezone.utc).timestamp())
 
-    def _engine(self, verdict):
+    def _engine(self, info):
+        """An engine whose inspect_interval answers with `info`.
+
+        A list is served one answer per call; a dict answers every call.
+        """
         engine = Mock(spec=CandleEngine)
         engine.interval_seconds = 60
         engine.interval_minutes = 1
-        engine.audit_empty_interval = Mock(return_value=verdict)
+        if isinstance(info, list):
+            engine.inspect_interval = Mock(side_effect=info)
+        else:
+            engine.inspect_interval = Mock(return_value=info)
         return engine
 
+    @staticmethod
+    def _empty(price=153.5):
+        return {'state': 'empty', 'last_close': price,
+                'last_completed_start': None}
+
+    @staticmethod
+    def _completed(price=153.5):
+        return {'state': 'completed', 'last_close': price,
+                'last_completed_start': None}
+
+    @staticmethod
+    def _status(connection_count=7, connected=True, tickers=('AAPL',)):
+        return {
+            'connected': connected,
+            'connection_count': connection_count,
+            'subscribed_tickers': list(tickers),
+        }
+
     async def _run(self, engine, statuses, path, mode='regular', passes=3):
-        """Run the task, returning a fresh ws status on each get_status call."""
         ws = Mock(spec=WebSocketManager)
         ws.get_status = Mock(side_effect=statuses)
 
@@ -924,64 +949,108 @@ class TestEmptyIntervalAuditObservations:
         with open(path, encoding='utf-8') as handle:
             return [json.loads(line) for line in handle if line.strip()]
 
-    @staticmethod
-    def _status(connection_count=7, connected=True, tickers=('AAPL',)):
-        return {
-            'connected': connected,
-            'connection_count': connection_count,
-            'subscribed_tickers': list(tickers),
-        }
+    @pytest.mark.asyncio
+    async def test_a_run_of_empty_intervals_is_counted_in_full(self, tmp_path):
+        """The correction this class exists for.
+
+        A real fill writes a candle for an empty interval, so the chain carries
+        into the next one and a run of silence is filled end to end. Asking the
+        engine about the chain would break it after the first interval, because
+        nothing was written -- counting one per run instead of all of them.
+        """
+        # A real candle, then four silent intervals in a row.
+        answers = [self._completed()] + [self._empty()] * 6
+        engine = self._engine(answers)
+        path = str(tmp_path / 'audit.jsonl')
+
+        rows = await self._run(engine, [self._status()] * 8, path, passes=6)
+
+        empties = [r for r in rows if r['reason'] != 'candle']
+        assert len(empties) >= 3, f"expected a run, got {rows}"
+        # Every interval after the real candle counts, not just the first.
+        assert all(r['would_fill'] for r in empties), \
+            [(r['bucket_utc'], r['reason']) for r in empties]
+        assert all(r['chain_intact'] for r in empties)
 
     @pytest.mark.asyncio
     async def test_records_an_interval_that_would_be_filled(self, tmp_path):
-        """All five conditions hold: the row says so and carries the price."""
-        engine = self._engine(
-            {'eligible': True, 'reason': 'would_fill', 'price': 153.5}
-        )
+        engine = self._engine([self._completed(), self._empty(153.5),
+                               self._empty(153.5), self._empty(153.5)])
         path = str(tmp_path / 'audit.jsonl')
 
-        rows = await self._run(engine, [self._status()] * 4, path)
+        rows = await self._run(engine, [self._status()] * 5, path, passes=4)
 
-        assert rows, "expected at least one observation"
+        assert rows
         row = rows[0]
         assert row['ticker'] == 'AAPL'
         assert row['would_fill'] is True
-        assert row['engine_reason'] == 'would_fill'
+        assert row['reason'] == 'would_fill'
+        assert row['chain_intact'] is True
         assert row['feed_steady'] is True
         assert row['subscribed_throughout'] is True
         assert row['inside_session'] is True
         assert row['price'] == 153.5
         assert row['interval_minutes'] == 1
         assert row['bucket'] % 60 == 0
-        assert row['bucket_utc'].startswith('2026-03-02')
+
+    @pytest.mark.asyncio
+    async def test_first_empty_interval_of_a_ticker_has_no_chain(self, tmp_path):
+        """Nothing precedes it, so there is no evidence the ticker was alive."""
+        engine = self._engine(self._empty(None))
+        path = str(tmp_path / 'audit.jsonl')
+
+        rows = await self._run(engine, [self._status()] * 5, path, passes=4)
+
+        assert rows
+        assert rows[0]['would_fill'] is False
+        assert rows[0]['reason'] == 'no_previous_candle'
+        assert rows[0]['chain_intact'] is False
+
+    @pytest.mark.asyncio
+    async def test_chain_breaks_after_an_interval_that_could_not_be_filled(self, tmp_path):
+        """A disqualified interval does not carry the chain forward.
+
+        The first silent interval is disqualified for having no known price, so
+        nothing would have been written for it -- and the interval after it has
+        an unfilled hole behind it.
+        """
+        engine = self._engine([
+            self._completed(150.0),
+            self._empty(None),      # nothing would be written here
+            self._empty(150.0),
+            self._empty(150.0),
+        ])
+        path = str(tmp_path / 'audit.jsonl')
+
+        rows = await self._run(engine, [self._status()] * 6, path, passes=5)
+
+        assert len(rows) >= 2, rows
+        assert rows[0]['reason'] == 'no_known_close'
+        assert rows[1]['would_fill'] is False
+        assert rows[1]['reason'] == 'chain_broken'
+        assert rows[1]['chain_intact'] is False
 
     @pytest.mark.asyncio
     async def test_a_reconnect_inside_the_interval_disqualifies_it(self, tmp_path):
-        """Ticks missed during a reconnect look exactly like an untraded interval."""
-        engine = self._engine(
-            {'eligible': True, 'reason': 'would_fill', 'price': 153.5}
-        )
+        engine = self._engine([self._completed()] + [self._empty()] * 4)
         path = str(tmp_path / 'audit.jsonl')
 
-        # connection_count changes between samples.
         rows = await self._run(engine, [
             self._status(connection_count=7),
             self._status(connection_count=8),
             self._status(connection_count=9),
             self._status(connection_count=10),
-        ], path)
+            self._status(connection_count=11),
+        ], path, passes=4)
 
         assert rows
         assert all(r['would_fill'] is False for r in rows)
-        assert all(r['feed_steady'] is False for r in rows)
-        # The engine still said yes; the worker is what refused.
-        assert all(r['engine_reason'] == 'would_fill' for r in rows)
+        assert rows[0]['reason'] == 'feed_unsteady'
+        assert rows[0]['feed_steady'] is False
 
     @pytest.mark.asyncio
     async def test_a_dropped_connection_disqualifies_the_interval(self, tmp_path):
-        engine = self._engine(
-            {'eligible': True, 'reason': 'would_fill', 'price': 153.5}
-        )
+        engine = self._engine([self._completed()] + [self._empty()] * 4)
         path = str(tmp_path / 'audit.jsonl')
 
         rows = await self._run(engine, [
@@ -989,18 +1058,23 @@ class TestEmptyIntervalAuditObservations:
             self._status(connected=False),
             self._status(connected=True),
             self._status(connected=True),
-        ], path)
+            self._status(connected=True),
+        ], path, passes=4)
 
         assert rows
         assert rows[0]['would_fill'] is False
         assert rows[0]['feed_steady'] is False
 
     @pytest.mark.asyncio
-    async def test_a_ticker_subscribed_only_at_the_end_is_disqualified(self, tmp_path):
-        """It was not being listened to for the whole interval."""
-        engine = self._engine(
-            {'eligible': True, 'reason': 'would_fill', 'price': 153.5}
-        )
+    async def test_subscription_continuity_is_recorded(self, tmp_path):
+        """A ticker absent from the opening sample is marked, not filled.
+
+        In practice the chain test catches this first: unsubscribing stops the
+        ticker producing candles, so the chain is already broken by the time it
+        returns. The subscription check is the belt-and-braces backstop, and
+        the field is recorded either way so the reason is visible.
+        """
+        engine = self._engine([self._empty(150.0)] * 5)
         path = str(tmp_path / 'audit.jsonl')
 
         rows = await self._run(engine, [
@@ -1008,48 +1082,43 @@ class TestEmptyIntervalAuditObservations:
             self._status(tickers=('AAPL',)),
             self._status(tickers=('AAPL',)),
             self._status(tickers=('AAPL',)),
-        ], path)
+            self._status(tickers=('AAPL',)),
+        ], path, passes=4)
 
         assert rows
-        assert rows[0]['ticker'] == 'AAPL'
-        assert rows[0]['would_fill'] is False
         assert rows[0]['subscribed_throughout'] is False
-
-    @pytest.mark.asyncio
-    async def test_the_engine_refusal_is_recorded_verbatim(self, tmp_path):
-        """A broken chain is written down, not silently skipped."""
-        engine = self._engine(
-            {'eligible': False, 'reason': 'chain_broken',
-             'last_completed_start': 1}
-        )
-        path = str(tmp_path / 'audit.jsonl')
-
-        rows = await self._run(engine, [self._status()] * 4, path)
-
-        assert rows
         assert rows[0]['would_fill'] is False
-        assert rows[0]['engine_reason'] == 'chain_broken'
-        assert rows[0]['price'] is None
+        # Later intervals have it subscribed at both ends.
+        assert any(r['subscribed_throughout'] for r in rows[1:])
 
     @pytest.mark.asyncio
     async def test_outside_the_session_window_nothing_would_be_filled(self, tmp_path):
-        """15:00 UTC is 10:00 ET, inside regular; premarket is not."""
-        engine = self._engine(
-            {'eligible': True, 'reason': 'would_fill', 'price': 153.5}
-        )
-        path = str(tmp_path / 'audit.jsonl')
-
-        # 08:00 UTC is 03:00 ET, outside both windows.
+        """08:00 UTC is 03:00 ET, outside both windows."""
         class EarlyMorning(TestEmptyIntervalAuditObservations):
             BUCKET = int(
                 datetime(2026, 3, 2, 8, 0, 0, tzinfo=timezone.utc).timestamp()
             )
 
-        rows = await EarlyMorning()._run(engine, [self._status()] * 4, path)
+        engine = self._engine([self._completed()] + [self._empty()] * 4)
+        path = str(tmp_path / 'audit.jsonl')
+
+        rows = await EarlyMorning()._run(
+            engine, [self._status()] * 5, path, passes=4
+        )
 
         assert rows
         assert all(r['would_fill'] is False for r in rows)
         assert all(r['inside_session'] is False for r in rows)
+        assert rows[0]['reason'] == 'outside_session'
+
+    @pytest.mark.asyncio
+    async def test_an_interval_with_trades_is_not_recorded(self, tmp_path):
+        engine = self._engine(self._completed())
+        path = str(tmp_path / 'audit.jsonl')
+
+        rows = await self._run(engine, [self._status()] * 5, path, passes=4)
+
+        assert rows == []
 
 
 if __name__ == '__main__':

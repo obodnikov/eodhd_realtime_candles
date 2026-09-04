@@ -26,6 +26,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Dict
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -441,11 +442,21 @@ async def empty_interval_audit_task(
     Measure, without writing, which empty intervals could be filled.
 
     MEASUREMENT ONLY. This task never creates a candle and never touches the
-    candles table. Once per interval it asks: for each subscribed ticker, did
-    this interval produce no candle, and would all the preconditions for
-    writing a zero-volume candle have held? Each answer is appended to a
-    newline-delimited JSON file so the question "should the service fill empty
-    intervals at all?" can be settled with observed numbers.
+    candles table. Once per interval it asks, for each subscribed ticker: did
+    this interval produce no candle, and would every precondition for writing a
+    zero-volume candle have held? Each answer is appended to a newline-delimited
+    JSON file so the question "should the service fill empty intervals at all?"
+    can be settled with observed numbers.
+
+    The chain is tracked here rather than in the engine, and that distinction
+    matters for the count. A real fill would write a candle for an empty
+    interval and so carry the chain forward into the next one, filling a run of
+    silent intervals end to end. Asking the engine instead would break the
+    chain after the first, because nothing was actually written -- counting one
+    interval per run rather than all of them, and understating long runs
+    several-fold. This task therefore keeps its own record of which interval is
+    covered per ticker, advancing it both for real candles and for intervals it
+    judges fillable, exactly as a real fill would.
 
     Feed continuity is judged by comparing two samples one interval apart: the
     interval counts only if both show a live connection with an unchanged
@@ -480,6 +491,8 @@ async def empty_interval_audit_task(
 
     previous_sample = None
     last_audited_bucket = None
+    # ticker -> the latest interval covered by a candle, real or would-be-filled
+    covered: Dict[str, int] = {}
 
     while True:
         try:
@@ -514,23 +527,45 @@ async def empty_interval_audit_task(
                 earlier[0] and sample[0] and earlier[1] == sample[1]
             )
             inside_session = _inside_fill_session(finished_bucket, mode)
+            previous_bucket = finished_bucket - interval_seconds
 
             rows = []
             for ticker in sorted(sample[2]):
-                verdict = await asyncio.to_thread(
-                    candle_engine.audit_empty_interval, ticker, finished_bucket
+                info = await asyncio.to_thread(
+                    candle_engine.inspect_interval, ticker, finished_bucket
                 )
-                if verdict['reason'] in ('candle_in_progress', 'candle_completed'):
-                    # The interval had trades; nothing to measure.
+
+                if info['state'] != 'empty':
+                    # The interval had trades. Nothing to measure, but the
+                    # chain moves forward.
+                    covered[ticker] = finished_bucket
                     continue
 
+                chain_intact = covered.get(ticker) == previous_bucket
                 subscribed_throughout = ticker in earlier[2]
-                eligible = bool(
-                    verdict['eligible']
-                    and feed_steady
-                    and subscribed_throughout
-                    and inside_session
-                )
+                price = info['last_close']
+
+                if not chain_intact:
+                    reason = (
+                        'chain_broken' if ticker in covered
+                        else 'no_previous_candle'
+                    )
+                elif price is None:
+                    reason = 'no_known_close'
+                elif not inside_session:
+                    reason = 'outside_session'
+                elif not feed_steady:
+                    reason = 'feed_unsteady'
+                elif not subscribed_throughout:
+                    reason = 'subscription_changed'
+                else:
+                    reason = 'would_fill'
+
+                eligible = reason == 'would_fill'
+                if eligible:
+                    # A real fill would have written a candle here, so the chain
+                    # continues into the next interval.
+                    covered[ticker] = finished_bucket
 
                 rows.append({
                     'ticker': ticker,
@@ -540,11 +575,12 @@ async def empty_interval_audit_task(
                     ).isoformat(),
                     'interval_minutes': candle_engine.interval_minutes,
                     'would_fill': eligible,
-                    'engine_reason': verdict['reason'],
+                    'reason': reason,
+                    'chain_intact': chain_intact,
                     'feed_steady': feed_steady,
                     'subscribed_throughout': subscribed_throughout,
                     'inside_session': inside_session,
-                    'price': verdict.get('price'),
+                    'price': price,
                     'observed_at': datetime.now(timezone.utc).isoformat(),
                 })
 
@@ -555,7 +591,8 @@ async def empty_interval_audit_task(
 
             would_fill = sum(1 for r in rows if r['would_fill'])
             logger.info(
-                "Empty-interval audit %s: %d ticker(s) без свечи, %d прошли бы все условия",
+                "Empty-interval audit %s: %d ticker(s) with no candle, "
+                "%d would have been filled",
                 datetime.fromtimestamp(finished_bucket, tz=timezone.utc).strftime(
                     '%Y-%m-%d %H:%M UTC'
                 ),
