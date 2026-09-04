@@ -1,10 +1,27 @@
-# EODHD Real-Time Candle Aggregator v0.9.13
+# EODHD Real-Time Candle Aggregator v0.9.14
 
 > **Converts EODHD WebSocket tick data into configurable OHLCV candles with full REST API management**
 
 ## Overview
 
 This microservice solves the problem that EODHD's Intraday Historical API only provides data **2-3 hours after market close**. By connecting to the real-time WebSocket feed (included in your EOD+Intraday Extended plan), it aggregates ticks into OHLCV candles that you can query during market hours.
+
+> ### Know what the feed is before you use the numbers
+>
+> The EODHD US stream is **Cboe EDGX — one exchange**, not the consolidated (SIP) tape. It
+> carries no executions from other venues, no off-exchange trades and no FINRA TRF prints.
+> Measured against the same provider's Intraday Historical API over 51 tickers on
+> 3 September 2026:
+>
+> - **Volume is about 2.8% of market volume** (0.7–5.6% per ticker, median 2.8%). Use it to
+>   compare a ticker against *its own* history — relative volume, volume profile by
+>   minute-of-session. Do not read it as shares traded on the market.
+> - **A minute with no candle usually still traded.** 88.7% of the main-session minutes with
+>   no candle had trades on other venues. An absent candle means "no EDGX print this minute",
+>   not "nobody traded".
+>
+> Prices are real executions, so OHLC is sound. It is volume and the presence of a candle
+> that are partial. See [ARCHITECTURE.md](ARCHITECTURE.md) §4.4.
 
 ### Features
 
@@ -19,7 +36,7 @@ This microservice solves the problem that EODHD's Intraday Historical API only p
 - ✅ **Multi-worker architecture** for high performance and scalability
 - ✅ **Admin Web UI** with real-time monitoring and Chart.js visualizations
 
-### Architecture (v0.9.13)
+### Architecture (v0.9.14)
 
 The service uses a **multi-worker architecture** for optimal performance and scalability:
 
@@ -489,6 +506,7 @@ Body:
 | `CANDLE_CLOSE_GRACE_SECONDS` | `2.0` | Delay past an interval's end before its candle is closed. Environment only — `PATCH /config` refuses it, because the close task runs in the WebSocket worker |
 | `EMPTY_INTERVAL_AUDIT` | `off` | `off` / `regular` / `extended`. Measurement only: records which empty intervals *could* be filled, writing no candles. See [docs/EMPTY_INTERVAL_AUDIT.md](docs/EMPTY_INTERVAL_AUDIT.md) |
 | `EMPTY_INTERVAL_AUDIT_PATH` | next to the database | Where the audit appends its observations |
+| `SUBSCRIPTION_SILENCE_MINUTES` | `15` | A subscribed ticker silent this long is listed in `subscription_health` in `GET /status`. Reporting only |
 
 ---
 

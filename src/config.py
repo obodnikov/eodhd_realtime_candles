@@ -88,6 +88,7 @@ class Config:
     candle_close_grace_seconds: float = field(default_factory=lambda: float(os.environ.get('CANDLE_CLOSE_GRACE_SECONDS', '2.0')))
     empty_interval_audit: str = field(default_factory=lambda: os.environ.get('EMPTY_INTERVAL_AUDIT', 'off').strip().lower())
     empty_interval_audit_path: str = field(default_factory=lambda: os.environ.get('EMPTY_INTERVAL_AUDIT_PATH', ''))
+    subscription_silence_minutes: float = field(default_factory=lambda: float(os.environ.get('SUBSCRIPTION_SILENCE_MINUTES', '15')))
 
     # Persistence
     config_file: str = field(default_factory=lambda: os.environ.get('CONFIG_FILE', ''))
@@ -135,6 +136,9 @@ class Config:
                 f"({self.candle_interval_minutes * 60}s)"
             )
 
+        if self.subscription_silence_minutes <= 0:
+            errors.append("subscription_silence_minutes must be > 0")
+
         if self.empty_interval_audit not in ('off', 'regular', 'extended'):
             errors.append(
                 "empty_interval_audit must be one of: off, regular, extended "
@@ -178,6 +182,7 @@ class Config:
             'tick_max_age_seconds': self.tick_max_age_seconds,
             'candle_close_grace_seconds': self.candle_close_grace_seconds,
             'empty_interval_audit': self.empty_interval_audit,
+            'subscription_silence_minutes': self.subscription_silence_minutes,
             'authentication_enabled': self.api_key is not None,
         }
 

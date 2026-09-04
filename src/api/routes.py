@@ -93,6 +93,69 @@ class APIRoutes:
             'timestamp': datetime.now(timezone.utc).isoformat()
         })
     
+    @staticmethod
+    def _subscription_health(tickers, silence_threshold_minutes: float) -> dict:
+        """
+        Which subscribed tickers have gone quiet, and for how long.
+
+        EODHD accepts a subscription silently and simply never streams a symbol
+        it does not carry, so a ticker can be subscribed, the connection
+        healthy, and no tick ever arrive -- with nothing in the logs to say so.
+        This reports freshness per symbol rather than per connection, which is
+        what the provider's own reliability guidance asks for.
+
+        Silence is reported, not judged: outside the main session most symbols
+        are legitimately quiet, and the threshold that separates "thin stock"
+        from "dead subscription" depends on the session and on the watchlist.
+        The caller decides what to do with the numbers.
+
+        Args:
+            tickers: TrackedTicker rows, each carrying last_tick_at.
+            silence_threshold_minutes: Age past which a ticker is listed as
+                silent.
+
+        Returns:
+            Counts plus the silent tickers, longest silence first.
+        """
+        now = datetime.now(timezone.utc)
+        silent = []
+        never_seen = []
+        ticking = 0
+
+        for ticker in tickers:
+            last_tick_at = getattr(ticker, 'last_tick_at', None)
+            if not last_tick_at:
+                never_seen.append(ticker.symbol)
+                continue
+            try:
+                seen = datetime.fromisoformat(last_tick_at)
+                if seen.tzinfo is None:
+                    seen = seen.replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                never_seen.append(ticker.symbol)
+                continue
+
+            quiet_minutes = (now - seen).total_seconds() / 60
+            if quiet_minutes >= silence_threshold_minutes:
+                silent.append({
+                    'ticker': ticker.symbol,
+                    'last_tick_at': last_tick_at,
+                    'silent_minutes': round(quiet_minutes, 1),
+                })
+            else:
+                ticking += 1
+
+        silent.sort(key=lambda row: -row['silent_minutes'])
+
+        return {
+            'subscribed': len(tickers),
+            'ticking': ticking,
+            'silent': len(silent),
+            'never_seen': sorted(never_seen),
+            'silence_threshold_minutes': silence_threshold_minutes,
+            'silent_tickers': silent,
+        }
+
     async def status(self, request: web.Request) -> web.Response:
         """GET /status - Detailed system status."""
         # Check if this is a dummy WebSocketManager (API worker)
@@ -143,9 +206,16 @@ class APIRoutes:
         db_stats = await asyncio.to_thread(self.storage.get_stats)
         overrides = self.config_manager.get_overrides()
 
+        tracked = await asyncio.to_thread(self.storage.get_tickers)
+        subscription_health = self._subscription_health(
+            tracked,
+            self.config_manager.config.subscription_silence_minutes
+        )
+
         return web.json_response({
             'version': __version__,
             'websocket': ws_status,
+            'subscription_health': subscription_health,
             'database': db_stats,
             'config': self.config_manager.config.get_public_config(
                 include_source=True,

@@ -1,6 +1,6 @@
 # ARCHITECTURE.md
 
-**Version**: 0.9.13
+**Version**: 0.9.14
 **Last Updated**: 2026-09-02
 **Project**: EODHD Real-Time Candle Aggregator
 
@@ -62,7 +62,7 @@ Architecture pattern (multi-worker):
 └─────────────────────────────────────────────────────────────┘
 ```
 
-Key benefits (v0.9.13):
+Key benefits (v0.9.14):
 - Isolated tick ingestion and aggregation in dedicated worker
 - Backpressure via bounded tick queue to avoid unbounded async task growth
 - Reduced lock hold time by asynchronous candle/status flush paths
@@ -152,6 +152,26 @@ WebSocket worker background tasks:
 - EODHD WebSocket (`wss://ws.eodhistoricaldata.com/ws/us`)
 - Optional client/integration workflows via REST (e.g., n8n)
 
+**What the feed carries, and what it does not.** The US stream is **Cboe EDGX — a single
+exchange**, not the consolidated (SIP) tape. It excludes executions from other venues,
+off-exchange trades and FINRA TRF prints. Two consequences shape everything this service
+produces:
+
+- **Volume is a fraction of market volume.** Measured against the same provider's Intraday
+  Historical API across 51 tickers on 3 September 2026: **2.8% of consolidated volume**,
+  ranging 0.7–5.6% per ticker with a median of 2.8% — the ordinary EDGX share. Prices are
+  real trades; volume is not market-wide.
+- **A minute with no candle usually still traded.** Of 4 035 main-session minutes in which
+  the service produced no candle, **88.7% saw trades elsewhere**. An absent candle means
+  "no EDGX execution in this minute", not "no trade in this minute". This is why empty
+  intervals must never be filled with a synthesised candle — see the *Candle correctness*
+  rule in [AI_WEBSOCKET_ENGINE.md](AI_WEBSOCKET_ENGINE.md).
+
+How much this costs depends on liquidity, not on the ticker's share of the feed: the share
+is near-constant, but an active name prints in every minute anyway while a thin one does
+not. On the same day 14 of 51 tickers had all 390 main-session minutes; 5 lost more than
+half.
+
 ---
 
 ## 5. Data Flow & Runtime Model
@@ -160,7 +180,7 @@ WebSocket worker background tasks:
 REST request -> auth middleware (`X-API-Key` / bearer / query) -> route -> storage/service.
 `/health` remains low-cost and should avoid DB dependency.
 
-### 5.2 Tick-to-Candle Flow (v0.9.13)
+### 5.2 Tick-to-Candle Flow (v0.9.14)
 
 ```
 EODHD message

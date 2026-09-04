@@ -14,6 +14,48 @@ compared against this file. See *Versioning and changelog* in
 > the commits they cover; they are not release notes written at the time, and
 > they may omit changes that left no trace in a commit message.
 
+## [0.9.14] - 2026-09-04
+
+### Added
+- **`subscription_health` in `GET /status`.** Reports freshness per subscribed
+  ticker, not just per connection: how many are ticking, how many have been
+  silent past `SUBSCRIPTION_SILENCE_MINUTES` (default 15), which have never
+  produced a tick at all, and the silent ones listed longest-first.
+
+  This exists because two tickers went quiet in production for two days and
+  nothing noticed. SPCX and DASH streamed on 2 September and stopped; the
+  connection stayed healthy, the other 49 tickers were fine, and no log line
+  said otherwise. Over the same session the consolidated tape showed 106 million
+  shares for SPCX. EODHD accepts a subscription silently and never streams a
+  symbol it does not carry, which is exactly the failure its own reliability
+  guidance names: *"Partial symbol starvation: some symbols keep updating while
+  others stop. A connection-level health check can look fine while one symbol is
+  stale."*
+
+  Silence is reported, not judged. Outside the main session most symbols are
+  legitimately quiet, so no threshold can separate "thin stock" from "dead
+  subscription" on its own; the consumer decides. `last_tick_at` on
+  `GET /tickers` is unchanged and remains the per-row source.
+
+### Changed
+- **`README.md` and `ARCHITECTURE.md` §4.4 now state what the feed actually
+  carries.** The EODHD US stream is Cboe EDGX -- a single exchange, not the
+  consolidated (SIP) tape -- so it excludes other venues, off-exchange trades
+  and FINRA TRF prints. Measured against the same provider's Intraday Historical
+  API across 51 tickers on 3 September 2026: **2.8% of consolidated volume**
+  (0.7-5.6% per ticker, median 2.8%), and **88.7% of main-session minutes with
+  no candle had trades elsewhere**.
+
+  Prices are real executions, so OHLC is sound; it is volume and the presence of
+  a candle that are partial. Anyone reading volume as shares traded on the market
+  was reading it wrong, and nothing in the documentation said so.
+
+  This also settles the empty-interval question for good: an absent candle means
+  "no EDGX print this minute", not "nobody traded", so filling one would state
+  something false almost nine times in ten. The *Candle correctness* rule in
+  `AI_WEBSOCKET_ENGINE.md` stands unamended, and the audit added in 0.9.11 has
+  served its purpose.
+
 ## [0.9.13] - 2026-09-04
 
 ### Fixed
