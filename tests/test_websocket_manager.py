@@ -4,6 +4,8 @@ Tests for WebSocketManager authorization flow.
 
 import asyncio
 import json
+from datetime import datetime, timezone
+
 import pytest
 from unittest.mock import Mock, AsyncMock, patch, MagicMock
 
@@ -195,3 +197,109 @@ class TestWebSocketManagerStatus:
         assert status['connection_count'] == 0
         assert status['tick_count'] == 0
         assert status['last_message'] is None
+
+
+class TestFreshTickWatchdog:
+    """Only a current trade counts as evidence that the feed is live.
+
+    EODHD replays the previous session's last trade when a subscription is
+    made. Counting that snapshot as activity kept the silent-feed watchdog in
+    its tight mode overnight, tearing down a healthy socket every 66 seconds
+    and never letting the relaxation logic engage: 873 reconnects across two
+    nights, with the "silent connection" path never once taken.
+    """
+
+    @staticmethod
+    def _manager(**kwargs):
+        kwargs.setdefault('api_key', 'test_key')
+        kwargs.setdefault('tick_max_age_seconds', 180)
+        manager = WebSocketManager(**kwargs)
+        manager._authorized = True
+        return manager
+
+    @staticmethod
+    def _tick(age_seconds=0.0, ticker='AAPL', price=150.0):
+        now_ms = datetime.now(timezone.utc).timestamp() * 1000
+        return json.dumps({
+            's': ticker,
+            'p': price,
+            'v': 100,
+            't': int(now_ms - age_seconds * 1000),
+        })
+
+    def test_default_is_disabled(self):
+        """Unset, the manager behaves as before: any tick counts."""
+        manager = WebSocketManager(api_key='test_key')
+        assert manager.tick_max_age_seconds == 0
+
+    def test_negative_age_is_rejected(self):
+        with pytest.raises(ValueError, match='tick_max_age_seconds'):
+            WebSocketManager(api_key='test_key', tick_max_age_seconds=-1)
+
+    @pytest.mark.asyncio
+    async def test_a_current_trade_counts_as_activity(self):
+        manager = self._manager()
+
+        await manager._process_message(self._tick(age_seconds=0))
+
+        assert manager._tick_count == 1
+        assert manager._fresh_tick_count == 1
+
+    @pytest.mark.asyncio
+    async def test_a_replayed_trade_does_not_count_as_activity(self):
+        """The overnight snapshot: counted as a message, not as a live feed."""
+        manager = self._manager(tick_max_age_seconds=180)
+
+        # A trade from the previous session, hours old.
+        await manager._process_message(self._tick(age_seconds=6 * 3600))
+
+        assert manager._tick_count == 1, "still a message, and still forwarded"
+        assert manager._fresh_tick_count == 0, "but not evidence of a live feed"
+
+    @pytest.mark.asyncio
+    async def test_the_boundary_is_the_configured_age(self):
+        manager = self._manager(tick_max_age_seconds=180)
+
+        await manager._process_message(self._tick(age_seconds=179))
+        assert manager._fresh_tick_count == 1
+
+        await manager._process_message(self._tick(age_seconds=181))
+        assert manager._fresh_tick_count == 1, "older than the limit"
+
+    @pytest.mark.asyncio
+    async def test_a_future_timestamp_still_counts(self):
+        """Clock skew must not make a live feed look dead."""
+        manager = self._manager(tick_max_age_seconds=180)
+
+        await manager._process_message(self._tick(age_seconds=-5))
+
+        assert manager._fresh_tick_count == 1
+
+    @pytest.mark.asyncio
+    async def test_disabled_check_counts_every_tick(self):
+        manager = self._manager(tick_max_age_seconds=0)
+
+        await manager._process_message(self._tick(age_seconds=6 * 3600))
+
+        assert manager._fresh_tick_count == 1
+
+    @pytest.mark.asyncio
+    async def test_a_stale_tick_is_still_delivered_to_the_callback(self):
+        """The manager judges liveness; dropping ticks stays the engine's call."""
+        seen = []
+        manager = self._manager(tick_max_age_seconds=180)
+        manager.set_on_tick(
+            lambda t, p, v, ts: seen.append((t, p, v, ts)),
+            fire_and_forget=False
+        )
+
+        await manager._process_message(self._tick(age_seconds=6 * 3600))
+
+        assert len(seen) == 1
+        assert seen[0][0] == 'AAPL'
+
+    def test_status_reports_both_counts(self):
+        manager = self._manager()
+        status = manager.get_status()
+        assert status['tick_count'] == 0
+        assert status['fresh_tick_count'] == 0

@@ -640,7 +640,8 @@ async def run_worker(config: Config):
         reconnect_delay=config.ws_reconnect_delay,
         ping_interval=config.ws_ping_interval,
         data_timeout=config.ws_data_timeout,
-        max_silent_timeout=config.ws_max_silent_timeout
+        max_silent_timeout=config.ws_max_silent_timeout,
+        tick_max_age_seconds=config.tick_max_age_seconds
     )
     
     # Bounded queue + fixed workers to apply backpressure under high tick volume

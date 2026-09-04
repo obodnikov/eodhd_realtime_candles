@@ -36,7 +36,7 @@ class WebSocketManager:
     def __init__(self, api_key: str, reconnect_delay: int = 5, ping_interval: int = 30, 
                  auth_timeout: int = 10, is_dummy: bool = False,
                  max_reconnect_delay: int = 60, data_timeout: int = 60,
-                 max_silent_timeout: int = 900):
+                 max_silent_timeout: int = 900, tick_max_age_seconds: int = 0):
         if reconnect_delay < 1:
             raise ValueError(f"reconnect_delay must be >= 1, got {reconnect_delay}")
         if max_reconnect_delay < 1:
@@ -45,6 +45,10 @@ class WebSocketManager:
             raise ValueError(f"data_timeout must be >= 1, got {data_timeout}")
         if max_silent_timeout < 1:
             raise ValueError(f"max_silent_timeout must be >= 1, got {max_silent_timeout}")
+        if tick_max_age_seconds < 0:
+            raise ValueError(
+                f"tick_max_age_seconds must be >= 0, got {tick_max_age_seconds}"
+            )
         # Ensure max is at least as large as base delay
         max_reconnect_delay = max(max_reconnect_delay, reconnect_delay)
         # The silent-feed ceiling can never be tighter than the first-data timeout
@@ -58,6 +62,10 @@ class WebSocketManager:
         self.is_dummy = is_dummy  # Flag to identify dummy instances in API workers
         self.max_reconnect_delay = max_reconnect_delay  # Cap for exponential backoff
         self.max_silent_timeout = max_silent_timeout  # Ceiling for the relaxed silent-feed watchdog
+        # Age beyond which a trade is too old to count as evidence that the feed
+        # is live. Matches the engine's own staleness rule so both agree on what
+        # "a current tick" means. 0 disables the check.
+        self.tick_max_age_seconds = tick_max_age_seconds
         
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._subscribed_tickers: Set[str] = set()
@@ -76,6 +84,12 @@ class WebSocketManager:
         # Outside trading hours this is the normal state, so the watchdog relaxes
         # rather than tearing down a healthy socket every few minutes.
         self._silent_connections = 0
+        # Ticks whose trade time was close to now. EODHD replays the previous
+        # session's last trade on subscribe, so a bare message count cannot tell
+        # a live feed from a snapshot of a closed market -- and treating that
+        # snapshot as activity kept the watchdog in its tight mode all night,
+        # tearing down a healthy socket every 66 seconds.
+        self._fresh_tick_count = 0
 
         # Callback for processing ticks (auto-detects sync vs async)
         self._on_tick: Optional[Callable[[str, float, int, int], Union[None, Awaitable[None]]]] = None
@@ -260,6 +274,16 @@ class WebSocketManager:
                 
                 self._tick_count += 1
                 self._last_message_time = datetime.now(timezone.utc)
+
+                # Only a trade close to the present proves the feed is live.
+                if self.tick_max_age_seconds > 0:
+                    age_seconds = (
+                        datetime.now(timezone.utc).timestamp() - timestamp_ms / 1000
+                    )
+                    if age_seconds <= self.tick_max_age_seconds:
+                        self._fresh_tick_count += 1
+                else:
+                    self._fresh_tick_count += 1
                 
                 if self._on_tick:
                     if self._fire_and_forget_ticks:
@@ -423,7 +447,7 @@ class WebSocketManager:
                         #      the previous connection died from a 500 (then use tight timeout).
                         #   2. After first tick: use data_timeout to detect feed going silent.
                         received_tick_on_connection = False
-                        tick_count_at_start = self._tick_count
+                        tick_count_at_start = self._fresh_tick_count
                         
                         # If last failure was a server error, the feed was active —
                         # use tight timeout to recover faster instead of waiting 5 minutes
@@ -474,7 +498,7 @@ class WebSocketManager:
                             await self._process_message(message)
                             
                             # Detect first tick on this connection by comparing tick count
-                            if not received_tick_on_connection and self._tick_count > tick_count_at_start:
+                            if not received_tick_on_connection and self._fresh_tick_count > tick_count_at_start:
                                 received_tick_on_connection = True
                                 # Data is flowing again — drop back to the tight watchdog
                                 self._silent_connections = 0
@@ -559,6 +583,7 @@ class WebSocketManager:
             'pending_subscribe': list(self._pending_subscribe),
             'connection_count': self._connection_count,
             'tick_count': self._tick_count,
+            'fresh_tick_count': self._fresh_tick_count,
             'last_message': self._last_message_time.isoformat() if self._last_message_time else None,
             'consecutive_failures': self._consecutive_failures,
             'silent_connections': self._silent_connections,

@@ -14,6 +14,37 @@ compared against this file. See *Versioning and changelog* in
 > the commits they cover; they are not release notes written at the time, and
 > they may omit changes that left no trace in a commit message.
 
+## [0.9.13] - 2026-09-04
+
+### Fixed
+- **The silent-feed watchdog tore down a healthy connection every 66 seconds all
+  night: 873 reconnects across two nights, 437 per night.** EODHD replays the
+  previous session's last trade when a subscription is made. The manager counted
+  that snapshot as activity, so `received_tick_on_connection` went true, the
+  watchdog stayed in its tight 60-second mode, and the relaxation logic that
+  exists for exactly this case never engaged once — the "silent connection" path
+  was taken zero times in two days. The trade itself was then dropped by the
+  engine as stale, so no candle appeared and nothing in the log hinted at the
+  cause.
+
+  A trade now counts as evidence of a live feed only when its trade time is
+  close to the present, judged by the same `TICK_MAX_AGE_SECONDS` the engine
+  uses to drop stale ticks, so both agree on what a current tick is. Overnight
+  the existing relaxation takes over: 300 s, then 600 s, then the
+  `WS_MAX_SILENT_TIMEOUT` ceiling — about **33 reconnects a night instead of
+  437**. Daytime behaviour is unchanged: the first real tick resets the counter
+  and the tight watchdog returns, so a feed that genuinely dies is still caught
+  in 60 seconds.
+
+  Stale ticks are still forwarded to the engine, which remains the only place
+  that decides whether to aggregate them. The manager only judges liveness.
+
+### Added
+- `WebSocketManager` takes `tick_max_age_seconds` (default `0`, meaning every
+  tick counts, as before). The WebSocket worker passes the configured value.
+- `fresh_tick_count` in `GET /status` alongside `tick_count`. A large gap
+  between the two means the feed is mostly replaying old trades.
+
 ## [0.9.12] - 2026-09-04
 
 ### Fixed
