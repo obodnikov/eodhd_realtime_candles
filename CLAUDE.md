@@ -20,6 +20,8 @@ workers) sharing a single SQLite-WAL or PostgreSQL backend under supervisord.
 2. The relevant `AI_*.md` file(s) for the code you are touching — coding rules (see below).
 3. [docs/](docs/) — deployment, migration, and operational guides; [docs/chats/](docs/chats/) for
    prior implementation history and review context.
+4. [analysis/](analysis/) — measurement tools that read and compare, never write. Use
+   `compare_with_intraday.py` before trusting any claim about feed coverage or missing minutes.
 
 ## Coding rules live in `AI_*.md` (do not duplicate them here or in ARCHITECTURE.md)
 

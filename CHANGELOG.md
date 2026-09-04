@@ -37,6 +37,15 @@ compared against this file. See *Versioning and changelog* in
   subscription" on its own; the consumer decides. `last_tick_at` on
   `GET /tickers` is unchanged and remains the per-row source.
 
+### Added (tooling)
+- **`analysis/compare_with_intraday.py`** — reproduces the measurement above
+  against any session, so the figures in ARCHITECTURE.md §4.4 can be re-checked
+  rather than taken on trust. Reads the service's own candles and the provider's
+  full tape, reports volume share and false-empty minutes per ticker, and names
+  any ticker producing no candle at all while the tape shows it trading. Refuses
+  to run unless the service is aggregating at 1 minute, since the reference bars
+  are 1-minute.
+
 ### Changed
 - **`README.md` and `ARCHITECTURE.md` §4.4 now state what the feed actually
   carries.** The EODHD US stream is Cboe EDGX -- a single exchange, not the
