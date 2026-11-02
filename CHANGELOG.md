@@ -14,6 +14,77 @@ compared against this file. See *Versioning and changelog* in
 > the commits they cover; they are not release notes written at the time, and
 > they may omit changes that left no trace in a commit message.
 
+## [0.9.15] - 2026-11-02
+
+### Changed
+- **The AI-coding rule set now matches the code it governs.** The previous set
+  was written on 2026-09-02, before 0.9.10-0.9.14 landed, so it described a
+  service that closed candles on the next tick, had no log buffer, and reported
+  only connection-level health. It also carried generic guidance copied from
+  other projects: methods that do not exist here (`get_data`, `get_stats`),
+  a dependency menu naming FastAPI and SQLAlchemy, and the same
+  `asyncio.to_thread` and `/health` rules repeated in three files at once.
+
+  Every rule file is now project-specific and de-duplicated — each rule has
+  exactly one home, and the other files point at it:
+
+  - `AI.md` — general Python rules for `src/**`, `scripts/**`, `tests/**`,
+    `analysis/**`: relative imports inside the package, dotenv at the entry
+    points, the env-var contract between `src/config.py` and `.env.example`,
+    and the rule that `analysis/**` reads and compares but never writes.
+  - `AI_REST_API.md` — adds `/logs` (database first, in-memory ring buffer as
+    fallback, and the response says which), `subscription_health` in
+    `GET /status`, the `202` + database hand-off that `POST /reconnect` uses
+    instead of restarting a feed connection inside an API worker, and the
+    `version` field.
+  - `AI_WEBSOCKET_ENGINE.md` — adds the three tick filters and who owns each
+    (stale by age, out-of-order, late-for-a-closed-bucket), the timer that
+    closes a candle interval rather than the next tick, the empty-interval
+    audit that measures without writing, the reconnect-request task, and the
+    rule that an absent candle is not an empty candle.
+  - `AI_FLASK.md` — adds the log viewer, its level filter and limit clamp, and
+    the `ADMIN_*` variables the UI reads.
+  - `AI_SQLITE.md` / `AI_POSTGRESQL.md` — rewritten from generic tutorials into
+    the settings this code actually uses: the PRAGMAs, the thread-local
+    connection, the retry helper, the WAL checkpoint, and the two places the
+    PostgreSQL schema is defined that must be kept in step with each other.
+
+  `CLAUDE.md` gains the codebase-verification rule, the provider-verification
+  rule (the EODHD feed's behaviour is not in this repository — check the
+  provider's documentation and re-measure with
+  `analysis/compare_with_intraday.py` rather than reasoning from memory), the
+  recurring traps, and a pointer to the `semantic-index` skill for searching
+  this repo.
+
+  `ARCHITECTURE.md` picks up the components that were missing: `log_buffer.py`,
+  the storage factory, `analysis/`, and the reconnect-request task in the
+  background-task list, plus the seven environment variables added since
+  2026-09-02 and their owners in the stability zones.
+
+  No runtime behaviour changed: this release moves documentation only.
+
+### Fixed
+- **The review-fix-loop skill could be killed mid-review.** Its timeout was 15
+  minutes while `code-review.sh` is allowed 55 minutes
+  (`REVIEW_TOTAL_BUDGET=3300` in `~/mbin/.env`), so the calling agent could
+  terminate the script while it was still retrying — and the diagnostic it
+  would have printed was lost with it. The timeout is now 60 minutes, longer
+  than the budget the script is allowed to spend.
+
+  The skill also did not recognise `SERVICE_ERROR`, the outcome the script
+  produces when the review service is unreachable: a run that never reviewed
+  anything was counted as an iteration, and a service failure looked like
+  review feedback. A `SERVICE_ERROR` run now ends the loop, changes no code,
+  and does not consume an iteration.
+
+### Removed
+- **A broken self-referencing symlink** at `.agents/skills/skills` (it pointed
+  at itself), tracked in git and resolvable to nothing.
+
+### Added
+- **A project-level `.pi/bash-restrictions.json`**, holding only what the
+  global `~/.pi/agent/bash-restrictions.json` does not already cover.
+
 ## [0.9.14] - 2026-09-04
 
 ### Added
