@@ -3,9 +3,41 @@ Tests for LogBufferHandler and log buffer integration.
 """
 
 import logging
+from unittest.mock import patch
+
 import pytest
 
-from src.log_buffer import LogBufferHandler, get_log_buffer, install_log_buffer
+from src.log_buffer import LogBufferHandler, LogThrottle, get_log_buffer, install_log_buffer
+
+
+class TestLogThrottle:
+    """A failure repeating per tick must not erase the rest of the log."""
+
+    def test_the_first_occurrence_is_let_through(self):
+        assert LogThrottle(interval_seconds=60).allow() == 1
+
+    def test_repeats_inside_the_interval_are_held_back(self):
+        throttle = LogThrottle(interval_seconds=60)
+        with patch('src.log_buffer.time.monotonic', return_value=100.0):
+            assert throttle.allow() == 1
+            assert throttle.allow() is None
+            assert throttle.allow() is None
+
+    def test_the_next_line_reports_everything_held_back(self):
+        throttle = LogThrottle(interval_seconds=60)
+        with patch('src.log_buffer.time.monotonic', return_value=100.0):
+            throttle.allow()
+            throttle.allow()
+            throttle.allow()
+        with patch('src.log_buffer.time.monotonic', return_value=160.0):
+            assert throttle.allow() == 3, "two held back, plus this one"
+
+    def test_the_count_starts_again_after_each_line(self):
+        throttle = LogThrottle(interval_seconds=60)
+        with patch('src.log_buffer.time.monotonic', return_value=100.0):
+            throttle.allow()
+        with patch('src.log_buffer.time.monotonic', return_value=200.0):
+            assert throttle.allow() == 1
 
 
 class TestLogBufferHandler:

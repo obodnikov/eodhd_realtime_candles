@@ -46,9 +46,18 @@ class TrackedTicker:
     last_price: Optional[float]
     candle_count: int
     last_candle_request_at: Optional[str]
-    
+    # Start of the newest stored candle, finished or not.
+    last_candle_at: Optional[str] = None
+
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+def candle_time_iso(timestamp: Optional[int]) -> Optional[str]:
+    """A candle's Unix-seconds timestamp as ISO 8601 UTC, like the other ticker times."""
+    if timestamp is None:
+        return None
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
 
 
 class Storage:
@@ -296,6 +305,9 @@ class Storage:
                 candle_write_dropped_count INTEGER NOT NULL DEFAULT 0,
                 stale_tick_dropped_count INTEGER NOT NULL DEFAULT 0,
                 out_of_order_tick_dropped_count INTEGER NOT NULL DEFAULT 0,
+                future_tick_dropped_count INTEGER NOT NULL DEFAULT 0,
+                late_tick_dropped_count INTEGER NOT NULL DEFAULT 0,
+                tick_failed_count INTEGER NOT NULL DEFAULT 0,
                 last_message TEXT,
                 last_update TEXT NOT NULL
             )
@@ -324,7 +336,13 @@ class Storage:
             cursor.execute("ALTER TABLE websocket_status ADD COLUMN stale_tick_dropped_count INTEGER NOT NULL DEFAULT 0")
         if 'out_of_order_tick_dropped_count' not in ws_columns:
             cursor.execute("ALTER TABLE websocket_status ADD COLUMN out_of_order_tick_dropped_count INTEGER NOT NULL DEFAULT 0")
-        
+        if 'future_tick_dropped_count' not in ws_columns:
+            cursor.execute("ALTER TABLE websocket_status ADD COLUMN future_tick_dropped_count INTEGER NOT NULL DEFAULT 0")
+        if 'late_tick_dropped_count' not in ws_columns:
+            cursor.execute("ALTER TABLE websocket_status ADD COLUMN late_tick_dropped_count INTEGER NOT NULL DEFAULT 0")
+        if 'tick_failed_count' not in ws_columns:
+            cursor.execute("ALTER TABLE websocket_status ADD COLUMN tick_failed_count INTEGER NOT NULL DEFAULT 0")
+
         # Active candles status table (for multi-worker status sharing)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS active_candles_status (
@@ -404,9 +422,10 @@ class Storage:
                 t.last_tick_at,
                 t.last_price,
                 t.last_candle_request_at,
-                COUNT(c.id) as candle_count
+                COUNT(CASE WHEN c.is_complete = 1 THEN 1 END) as candle_count,
+                MAX(c.timestamp) as last_candle_ts
             FROM tickers t
-            LEFT JOIN candles c ON t.symbol = c.ticker AND c.is_complete = 1
+            LEFT JOIN candles c ON t.symbol = c.ticker
             GROUP BY t.symbol
             ORDER BY t.symbol
         ''')
@@ -420,9 +439,10 @@ class Storage:
                 last_tick_at=row['last_tick_at'],
                 last_price=row['last_price'],
                 candle_count=row['candle_count'],
-                last_candle_request_at=row['last_candle_request_at']
+                last_candle_request_at=row['last_candle_request_at'],
+                last_candle_at=candle_time_iso(row['last_candle_ts'])
             ))
-        
+
         return tickers
     
     def get_ticker_symbols(self) -> List[str]:
@@ -475,9 +495,10 @@ class Storage:
                 t.last_tick_at,
                 t.last_price,
                 t.last_candle_request_at,
-                COUNT(c.id) as candle_count
+                COUNT(CASE WHEN c.is_complete = 1 THEN 1 END) as candle_count,
+                MAX(c.timestamp) as last_candle_ts
             FROM tickers t
-            LEFT JOIN candles c ON t.symbol = c.ticker AND c.is_complete = 1
+            LEFT JOIN candles c ON t.symbol = c.ticker
             WHERE t.symbol = ?
             GROUP BY t.symbol
         ''', (symbol.upper(),))
@@ -493,7 +514,8 @@ class Storage:
             last_tick_at=row['last_tick_at'],
             last_price=row['last_price'],
             candle_count=row['candle_count'],
-            last_candle_request_at=row['last_candle_request_at']
+            last_candle_request_at=row['last_candle_request_at'],
+            last_candle_at=candle_time_iso(row['last_candle_ts'])
         )
 
     def get_ticker_count(self) -> int:
@@ -977,8 +999,9 @@ class Storage:
                 tick_enqueued_count, tick_processed_count, tick_dropped_count,
                 candle_write_queue_size, candle_write_queue_maxsize, candle_write_dropped_count,
                 stale_tick_dropped_count, out_of_order_tick_dropped_count,
+                future_tick_dropped_count, late_tick_dropped_count, tick_failed_count,
                 last_message, last_update
-            ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             1 if status.get('connected') else 0,
             json.dumps(status.get('subscribed_tickers', [])),
@@ -996,6 +1019,9 @@ class Storage:
             status.get('candle_write_dropped_count', 0),
             status.get('stale_tick_dropped_count', 0),
             status.get('out_of_order_tick_dropped_count', 0),
+            status.get('future_tick_dropped_count', 0),
+            status.get('late_tick_dropped_count', 0),
+            status.get('tick_failed_count', 0),
             status.get('last_message'),
             datetime.now(timezone.utc).isoformat()
         ))
@@ -1064,6 +1090,9 @@ class Storage:
             'candle_write_dropped_count': row['candle_write_dropped_count'],
             'stale_tick_dropped_count': row['stale_tick_dropped_count'],
             'out_of_order_tick_dropped_count': row['out_of_order_tick_dropped_count'],
+            'future_tick_dropped_count': row['future_tick_dropped_count'],
+            'late_tick_dropped_count': row['late_tick_dropped_count'],
+            'tick_failed_count': row['tick_failed_count'],
             'last_message': row['last_message'],
             'last_update': row['last_update'],
             'is_stale': is_stale,

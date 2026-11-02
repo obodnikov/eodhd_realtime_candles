@@ -1,7 +1,8 @@
 # analysis/
 
 Measurement tools. Nothing here runs as part of the service, and nothing here
-writes to its database — these scripts read, compare and print.
+writes candles — these scripts read, compare and print. The one field their
+reads do change is described under *One thing these reads change*.
 
 They exist because two questions about this service can only be answered with
 numbers, and both were once answered with estimates that turned out wrong.
@@ -56,6 +57,34 @@ active name prints in every minute even on one venue, a thin one does not. On
 that day 14 of 51 tickers had all 390 minutes, and 5 lost more than half.
 
 Re-run it after a session to confirm those figures still hold.
+
+### Same-exchange check: `--feed-bars`
+
+The figures above describe the feed and the service together, because Intraday
+covers every exchange. To measure the service alone, compare against the minute
+bars EODHD builds from the same exchange feed:
+
+```bash
+# every tracked ticker, the latest minutes
+python analysis/compare_with_intraday.py --feed-bars
+
+# a few tickers
+python analysis/compare_with_intraday.py --feed-bars --tickers NVDA,ONT
+```
+
+A minute these bars have and the service does not is a loss inside the service,
+so the result should be close to 100%. It works during the session, when Intraday
+has nothing yet. The provider returns at most 120 bars per ticker, so it covers
+only the latest minutes and takes no date. The two newest minutes are left out,
+because a candle may not be stored yet.
+
+### One thing these reads change
+
+`GET /candles/{ticker}` records the request in `last_candle_request_at`, and
+`scripts/manage_tickers.py` uses that field to choose which tickers to remove. A
+full run of this script therefore marks every ticker as just requested. This does
+no harm where clients poll every ticker anyway, but on an installation where some
+tickers really are unused, it hides that until they age again.
 
 ## A note on `empty_interval_audit.jsonl`
 

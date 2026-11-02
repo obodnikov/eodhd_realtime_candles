@@ -36,7 +36,8 @@ class WebSocketManager:
     def __init__(self, api_key: str, reconnect_delay: int = 5, ping_interval: int = 30, 
                  auth_timeout: int = 10, is_dummy: bool = False,
                  max_reconnect_delay: int = 60, data_timeout: int = 60,
-                 max_silent_timeout: int = 900, tick_max_age_seconds: int = 0):
+                 max_silent_timeout: int = 900, tick_max_age_seconds: int = 0,
+                 tick_max_future_seconds: int = 60):
         if reconnect_delay < 1:
             raise ValueError(f"reconnect_delay must be >= 1, got {reconnect_delay}")
         if max_reconnect_delay < 1:
@@ -48,6 +49,10 @@ class WebSocketManager:
         if tick_max_age_seconds < 0:
             raise ValueError(
                 f"tick_max_age_seconds must be >= 0, got {tick_max_age_seconds}"
+            )
+        if tick_max_future_seconds < 1:
+            raise ValueError(
+                f"tick_max_future_seconds must be >= 1, got {tick_max_future_seconds}"
             )
         # Ensure max is at least as large as base delay
         max_reconnect_delay = max(max_reconnect_delay, reconnect_delay)
@@ -66,7 +71,11 @@ class WebSocketManager:
         # is live. Matches the engine's own staleness rule so both agree on what
         # "a current tick" means. 0 disables the check.
         self.tick_max_age_seconds = tick_max_age_seconds
-        
+        # How far ahead of the clock a trade may be stamped and still count as
+        # current. The engine drops anything beyond this, so a tick it will not
+        # use must not persuade the watchdog that the feed is live either.
+        self.tick_max_future_seconds = tick_max_future_seconds
+
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._subscribed_tickers: Set[str] = set()
         self._pending_subscribe: Set[str] = set()
@@ -75,6 +84,10 @@ class WebSocketManager:
         self._connected = False
         self._authorized = False  # Track authorization state
         self._running = False
+        # The one task running _connection_loop. stop() must see it finish before
+        # start() may create another: two loops share every field on this object
+        # and compete for the token's symbol allowance.
+        self._connection_task: Optional[asyncio.Task] = None
         self._last_message_time: Optional[datetime] = None
         self._connection_count = 0
         self._tick_count = 0
@@ -276,15 +289,17 @@ class WebSocketManager:
                 self._last_message_time = datetime.now(timezone.utc)
 
                 # Only a trade close to the present proves the feed is live.
-                if self.tick_max_age_seconds > 0:
-                    age_seconds = (
-                        datetime.now(timezone.utc).timestamp() - timestamp_ms / 1000
-                    )
-                    if age_seconds <= self.tick_max_age_seconds:
-                        self._fresh_tick_count += 1
-                else:
+                age_seconds = (
+                    datetime.now(timezone.utc).timestamp() - timestamp_ms / 1000
+                )
+                too_old = (
+                    self.tick_max_age_seconds > 0
+                    and age_seconds > self.tick_max_age_seconds
+                )
+                too_far_ahead = age_seconds < -self.tick_max_future_seconds
+                if not too_old and not too_far_ahead:
                     self._fresh_tick_count += 1
-                
+
                 if self._on_tick:
                     if self._fire_and_forget_ticks:
                         # Fire-and-forget mode: don't await tick processing.
@@ -562,16 +577,33 @@ class WebSocketManager:
         self._running = True
         self._consecutive_failures = 0  # Fresh start with base reconnect timing
         self._silent_connections = 0  # Fresh start with the tight data watchdog
-        asyncio.create_task(self._connection_loop())
+        self._connection_task = asyncio.create_task(self._connection_loop())
         logger.info("WebSocket manager started")
-    
+
     async def stop(self):
-        """Stop the WebSocket connection."""
+        """
+        Stop the WebSocket connection and wait for its loop to end.
+
+        Clearing the flag is not enough. A loop waiting to reconnect has no
+        socket to close, so when start() follows straight away it wakes to find
+        the flag set again and carries on beside the new loop. Cancelling covers
+        every place the loop can be waiting: the websockets documentation allows
+        cancelling both the opening handshake and recv().
+        """
         self._running = False
-        
+
         if self._ws:
-            await self._ws.close()
-        
+            try:
+                await self._ws.close()
+            except Exception as e:
+                logger.warning(f"Error closing WebSocket during stop: {e}")
+
+        task = self._connection_task
+        self._connection_task = None
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
         logger.info("WebSocket manager stopped")
     
     def get_status(self) -> dict:

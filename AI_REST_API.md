@@ -64,6 +64,14 @@ is the coding contract. Persistence rules live in [AI_SQLITE.md](AI_SQLITE.md) a
   which never produced a tick. This exists because the provider accepts a subscription silently
   and never streams a symbol it does not carry — a connection-level health check looks fine while
   one symbol is dead. Do not collapse per-ticker freshness back into a single connection flag.
+  It also lists `ticking_without_candles`, because fresh ticks do not prove that candles are being
+  made. That comparison uses the newest stored candle, finished or not: a quiet stock's first
+  trade in an hour must not look like a gap while its candle is still open.
+- The tick counters in `GET /status` come from the `websocket_status` row, so an API worker can
+  report only what that row stores. A new counter needs its column in `storage.py`,
+  `storage_postgres.py` and `scripts/init_postgres.sql`, and its place in the status task's change
+  check. `tick_processed_count` counts ticks the engine handled without an error, including those
+  it dropped on purpose; it does not mean they reached a candle.
 - `GET /logs` reads the shared log store: the database when the backend supports
   `get_log_entries`, otherwise the in-memory ring buffer (`src/log_buffer.py`), and falls back to
   the buffer again if the DB read fails. The response reports which source was used

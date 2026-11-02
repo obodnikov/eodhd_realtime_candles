@@ -8,10 +8,49 @@ for display in the admin panel without file I/O.
 
 import logging
 import threading
+import time
 import queue
 from collections import deque
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
+
+
+class LogThrottle:
+    """
+    Decides whether a message that repeats per tick may be logged now.
+
+    The database keeps only the newest entries, so a failure repeating hundreds
+    of times a second erases everything logged before it, including whatever
+    would have dated its start. Callers report one line per interval, carrying
+    the number of occurrences it stands for, and keep their own exact counter.
+
+    Thread-safe: process_tick runs in a thread pool.
+    """
+
+    def __init__(self, interval_seconds: float = 60.0):
+        self.interval_seconds = interval_seconds
+        self._lock = threading.Lock()
+        self._last_logged: Optional[float] = None
+        self._occurrences = 0
+
+    def allow(self) -> Optional[int]:
+        """
+        Record one occurrence.
+
+        Returns:
+            The occurrences since the last line, this one included, when a line
+            may be written now; None when it should be held back.
+        """
+        now = time.monotonic()
+        with self._lock:
+            self._occurrences += 1
+            if (self._last_logged is not None
+                    and now - self._last_logged < self.interval_seconds):
+                return None
+            occurrences = self._occurrences
+            self._occurrences = 0
+            self._last_logged = now
+            return occurrences
 
 
 class LogBufferHandler(logging.Handler):

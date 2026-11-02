@@ -1033,6 +1033,138 @@ class TestCandleEngineTickGuards(unittest.TestCase):
         self.assertEqual(metrics["out_of_order_tick_dropped_count"], 1)
 
 
+class TestCandleEngineFutureTickGuard(unittest.TestCase):
+    """A timestamp ahead of the clock must leave the engine untouched.
+
+    On 2 November 2026 EODHD sent 19-digit values in the millisecond field `t`.
+    One such tick became the ticker's last-seen time, so every ordinary tick
+    after it looked out of order, and its candle could neither be written nor
+    closed. All 50 tickers produced nothing until the worker was restarted, and
+    KLAC and UNH had been stuck the same way for over two weeks.
+    """
+
+    # A value from the production log.
+    BAD_T = 1793636889494600000
+
+    def setUp(self):
+        self.storage = Mock()
+        self.engine = CandleEngine(
+            self.storage,
+            interval_minutes=1,
+            max_candles=100,
+            save_every_n_ticks=1000,
+            save_every_m_seconds=1000.0,
+            ticker_status_update_interval_seconds=1.0,
+            tick_max_age_seconds=180,
+            tick_max_future_seconds=60
+        )
+
+    @staticmethod
+    def _now_ms():
+        return int(datetime.now(timezone.utc).timestamp() * 1000)
+
+    def _metrics(self):
+        return self.engine.get_candle_write_metrics()
+
+    def test_a_19_digit_timestamp_is_dropped_without_an_error(self):
+        self.engine.process_tick("NVDA", 207.0, 100, self.BAD_T)
+
+        self.assertEqual(self._metrics()["future_tick_dropped_count"], 1)
+        self.assertNotIn("NVDA", self.engine._current_candles)
+
+    def test_a_dropped_tick_is_not_remembered_as_the_last_seen_time(self):
+        self.engine.process_tick("NVDA", 207.0, 100, self.BAD_T)
+
+        self.assertNotIn("NVDA", self.engine._last_tick_timestamp_ms)
+
+    def test_a_dropped_tick_does_not_report_the_ticker_as_alive(self):
+        self.engine.process_tick("NVDA", 207.0, 100, self.BAD_T)
+
+        self.assertNotIn("NVDA", self.engine._pending_ticker_status)
+        self.storage.update_ticker_status.assert_not_called()
+
+    def test_ordinary_ticks_keep_flowing_after_a_bad_one(self):
+        """The production sequence: good, bad, then a stream of good ones."""
+        now_ms = self._now_ms()
+        self.engine.process_tick("NVDA", 200.0, 10, now_ms)
+        self.engine.process_tick("NVDA", 999.0, 10, self.BAD_T)
+        for offset in range(1, 101):
+            self.engine.process_tick("NVDA", 201.0, 10, now_ms + offset)
+
+        metrics = self._metrics()
+        self.assertEqual(metrics["out_of_order_tick_dropped_count"], 0)
+        self.assertEqual(metrics["future_tick_dropped_count"], 1)
+        current = self.engine._current_candles["NVDA"]
+        self.assertEqual(current.tick_count, 101)
+        self.assertEqual(current.high, 201.0, "the bad tick's price must not count")
+
+    def test_the_candle_still_closes_on_the_timer(self):
+        now_ms = self._now_ms()
+        self.engine.process_tick("NVDA", 200.0, 10, now_ms)
+        self.engine.process_tick("NVDA", 999.0, 10, self.BAD_T)
+
+        closed = self.engine.close_due_candles(
+            now_timestamp=now_ms // 1000 + 3600, grace_seconds=2.0
+        )
+
+        self.assertEqual([candle.ticker for candle in closed], ["NVDA"])
+        self.assertEqual(closed[0].close, 200.0)
+
+    def test_an_ordinary_length_timestamp_too_far_ahead_is_dropped_too(self):
+        """The rule is about time, not about how many digits a value has."""
+        self.engine.process_tick("NVDA", 200.0, 10, self._now_ms() + 30 * 60 * 1000)
+
+        self.assertEqual(self._metrics()["future_tick_dropped_count"], 1)
+        self.assertNotIn("NVDA", self.engine._current_candles)
+
+    def test_a_small_clock_difference_is_tolerated(self):
+        """The host's clock may run behind the exchange's; that is not bad data."""
+        self.engine.process_tick("NVDA", 200.0, 10, self._now_ms() + 5000)
+
+        self.assertEqual(self._metrics()["future_tick_dropped_count"], 0)
+        self.assertIn("NVDA", self.engine._current_candles)
+
+    def test_the_limit_is_configurable(self):
+        engine = CandleEngine(self.storage, interval_minutes=1, tick_max_future_seconds=1)
+
+        engine.process_tick("NVDA", 200.0, 10, self._now_ms() + 5000)
+
+        self.assertEqual(
+            engine.get_candle_write_metrics()["future_tick_dropped_count"], 1
+        )
+
+    def test_the_guard_works_with_the_age_filter_disabled(self):
+        engine = CandleEngine(self.storage, interval_minutes=1, tick_max_age_seconds=0)
+
+        engine.process_tick("NVDA", 200.0, 10, self.BAD_T)
+
+        self.assertEqual(
+            engine.get_candle_write_metrics()["future_tick_dropped_count"], 1
+        )
+        self.assertNotIn("NVDA", engine._current_candles)
+
+    def test_a_burst_writes_one_log_line_with_the_raw_value(self):
+        with self.assertLogs('src.candle_engine', level='WARNING') as captured:
+            for _ in range(1000):
+                self.engine.process_tick("NVDA", 207.0, 100, self.BAD_T)
+
+        self.assertEqual(self._metrics()["future_tick_dropped_count"], 1000)
+        self.assertEqual(len(captured.output), 1)
+        self.assertIn(str(self.BAD_T), captured.output[0])
+        self.assertIn("NVDA", captured.output[0])
+
+    def test_remove_ticker_forgets_the_last_seen_time(self):
+        """Removing and re-adding a ticker must start it clean."""
+        now_ms = self._now_ms()
+        self.engine.process_tick("NVDA", 200.0, 10, now_ms)
+
+        self.engine.remove_ticker("NVDA")
+        self.engine.process_tick("NVDA", 199.0, 10, now_ms - 1000)
+
+        self.assertEqual(self._metrics()["out_of_order_tick_dropped_count"], 0)
+        self.assertEqual(self.engine._current_candles["NVDA"].close, 199.0)
+
+
 class TestCandleEngineTimeBasedClose(unittest.TestCase):
     """Time-based candle closing (close_due_candles) and the late-tick guard.
 

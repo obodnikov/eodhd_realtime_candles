@@ -2,7 +2,7 @@
 
 # ARCHITECTURE.md
 
-**Version**: 0.9.15
+**Version**: 0.9.16
 **Last Updated**: 2026-11-02
 **Project**: EODHD Real-Time Candle Aggregator
 
@@ -17,7 +17,7 @@ It does not replace coding standards (§8), endpoint docs ([README.md](README.md
 implementation history ([docs/chats/](docs/chats/)). Audience: AI assistants, maintainers,
 reviewers.
 
-> Status: **implemented and in use** — v0.9.15. The multi-worker service is running in production
+> Status: **implemented and in use** — v0.9.16. The multi-worker service is running in production
 > against both SQLite and PostgreSQL; the design below describes what exists, not a plan.
 
 ---
@@ -179,6 +179,13 @@ streams a symbol it does not carry, so the connection can be fine while one tick
 `GET /status` therefore reports freshness per ticker (`subscription_health`), not just per
 connection.
 
+**The feed's timestamps are checked, not trusted.** The documented `t` is epoch milliseconds, but
+on 2 November 2026 EODHD sent 19-digit values which, read as nanoseconds, were 30 minutes ahead of
+the clock. Before 0.9.16 one such tick stopped a ticker producing candles until the worker
+restarted. The engine now drops anything stamped ahead of the clock beyond
+`TICK_MAX_FUTURE_SECONDS` before it touches any state, and counts it. The ticks are lost; the
+ticker is not.
+
 ---
 
 ## 5. Data Flow & Runtime Model
@@ -192,7 +199,7 @@ REST request -> auth middleware (`X-API-Key` / bearer / query) -> route -> stora
 database and returns `202`; the WebSocket worker polls for it and restarts the real feed.
 An API worker never opens a feed connection itself.
 
-### 5.2 Tick-to-Candle Flow (v0.9.15)
+### 5.2 Tick-to-Candle Flow (v0.9.16)
 
 ```
 EODHD message
@@ -208,7 +215,8 @@ Bounded tick queue (maxsize = TICK_QUEUE_MAXSIZE)
    │ consumed by N workers
    ▼
 CandleEngine.process_tick()
-   │ rejects stale ticks (TICK_MAX_AGE_SECONDS) and out-of-order ticks
+   │ rejects ticks stamped ahead of the clock (TICK_MAX_FUTURE_SECONDS),
+   │ stale ticks (TICK_MAX_AGE_SECONDS) and out-of-order ticks
    │ updates in-memory candle state
    │ enqueues candle/status writes (no direct hot-path DB write)
    │
@@ -250,6 +258,7 @@ Important optional vars:
 - `CANDLE_WRITE_QUEUE_MAXSIZE`, `TICK_QUEUE_MAXSIZE`, `TICK_WORKER_CONCURRENCY`
 - `CANDLE_CLOSE_GRACE_SECONDS` (how long past an interval's end a candle may close)
 - `TICK_MAX_AGE_SECONDS` (drop ticks older than this; also the liveness yardstick)
+- `TICK_MAX_FUTURE_SECONDS` (drop ticks stamped further ahead of the clock than this; also the liveness yardstick)
 - `WS_RECONNECT_DELAY`, `WS_PING_INTERVAL`, `WS_DATA_TIMEOUT`
 - `WS_MAX_SILENT_TIMEOUT` (ceiling for the relaxed watchdog, e.g. overnight)
 - `WS_STATUS_STALE_SECONDS` (multi-worker staleness of the status row)

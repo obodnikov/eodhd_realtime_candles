@@ -82,7 +82,8 @@ async def create_app(config: Config) -> web.Application:
         save_every_m_seconds=config.candle_save_every_m_seconds,
         ticker_status_update_interval_seconds=config.ticker_status_update_interval_seconds,
         candle_write_queue_maxsize=config.candle_write_queue_maxsize,
-        tick_max_age_seconds=config.tick_max_age_seconds
+        tick_max_age_seconds=config.tick_max_age_seconds,
+        tick_max_future_seconds=config.tick_max_future_seconds
     )
     
     # Create a dummy WebSocketManager for API compatibility

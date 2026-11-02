@@ -14,11 +14,19 @@ replacement. Comparing the two answers three questions per ticker:
 Run it after any session to confirm the figures in ARCHITECTURE.md section 4.4
 still hold, or when a ticker looks wrong.
 
+Those figures describe the feed and the service together. --feed-bars separates
+them: it compares against the minute bars EODHD builds from the same exchange
+feed, available for the most recent minutes, so a minute the bars have and the
+service does not is a loss inside the service. The result should be close to
+100%, and it works during the session, when Intraday has nothing yet.
+
 Usage:
     python analysis/compare_with_intraday.py 2026-09-03
     python analysis/compare_with_intraday.py 2026-09-03 --tickers NVDA,VPG
     python analysis/compare_with_intraday.py 2026-09-03 --session extended
     python analysis/compare_with_intraday.py 2026-09-03 --csv out.csv
+    python analysis/compare_with_intraday.py --feed-bars
+    python analysis/compare_with_intraday.py --feed-bars --tickers NVDA,VPG
 
 Reads EODHD_API_KEY, API_URL and API_KEY from the environment or .env.
 """
@@ -44,6 +52,11 @@ except ImportError:
 
 ET = ZoneInfo('America/New_York')
 INTRADAY_URL = 'https://eodhd.com/api/intraday/{ticker}.US'
+FEED_BARS_URL = 'https://ws.eodhistoricaldata.com/history'
+
+# A candle closes shortly after its minute ends, so the newest minutes may not
+# be stored yet. Leave them out rather than count them as lost.
+FEED_SETTLE_SECONDS = 120
 
 # Session windows in New York local time, so daylight saving is handled.
 SESSIONS = {
@@ -127,6 +140,30 @@ def fetch_intraday(eodhd_key: str, ticker: str, start_ts: int,
     return out
 
 
+def feed_bars_to_minutes(bars: List[dict]) -> Dict[int, int]:
+    """The provider's minute bars as {minute -> volume}. Their t is milliseconds."""
+    return {int(bar['t']) // 1000: int(bar.get('v') or 0) for bar in bars}
+
+
+def fetch_feed_bars(eodhd_key: str, ticker: str) -> Optional[Dict[int, int]]:
+    """Closed 1-minute bars from the feed this service consumes: {minute -> volume}."""
+    query = urllib.parse.urlencode({
+        'market': 'us', 'symbol': ticker, 'api_token': eodhd_key,
+    })
+    bars = fetch_json(f"{FEED_BARS_URL}?{query}")
+    if bars is None:
+        return None
+    return feed_bars_to_minutes(bars)
+
+
+def feed_window(bars: Dict[int, int], now_ts: int,
+                settle_seconds: int = FEED_SETTLE_SECONDS) -> List[int]:
+    """Minutes to compare: from the oldest bar up to the last settled minute."""
+    if not bars:
+        return []
+    return minute_grid(min(bars), (now_ts - settle_seconds) // 60 * 60)
+
+
 def compare(ours: Dict[int, int], theirs: Dict[int, int],
             grid: List[int]) -> dict:
     """One ticker's figures over the session grid."""
@@ -151,10 +188,84 @@ def compare(ours: Dict[int, int], theirs: Dict[int, int],
     }
 
 
+def write_csv(path: str, rows: List[dict]) -> None:
+    """One row per ticker."""
+    fields = ['ticker', 'our_volume', 'their_volume', 'volume_share',
+              'our_minutes', 'their_minutes', 'minutes_lost', 'our_empty',
+              'traded_elsewhere', 'false_empty_share']
+    with open(path, 'w', newline='', encoding='utf-8') as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows({k: r.get(k) for k in fields} for r in rows)
+    print(f"\nтаблица записана: {path}")
+
+
+def report_feed_bars(api_url: str, api_key: Optional[str], eodhd_key: str,
+                     tickers: List[str], csv_path: Optional[str],
+                     delay: float) -> int:
+    """Compare recent candles with the same exchange's own minute bars."""
+    now_ts = int(time.time())
+    print(f"минутные бары той же биржи, {len(tickers)} бумаг\n")
+
+    rows = []
+    for index, ticker in enumerate(tickers, 1):
+        theirs = fetch_feed_bars(eodhd_key, ticker)
+        time.sleep(delay)
+        if theirs is None:
+            print(f"{index:3d}/{len(tickers)} {ticker:8} пропущено")
+            continue
+        grid = feed_window(theirs, now_ts)
+        if not grid:
+            print(f"{index:3d}/{len(tickers)} {ticker:8} нет закрытых баров")
+            continue
+        ours = fetch_ours(api_url, api_key, ticker, grid[0], grid[-1])
+        if ours is None:
+            print(f"{index:3d}/{len(tickers)} {ticker:8} пропущено")
+            continue
+        result = compare(ours, theirs, grid)
+        result['ticker'] = ticker
+        rows.append(result)
+        share = (f"{result['volume_share']:5.1f}%"
+                 if result['volume_share'] is not None else "    —")
+        print(f"{index:3d}/{len(tickers)} {ticker:8} объём {share}   "
+              f"минут {result['our_minutes']:4d}/{result['their_minutes']:4d}   "
+              f"потеряно {result['traded_elsewhere']:4d}")
+
+    if not rows:
+        print("\nсравнить не удалось ни по одной бумаге", file=sys.stderr)
+        return 2
+
+    bar_minutes = sum(r['their_minutes'] for r in rows)
+    lost_minutes = sum(r['traded_elsewhere'] for r in rows)
+    our_volume = sum(r['our_volume'] for r in rows)
+    their_volume = sum(r['their_volume'] for r in rows)
+
+    print(f"\n{'=' * 62}")
+    if bar_minutes:
+        print(f"потеряно минут: {lost_minutes} из {bar_minutes} = "
+              f"{lost_minutes / bar_minutes * 100:.1f}%")
+    if their_volume:
+        print(f"объём: {our_volume:,} из {their_volume:,} = "
+              f"{our_volume / their_volume * 100:.1f}%".replace(',', ' '))
+    silent = [r['ticker'] for r in rows if r['our_minutes'] == 0
+              and r['their_minutes'] > 0]
+    if silent:
+        print(f"\nНИ ОДНОЙ СВЕЧИ, хотя биржа дала бары: {', '.join(silent)}")
+        print("  проверьте subscription_health и счётчики тиков в GET /status")
+
+    if csv_path:
+        write_csv(csv_path, rows)
+
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Compare this service's candles against the full tape.")
-    parser.add_argument('date', help='trading day, YYYY-MM-DD')
+    parser.add_argument('date', nargs='?', help='trading day, YYYY-MM-DD')
+    parser.add_argument('--feed-bars', action='store_true',
+                        help="compare the latest minutes with the same exchange's "
+                             "minute bars instead of a past day's Intraday data")
     parser.add_argument('--tickers', help='comma-separated; default: all tracked')
     parser.add_argument('--session', choices=sorted(SESSIONS), default='regular')
     parser.add_argument('--api-url', default=None,
@@ -163,6 +274,8 @@ def main() -> int:
     parser.add_argument('--delay', type=float, default=0.25,
                         help='seconds between Intraday requests (default: 0.25)')
     args = parser.parse_args()
+    if args.feed_bars == bool(args.date):
+        parser.error('нужна либо дата, либо --feed-bars')
 
     load_env()
     eodhd_key = os.environ.get('EODHD_API_KEY')
@@ -173,12 +286,14 @@ def main() -> int:
                or 'http://localhost:8765').rstrip('/')
     api_key = os.environ.get('API_KEY') or None
 
-    try:
-        day = datetime.strptime(args.date, '%Y-%m-%d')
-    except ValueError:
-        print(f"дата должна быть в виде YYYY-MM-DD, а не {args.date!r}",
-              file=sys.stderr)
-        return 1
+    day = None
+    if args.date:
+        try:
+            day = datetime.strptime(args.date, '%Y-%m-%d')
+        except ValueError:
+            print(f"дата должна быть в виде YYYY-MM-DD, а не {args.date!r}",
+                  file=sys.stderr)
+            return 1
 
     # Intraday is fetched as 1-minute bars, so the service must be aggregating
     # at 1 minute too, or the two grids describe different things and every
@@ -209,6 +324,10 @@ def main() -> int:
     if not tickers:
         print("список бумаг пуст", file=sys.stderr)
         return 2
+
+    if args.feed_bars:
+        return report_feed_bars(api_url, api_key, eodhd_key, tickers,
+                                args.csv, args.delay)
 
     start_ts, end_ts = session_bounds(day, args.session)
     grid = minute_grid(start_ts, end_ts)
@@ -261,14 +380,7 @@ def main() -> int:
         print("  проверьте subscription_health в GET /status")
 
     if args.csv:
-        fields = ['ticker', 'our_volume', 'their_volume', 'volume_share',
-                  'our_minutes', 'their_minutes', 'minutes_lost', 'our_empty',
-                  'traded_elsewhere', 'false_empty_share']
-        with open(args.csv, 'w', newline='', encoding='utf-8') as handle:
-            writer = csv.DictWriter(handle, fieldnames=fields)
-            writer.writeheader()
-            writer.writerows({k: r.get(k) for k in fields} for r in rows)
-        print(f"\nтаблица записана: {args.csv}")
+        write_csv(args.csv, rows)
 
     return 0
 

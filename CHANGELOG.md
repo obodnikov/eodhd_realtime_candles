@@ -14,6 +14,71 @@ compared against this file. See *Versioning and changelog* in
 > the commits they cover; they are not release notes written at the time, and
 > they may omit changes that left no trace in a commit message.
 
+## [0.9.16] - 2026-11-02
+
+### Fixed
+- **One tick with a bad timestamp stopped a ticker producing candles until the
+  worker restarted.** On 2 November 2026 EODHD sent 19-digit values in `t`, which
+  [its documentation](https://eodhd.com/financial-apis/new-real-time-data-api-websockets)
+  gives as epoch milliseconds: `1793636889494600000`, for example. Read as
+  nanoseconds, those values were 30 minutes ahead of the clock. The tick became the
+  ticker's last-seen time, so every ordinary tick after it was dropped as out of
+  order, and its candle could neither be written nor closed.
+
+  That day **all 50 tickers produced no candle at all**, with `/health` answering
+  `healthy` and `connected: true`. Where it could still be measured, EODHD's own
+  minute bars from the same exchange showed 4 941 bars between 10:59 and 13:24 ET
+  against none here. KLAC and UNH had been stuck the same way since the evening of
+  16 October, losing all 3 900 main-session minutes from 19 to 30 October.
+
+  The engine now drops a tick stamped more than `TICK_MAX_FUTURE_SECONDS` (default
+  60) ahead of the clock before it touches any state, and counts it in
+  `future_tick_dropped_count`. The value is not converted, because converting it
+  would put trades in the wrong candle. Those ticks are lost, and the ticker keeps
+  working as soon as ordinary ones return. The watchdog no longer treats such a
+  tick as evidence of a live feed.
+
+  **Candles already lost are not recovered**, and a worker running an older version
+  needs one restart to clear the stuck state.
+- **`POST /reconnect` could leave two connection loops running.** `stop()` only
+  cleared a flag and closed the current socket. While the loop was waiting to
+  reconnect there was no socket to close, so it woke to find the flag set again by
+  `start()` and carried on beside the new loop. Production ran this way: the second
+  loop got `422 Symbols limit reached` because the first held the token's 50-symbol
+  allowance, then stayed silent and reconnected every 15 minutes. `stop()` now
+  cancels the loop and waits for it to end.
+
+  The two loops share one set of flags, so each reconnect of the second also made
+  the first ignore its ticks. From the log that is about 6 seconds in every 15
+  minutes, roughly 0.7% of ticks. That figure is calculated and was not measured
+  directly; a local reproduction confirmed the mechanism. What started the second
+  loop in production, and when, is not known: the log history had been overwritten.
+- **`remove_ticker` kept the ticker's last-seen time**, so a ticker removed and added
+  back could have its ticks dropped as out of order.
+
+### Added
+- **`GET /status` can now show that ticks are arriving but candles are not.**
+  `subscription_health.ticking_without_candles` lists tickers whose newest candle is
+  far behind their last tick. Nothing could show this before, because freshness was
+  judged from tick times alone, and the bad ticks kept moving those. `silent_tickers`
+  entries and ticker rows (`GET /tickers`, `GET /tickers/{ticker}`) gain
+  `last_candle_at`. README explains which fields answer "is data being collected".
+- **`tick_failed_count`, `future_tick_dropped_count` and
+  `late_tick_dropped_count` in `GET /status`.** These need three new columns in
+  `websocket_status`, added automatically on start on both databases and in
+  `scripts/init_postgres.sql`. Existing data is untouched.
+- **`--feed-bars` in `analysis/compare_with_intraday.py`.** Compares the latest
+  minutes against EODHD's minute bars from the same exchange, so a missing minute is
+  a loss inside the service. It works during the session, unlike the Intraday
+  comparison. `analysis/README.md` also records that a run marks every ticker as just
+  requested in `last_candle_request_at`.
+
+### Changed
+- **A failure repeating per tick now writes one log line a minute**, stating how many
+  occurrences it stands for. On 2 November one error repeated 123 517 times, and since
+  the database keeps the newest 1000 entries, it erased the warnings that would have
+  dated the start of the problem. Dropped future-stamped ticks are logged the same way.
+
 ## [0.9.15] - 2026-11-02
 
 ### Changed

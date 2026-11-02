@@ -1,4 +1,4 @@
-# EODHD Real-Time Candle Aggregator v0.9.15
+# EODHD Real-Time Candle Aggregator v0.9.16
 
 > **Converts EODHD WebSocket tick data into configurable OHLCV candles with full REST API management**
 
@@ -36,7 +36,7 @@ This microservice solves the problem that EODHD's Intraday Historical API only p
 - ✅ **Multi-worker architecture** for high performance and scalability
 - ✅ **Admin Web UI** with real-time monitoring and Chart.js visualizations
 
-### Architecture (v0.9.15)
+### Architecture (v0.9.16)
 
 The service uses a **multi-worker architecture** for optimal performance and scalability:
 
@@ -178,6 +178,20 @@ All endpoints except `/health` require authentication via one of:
 | `GET` | `/health` | Basic health check (no auth) |
 | `GET` | `/status` | Detailed system status |
 | `POST` | `/reconnect` | Force WebSocket reconnection |
+
+**Reading GET /status.** `/health` and `websocket.connected` say only that the
+service and its connection are up. To see whether data is being collected, look at:
+
+| Field | What to look for |
+|-------|------------------|
+| `database.newest_candle_timestamp` | Should stay within a minute or two of now while the market is open. `complete_candles` is no substitute: the per-ticker limit deletes old candles as new ones arrive, so the total barely moves |
+| `subscription_health.silent_tickers` | Subscribed tickers with no accepted tick for `SUBSCRIPTION_SILENCE_MINUTES`, each with its `last_candle_at` |
+| `subscription_health.ticking_without_candles` | Ticks are being accepted but the newest candle is far behind them. A ticker that stays listed is not producing candles |
+| `websocket.future_tick_dropped_count` | Ticks stamped ahead of the clock. Above zero means the provider sent bad timestamps; these ticks are dropped, not converted |
+| `websocket.out_of_order_tick_dropped_count` | Ticks older than the ticker's last one. Rising as fast as `tick_count` means nearly everything is being thrown away |
+| `websocket.late_tick_dropped_count` | Ticks for a candle already closed. A non-trivial count means `CANDLE_CLOSE_GRACE_SECONDS` is too short |
+| `websocket.tick_failed_count` | Ticks that raised an error in the engine. Should stay at zero |
+| `websocket.connection_count` | Rising while ticks keep arriving means more than one connection is competing for the feed |
 
 #### Configuration
 
@@ -451,9 +465,14 @@ curl -H "X-API-Key: your-api-key" \
   "status": "active",
   "last_tick_at": "2025-12-09T14:29:55Z",
   "last_price": 245.67,
-  "candle_count": 15
+  "candle_count": 15,
+  "last_candle_request_at": "2025-12-09T14:29:00Z",
+  "last_candle_at": "2025-12-09T14:29:00+00:00"
 }
 ```
+
+`candle_count` counts finished candles. `last_candle_at` is the start of the newest
+stored candle, finished or not.
 
 ---
 
@@ -503,6 +522,7 @@ Body:
 | `ADMIN_ENABLED` | `true` | Enable admin web UI |
 | `ADMIN_HOST` | `127.0.0.1` | Admin UI host (localhost only by default) |
 | `ADMIN_PORT` | `5000` | Admin UI port |
+| `TICK_MAX_FUTURE_SECONDS` | `60` | Feed ticks stamped further ahead of the clock than this are dropped and counted in `future_tick_dropped_count`. Must be at least 1. Environment only — `PATCH /config` refuses it, because the filter runs in the WebSocket worker |
 | `CANDLE_CLOSE_GRACE_SECONDS` | `2.0` | Delay past an interval's end before its candle is closed. Environment only — `PATCH /config` refuses it, because the close task runs in the WebSocket worker |
 | `EMPTY_INTERVAL_AUDIT` | `off` | `off` / `regular` / `extended`. Measurement only: records which empty intervals *could* be filled, writing no candles. See [docs/EMPTY_INTERVAL_AUDIT.md](docs/EMPTY_INTERVAL_AUDIT.md) |
 | `EMPTY_INTERVAL_AUDIT_PATH` | next to the database | Where the audit appends its observations |

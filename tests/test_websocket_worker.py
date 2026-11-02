@@ -637,6 +637,99 @@ class TestCandleCloseTask:
         assert task.done()
 
 
+class TestTickFailureReporting:
+    """A tick that raises is counted every time and logged once per interval.
+
+    On 2 November 2026 one failure repeated 123 517 times, once per tick. The
+    database keeps the newest 1000 log entries, so those lines erased every
+    earlier warning, including the ones that would have dated the start.
+    """
+
+    @pytest.mark.asyncio
+    async def test_failed_ticks_are_counted_and_logged_once(self, caplog):
+        config = Config()
+        config.eodhd_api_key = 'test_key'
+        config.database_path = ':memory:'
+        config.default_tickers = []
+        captured = {}
+
+        async def spy_status_task(storage, ws_manager, get_tick_metrics):
+            captured['metrics'] = get_tick_metrics
+            await asyncio.Event().wait()
+
+        with patch('src.websocket_worker.WebSocketManager') as mock_ws, \
+                patch('src.websocket_worker.websocket_status_task', spy_status_task), \
+                patch('src.websocket_worker.CandleEngine.process_tick',
+                      side_effect=ValueError('year 56839265 is out of range')):
+            manager = Mock()
+            manager.start = AsyncMock()
+            manager.subscribe = AsyncMock()
+            manager.stop = AsyncMock()
+            mock_ws.return_value = manager
+
+            with caplog.at_level('ERROR', logger='src.websocket_worker'):
+                task = asyncio.create_task(run_worker(config))
+                await asyncio.sleep(0.3)
+
+                on_tick = manager.set_on_tick.call_args[0][0]
+                for offset in range(50):
+                    await on_tick('NVDA', 207.0, 1, 1793636889494600000 + offset)
+                await asyncio.sleep(0.2)
+                metrics = captured['metrics']()
+
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+        assert metrics['tick_failed_count'] == 50
+        assert metrics['tick_processed_count'] == 0
+        lines = [r for r in caplog.records if 'failed processing' in r.getMessage()]
+        assert len(lines) == 1
+        # Whichever of the concurrent workers failed first; the raw value is shown.
+        assert 'at 17936368894946000' in lines[0].getMessage()
+
+
+class TestStatusTaskNotices:
+    """The status row must be rewritten when any reported counter moves."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('counter', [
+        'future_tick_dropped_count',
+        'late_tick_dropped_count',
+        'tick_failed_count',
+    ])
+    async def test_a_change_in_this_counter_alone_is_written(self, counter):
+        from src.websocket_worker import websocket_status_task
+
+        values = {counter: 0}
+        storage = Mock()
+        ws_manager = Mock()
+        ws_manager.get_status.return_value = {'connected': True}
+
+        passes = {'n': 0}
+        real_sleep = asyncio.sleep
+
+        async def fast_sleep(seconds):
+            if seconds != 10:
+                await real_sleep(seconds)
+                return
+            passes['n'] += 1
+            values[counter] = passes['n']
+            await real_sleep(0)
+
+        with patch('src.websocket_worker.asyncio.sleep', fast_sleep):
+            task = asyncio.create_task(
+                websocket_status_task(storage, ws_manager, lambda: dict(values))
+            )
+            await real_sleep(0.05)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        assert storage.update_websocket_status.call_count >= 2
+
+
 class TestCandleCloseTaskShutdownOrdering:
     """The close task must stop before the worker's final flush."""
 

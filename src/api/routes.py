@@ -5,7 +5,7 @@ REST API route handlers.
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 from aiohttp import web
 
 from .. import __version__
@@ -94,7 +94,21 @@ class APIRoutes:
         })
     
     @staticmethod
-    def _subscription_health(tickers, silence_threshold_minutes: float) -> dict:
+    def _candle_lag_minutes(tick_time: datetime, last_candle_at: Optional[str]) -> Optional[float]:
+        """Minutes from a ticker's newest candle to its last tick; None if unknown."""
+        if not last_candle_at:
+            return None
+        try:
+            candle_time = datetime.fromisoformat(last_candle_at)
+        except (TypeError, ValueError):
+            return None
+        if candle_time.tzinfo is None:
+            candle_time = candle_time.replace(tzinfo=timezone.utc)
+        return round((tick_time - candle_time).total_seconds() / 60, 1)
+
+    @staticmethod
+    def _subscription_health(tickers, silence_threshold_minutes: float,
+                             candle_interval_minutes: int = 1) -> dict:
         """
         Which subscribed tickers have gone quiet, and for how long.
 
@@ -109,18 +123,28 @@ class APIRoutes:
         from "dead subscription" depends on the session and on the watchlist.
         The caller decides what to do with the numbers.
 
+        Fresh ticks do not prove that candles are being made, so each ticking
+        ticker is also compared with its newest candle, finished or not. A
+        ticker that keeps ticking with no candle to match is listed separately.
+
         Args:
-            tickers: TrackedTicker rows, each carrying last_tick_at.
+            tickers: TrackedTicker rows, each carrying last_tick_at and
+                last_candle_at.
             silence_threshold_minutes: Age past which a ticker is listed as
                 silent.
+            candle_interval_minutes: Added to the allowed gap between a tick and
+                its candle, because a candle's time is the start of its interval.
 
         Returns:
-            Counts plus the silent tickers, longest silence first.
+            Counts plus the silent tickers, longest silence first, and the
+            tickers ticking without candles, longest gap first.
         """
         now = datetime.now(timezone.utc)
         silent = []
         never_seen = []
+        ticking_without_candles = []
         ticking = 0
+        candle_lag_limit = silence_threshold_minutes + candle_interval_minutes
 
         for ticker in tickers:
             last_tick_at = getattr(ticker, 'last_tick_at', None)
@@ -135,17 +159,31 @@ class APIRoutes:
                 never_seen.append(ticker.symbol)
                 continue
 
+            last_candle_at = getattr(ticker, 'last_candle_at', None)
             quiet_minutes = (now - seen).total_seconds() / 60
             if quiet_minutes >= silence_threshold_minutes:
                 silent.append({
                     'ticker': ticker.symbol,
                     'last_tick_at': last_tick_at,
                     'silent_minutes': round(quiet_minutes, 1),
+                    'last_candle_at': last_candle_at,
                 })
             else:
                 ticking += 1
+                candle_lag = APIRoutes._candle_lag_minutes(seen, last_candle_at)
+                if candle_lag is None or candle_lag > candle_lag_limit:
+                    ticking_without_candles.append({
+                        'ticker': ticker.symbol,
+                        'last_tick_at': last_tick_at,
+                        'last_candle_at': last_candle_at,
+                        'candle_lag_minutes': candle_lag,
+                    })
 
         silent.sort(key=lambda row: -row['silent_minutes'])
+        # No candle at all (None) is the longest gap there is, so it comes first.
+        ticking_without_candles.sort(
+            key=lambda row: -(row['candle_lag_minutes'] or float('inf'))
+        )
 
         return {
             'subscribed': len(tickers),
@@ -154,6 +192,7 @@ class APIRoutes:
             'never_seen': sorted(never_seen),
             'silence_threshold_minutes': silence_threshold_minutes,
             'silent_tickers': silent,
+            'ticking_without_candles': ticking_without_candles,
         }
 
     async def status(self, request: web.Request) -> web.Response:
@@ -209,7 +248,8 @@ class APIRoutes:
         tracked = await asyncio.to_thread(self.storage.get_tickers)
         subscription_health = self._subscription_health(
             tracked,
-            self.config_manager.config.subscription_silence_minutes
+            self.config_manager.config.subscription_silence_minutes,
+            self.config_manager.config.candle_interval_minutes
         )
 
         return web.json_response({

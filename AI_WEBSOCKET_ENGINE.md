@@ -29,12 +29,18 @@ placement; this file is the coding contract. Persistence rules live in
 - `set_on_tick(..., fire_and_forget=False)`: the callback is awaited. Keep it cheap and
   non-blocking so the socket read loop keeps draining.
 
-## Tick acceptance — three filters, one owner each
+## Tick acceptance — four filters, one owner each
 
+- **Ahead of the clock** (`TICK_MAX_FUTURE_SECONDS`): the *engine* drops a tick stamped further
+  ahead than the limit and counts it as `future_tick_dropped_count`, **before touching any state**.
+  This filter runs first and cannot be switched off. As a last-seen time such a tick makes every
+  ordinary tick look out of order until a restart, and its candle can neither be written nor
+  closed. Do not convert the value into something usable: the provider's 19-digit stamps read as
+  nanoseconds are 30 minutes ahead of the clock, so conversion puts trades in the wrong candle.
 - **Staleness** (`TICK_MAX_AGE_SECONDS`): the *engine* drops a tick older than the limit and
-  counts it as `stale_tick_dropped_count`. The *manager* uses the same limit for a different
-  purpose — judging whether a trade counts as evidence of a live feed. The two must agree on what
-  a current tick is; if you change one, change the other.
+  counts it as `stale_tick_dropped_count`. The *manager* uses both this limit and
+  `TICK_MAX_FUTURE_SECONDS` for a different purpose — judging whether a trade counts as evidence of
+  a live feed. The two must agree on what a current tick is; if you change one, change the other.
 - **Out-of-order** (`out_of_order_tick_dropped_count`): a tick older than the last one seen for
   that ticker is dropped. Timestamps from the feed are not guaranteed monotonic.
 - **Late tick** (`late_tick_dropped_count`): a tick for a bucket that has already been completed
@@ -97,6 +103,11 @@ placement; this file is the coding contract. Persistence rules live in
   overnight). A trade only counts as evidence of a live feed when its trade time is close to the
   present; the provider replays the previous session's last trade on subscribe, and treating that
   replay as activity defeats the relaxation entirely.
+- **Exactly one connection loop, always.** `WebSocketManager` keeps the task running
+  `_connection_loop`; `stop()` cancels it and waits for it to end, so `start()` can never run
+  beside a survivor. Two loops share every field on the manager and compete for the token's symbol
+  allowance: the second gets `422 Symbols limit reached`, and each of its reconnects makes the
+  first ignore its ticks. A rising `connection_count` while ticks keep arriving is the signature.
 - Ticker subscribe/unsubscribe is driven by the DB via the ticker-sync task (diff DB symbols vs
   subscribed set). Respect the EODHD `MAX_TICKERS` cap; don't subscribe beyond it.
 
@@ -108,11 +119,14 @@ placement; this file is the coding contract. Persistence rules live in
 - The DB writer runs on a background thread and must never raise into the logging path; dropped
   entries are counted, not silently discarded.
 - The buffer is a *diagnostic* aid, not a system of record. Do not make correctness depend on it.
+- A message that can repeat per tick goes through `LogThrottle`: one line per interval, carrying
+  how many occurrences it stands for, with an exact counter kept beside it. The database keeps the
+  newest 1000 entries, so an unthrottled burst erases the history needed to diagnose it.
 
 ## Testing
 
 - `pytest` + `pytest-asyncio`. Cover: tick aggregation into correct OHLCV, queue-full handling,
   flush persists queued writes, backoff on reconnect, and graceful task cancellation/shutdown flush.
 - Mock storage with `pytest-mock`; do not hit a real WebSocket.
-- Cover the three tick filters separately — a test that only exercises the happy path will not
-  catch a stale or late tick being aggregated.
+- Cover the four tick filters separately — a test that only exercises the happy path will not
+  catch a stale, late or future-stamped tick being aggregated.

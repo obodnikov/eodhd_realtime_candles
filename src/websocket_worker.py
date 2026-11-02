@@ -35,6 +35,7 @@ from .config import Config, ConfigManager
 from .storage import Storage
 from .storage_factory import create_storage, get_database_type
 from .candle_engine import CandleEngine
+from .log_buffer import LogThrottle
 from .websocket_manager import WebSocketManager
 
 
@@ -156,7 +157,10 @@ async def websocket_status_task(storage, ws_manager: WebSocketManager, get_tick_
                 status.get('candle_write_queue_maxsize'),
                 status.get('candle_write_dropped_count'),
                 status.get('stale_tick_dropped_count'),
-                status.get('out_of_order_tick_dropped_count')
+                status.get('out_of_order_tick_dropped_count'),
+                status.get('future_tick_dropped_count'),
+                status.get('late_tick_dropped_count'),
+                status.get('tick_failed_count')
             )
             
             if last_status != status_key:
@@ -633,7 +637,8 @@ async def run_worker(config: Config):
         save_every_m_seconds=config.candle_save_every_m_seconds,
         ticker_status_update_interval_seconds=config.ticker_status_update_interval_seconds,
         candle_write_queue_maxsize=config.candle_write_queue_maxsize,
-        tick_max_age_seconds=config.tick_max_age_seconds
+        tick_max_age_seconds=config.tick_max_age_seconds,
+        tick_max_future_seconds=config.tick_max_future_seconds
     )
     ws_manager = WebSocketManager(
         api_key=config.eodhd_api_key,
@@ -641,7 +646,8 @@ async def run_worker(config: Config):
         ping_interval=config.ws_ping_interval,
         data_timeout=config.ws_data_timeout,
         max_silent_timeout=config.ws_max_silent_timeout,
-        tick_max_age_seconds=config.tick_max_age_seconds
+        tick_max_age_seconds=config.tick_max_age_seconds,
+        tick_max_future_seconds=config.tick_max_future_seconds
     )
     
     # Bounded queue + fixed workers to apply backpressure under high tick volume
@@ -651,7 +657,9 @@ async def run_worker(config: Config):
     tick_enqueued = 0
     tick_dropped = 0
     tick_processed = 0
-    
+    tick_failed = 0
+    tick_failure_log = LogThrottle()
+
     # Create async tick handler that enqueues ticks without blocking WebSocket loop
     async def async_process_tick(ticker: str, price: float, volume: int, timestamp_ms: int):
         """
@@ -674,7 +682,7 @@ async def run_worker(config: Config):
 
     async def tick_worker(worker_id: int):
         """Consume ticks from queue and process in thread pool."""
-        nonlocal tick_processed
+        nonlocal tick_processed, tick_failed
 
         while True:
             try:
@@ -690,13 +698,19 @@ async def run_worker(config: Config):
                         )
                         tick_processed += 1
                     except Exception as e:
-                        logger.error(
-                            "Tick worker %d failed processing %s at %d: %s",
-                            worker_id,
-                            ticker,
-                            timestamp_ms,
-                            e
-                        )
+                        tick_failed += 1
+                        occurrences = tick_failure_log.allow()
+                        if occurrences is not None:
+                            logger.error(
+                                "Tick worker %d failed processing %s at %d: %s "
+                                "(%d failures since the last report, %d in total)",
+                                worker_id,
+                                ticker,
+                                timestamp_ms,
+                                e,
+                                occurrences,
+                                tick_failed
+                            )
                 finally:
                     tick_queue.task_done()
             except asyncio.CancelledError:
@@ -710,7 +724,8 @@ async def run_worker(config: Config):
             'tick_queue_maxsize': config.tick_queue_maxsize,
             'tick_enqueued_count': tick_enqueued,
             'tick_processed_count': tick_processed,
-            'tick_dropped_count': tick_dropped
+            'tick_dropped_count': tick_dropped,
+            'tick_failed_count': tick_failed
         }
         tick_metrics.update(candle_engine.get_candle_write_metrics())
         return tick_metrics
