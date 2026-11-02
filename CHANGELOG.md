@@ -55,6 +55,12 @@ compared against this file. See *Versioning and changelog* in
   README and `analysis/README.md` were measured with this loss and now say so; they
   need re-measuring after a full session.
 
+  **Expect a step in volume on upgrade.** New candles carry roughly a third more volume
+  than the ones before them, so anything comparing a ticker against its own recent
+  volume will read high until the old candles age out. With `MAX_CANDLES_STORED=5000`
+  that took about six sessions for an active ticker in October, and longer for a
+  quiet one.
+
   Single-process mode (`src/main.py`, not used in production) still has this problem,
   and `ARCHITECTURE.md` §5.2 says so.
 
