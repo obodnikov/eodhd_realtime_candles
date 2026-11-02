@@ -20,10 +20,15 @@ placement; this file is the coding contract. Persistence rules live in
 
 ## Tick flow & backpressure (do not bypass)
 
-- Ticks enter through `WebSocketManager.on_message` → the awaited `on_tick` callback → a **bounded**
-  `asyncio.Queue(maxsize=TICK_QUEUE_MAXSIZE)`, consumed by `TICK_WORKER_CONCURRENCY` workers calling
-  `CandleEngine.process_tick`. Keep this pipeline; do not call `process_tick` directly from the
-  socket callback.
+- Ticks enter through `WebSocketManager.on_message` → the awaited `on_tick` callback →
+  `TickDispatcher`, **bounded** by `TICK_QUEUE_MAXSIZE` across all workers → one of
+  `TICK_WORKER_CONCURRENCY` workers calling `CandleEngine.process_tick`. Keep this pipeline; do not
+  call `process_tick` directly from the socket callback.
+- **One ticker, one worker, one tick at a time.** A ticker's ticks must reach the engine in the
+  order they arrived. Never let two workers take ticks of the same ticker, and never let a worker
+  start a tick before its last one has finished. With a shared queue a later tick overtook an
+  earlier one in the thread pool and the out-of-order filter dropped the earlier one: 21% of all
+  ticks on a healthy service, and that loss looked like ordinary filtering.
 - Enqueue with `put_nowait` and handle `asyncio.QueueFull` explicitly (drop/log with a counter) —
   never let the queue grow unbounded and never silently swallow a dropped tick without metrics.
 - `set_on_tick(..., fire_and_forget=False)`: the callback is awaited. Keep it cheap and
@@ -42,7 +47,9 @@ placement; this file is the coding contract. Persistence rules live in
   `TICK_MAX_FUTURE_SECONDS` for a different purpose — judging whether a trade counts as evidence of
   a live feed. The two must agree on what a current tick is; if you change one, change the other.
 - **Out-of-order** (`out_of_order_tick_dropped_count`): a tick older than the last one seen for
-  that ticker is dropped. Timestamps from the feed are not guaranteed monotonic.
+  that ticker is dropped. Timestamps from the feed are not guaranteed monotonic, but this should
+  be rare: a count rising with `tick_count` means real data is being lost, so measure it against
+  the exchange's bars (`analysis/compare_with_intraday.py --feed-bars`) rather than accept it.
 - **Late tick** (`late_tick_dropped_count`): a tick for a bucket that has already been completed
   is dropped, never merged. `save_candle` upserts on `(ticker, timestamp, interval_minutes)`, so
   re-opening a closed bucket would replace a proper bar with a one-tick bar. A non-trivial count
@@ -125,7 +132,8 @@ placement; this file is the coding contract. Persistence rules live in
 
 ## Testing
 
-- `pytest` + `pytest-asyncio`. Cover: tick aggregation into correct OHLCV, queue-full handling,
+- `pytest` + `pytest-asyncio`. Cover: tick aggregation into correct OHLCV, per-ticker order
+  through the whole pipeline, queue-full handling,
   flush persists queued writes, backoff on reconnect, and graceful task cancellation/shutdown flush.
 - Mock storage with `pytest-mock`; do not hit a real WebSocket.
 - Cover the four tick filters separately — a test that only exercises the happy path will not

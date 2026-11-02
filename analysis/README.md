@@ -51,6 +51,10 @@ and never streamed; cross-check it against `subscription_health` in
 | Minutes with no candle that traded elsewhere | 88.7% |
 | Tickers producing nothing at all | 2 — SPCX and DASH |
 
+These figures predate 0.9.17, when the service was still losing about a quarter of
+the volume it received. The share is therefore higher than shown, and the table
+needs re-measuring after a full session on 0.9.17 or later.
+
 The volume share is near-constant across tickers because it is a property of the
 feed, not of the stock. Whether that costs whole minutes depends on liquidity: an
 active name prints in every minute even on one venue, a thin one does not. On

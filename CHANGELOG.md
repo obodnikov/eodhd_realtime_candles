@@ -14,6 +14,50 @@ compared against this file. See *Versioning and changelog* in
 > the commits they cover; they are not release notes written at the time, and
 > they may omit changes that left no trace in a commit message.
 
+## [0.9.17] - 2026-11-02
+
+### Fixed
+- **A healthy service was throwing away about a fifth of its ticks.** Workers shared
+  one queue and ran `process_tick` in a thread pool, so a later tick of a ticker
+  could overtake an earlier one, and the out-of-order filter then dropped the earlier
+  one. Those were real trades, and nothing presented them as a loss: the counter read
+  like ordinary filtering. The queue and the filter both date from 2026-02-20, so
+  every candle since then is affected.
+
+  On production on 2 November, right after a restart, 21% of ticks were dropped this
+  way, and candles held about 77% of the volume in EODHD's minute bars from the same
+  exchange. A test feeding strictly ordered ticks through the old pipeline lost
+  20.9% of them.
+
+  Each ticker now always goes to the same worker, which finishes one tick before
+  taking the next (`TickDispatcher`). Different tickers still run in parallel, and
+  `TICK_QUEUE_MAXSIZE` still limits the total waiting, so one busy ticker can use all
+  of it. Nothing needs configuring.
+
+  Both pipelines side by side on the live public demo feed (6 tickers), compared with
+  the exchange's bars:
+
+  | | Shared queue | One worker per ticker |
+  | --- | --- | --- |
+  | Dropped as out of order, 7 minutes | 628 of 2 746 (22.9%) | 0 of 2 775 |
+  | Volume, the 4 minutes compared | 71 533 of 95 776 (74.7%) | 95 776 of 95 776 (100%) |
+
+  A further 15-minute run of the new pipeline dropped 0 of 4 269 ticks as out of
+  order and stored 99.48% of the volume, with 86 of 89 ticker-minutes exact on open,
+  high, low, close and volume. What remains is mostly ticks arriving after their
+  candle closed, 5 in that run, reported in `late_tick_dropped_count`.
+
+  This has not yet been measured on production's 50 tickers; run
+  `analysis/compare_with_intraday.py --feed-bars` after deploying.
+
+  **Candles already stored are not corrected.** They miss real trades, which can also
+  affect their high, low and close. The volume figures in ARCHITECTURE.md §4.4,
+  README and `analysis/README.md` were measured with this loss and now say so; they
+  need re-measuring after a full session.
+
+  Single-process mode (`src/main.py`, not used in production) still has this problem,
+  and `ARCHITECTURE.md` §5.2 says so.
+
 ## [0.9.16] - 2026-11-02
 
 ### Fixed

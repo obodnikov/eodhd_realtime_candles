@@ -1,4 +1,4 @@
-# EODHD Real-Time Candle Aggregator v0.9.16
+# EODHD Real-Time Candle Aggregator v0.9.17
 
 > **Converts EODHD WebSocket tick data into configurable OHLCV candles with full REST API management**
 
@@ -20,6 +20,10 @@ This microservice solves the problem that EODHD's Intraday Historical API only p
 >   no candle had trades on other venues. An absent candle means "no EDGX print this minute",
 >   not "nobody traded".
 >
+> These figures predate 0.9.17, when the service was still losing about a quarter of the
+> volume it received, so the true share of market volume is higher. Candles stored before that
+> release also miss some real trades, which can affect their high, low and close as well.
+>
 > Prices are real executions, so OHLC is sound. It is volume and the presence of a candle
 > that are partial. See [ARCHITECTURE.md](ARCHITECTURE.md) §4.4.
 
@@ -36,7 +40,7 @@ This microservice solves the problem that EODHD's Intraday Historical API only p
 - ✅ **Multi-worker architecture** for high performance and scalability
 - ✅ **Admin Web UI** with real-time monitoring and Chart.js visualizations
 
-### Architecture (v0.9.16)
+### Architecture (v0.9.17)
 
 The service uses a **multi-worker architecture** for optimal performance and scalability:
 
@@ -188,7 +192,7 @@ service and its connection are up. To see whether data is being collected, look 
 | `subscription_health.silent_tickers` | Subscribed tickers with no accepted tick for `SUBSCRIPTION_SILENCE_MINUTES`, each with its `last_candle_at` |
 | `subscription_health.ticking_without_candles` | Ticks are being accepted but the newest candle is far behind them. A ticker that stays listed is not producing candles |
 | `websocket.future_tick_dropped_count` | Ticks stamped ahead of the clock. Above zero means the provider sent bad timestamps; these ticks are dropped, not converted |
-| `websocket.out_of_order_tick_dropped_count` | Ticks older than the ticker's last one. Rising as fast as `tick_count` means nearly everything is being thrown away |
+| `websocket.out_of_order_tick_dropped_count` | Ticks older than the ticker's last one. Should stay rare: these are real trades lost from the candles. Rising as fast as `tick_count` means nearly everything is being thrown away |
 | `websocket.late_tick_dropped_count` | Ticks for a candle already closed. A non-trivial count means `CANDLE_CLOSE_GRACE_SECONDS` is too short |
 | `websocket.tick_failed_count` | Ticks that raised an error in the engine. Should stay at zero |
 | `websocket.connection_count` | Rising while ticks keep arriving means more than one connection is competing for the feed |

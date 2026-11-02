@@ -2,7 +2,7 @@
 
 # ARCHITECTURE.md
 
-**Version**: 0.9.16
+**Version**: 0.9.17
 **Last Updated**: 2026-11-02
 **Project**: EODHD Real-Time Candle Aggregator
 
@@ -17,7 +17,7 @@ It does not replace coding standards (§8), endpoint docs ([README.md](README.md
 implementation history ([docs/chats/](docs/chats/)). Audience: AI assistants, maintainers,
 reviewers.
 
-> Status: **implemented and in use** — v0.9.16. The multi-worker service is running in production
+> Status: **implemented and in use** — v0.9.17. The multi-worker service is running in production
 > against both SQLite and PostgreSQL; the design below describes what exists, not a plan.
 
 ---
@@ -62,7 +62,8 @@ Architecture pattern (multi-worker):
 
 Key properties:
 - Tick ingestion and aggregation are isolated in a dedicated worker
-- Backpressure via a bounded tick queue; candle/status writes are flushed, not written per tick
+- Backpressure via a bounded hand-off to tick workers; candle/status writes are flushed, not written per tick
+- Each ticker is processed by one worker at a time, so its ticks stay in arrival order
 - API workers hold a *dummy* `WebSocketManager`: they never open a feed connection
 - SQLite and PostgreSQL are interchangeable behind one factory
 
@@ -73,7 +74,7 @@ Key properties:
 eodhd_realtime_candles/
 ├── src/
 │   ├── __init__.py             # __version__ — the single source of truth
-│   ├── main.py                 # Single-process mode (dev/fallback)
+│   ├── main.py                 # Single-process mode (dev/fallback): ticks are not kept in order (§5.2)
 │   ├── api_server.py           # API worker entry point
 │   ├── websocket_worker.py     # WebSocket worker entry point (all background tasks)
 │   ├── websocket_manager.py    # Feed client, subscription handling, liveness
@@ -147,7 +148,7 @@ WebSocket worker background tasks:
 - Candle close task (completes candles whose interval has ended, independently of tick arrival)
 - Reconnect request task (acts on `POST /reconnect` recorded by API workers)
 - Empty-interval audit task (optional, measurement only: records which empty intervals could be filled, writing no candles)
-- Tick workers consuming a bounded queue
+- Tick workers, each owning a fixed share of the tickers (`TickDispatcher`)
 
 ### 4.4 External Integrations
 
@@ -161,7 +162,8 @@ TRF prints. Two consequences shape everything this service produces:
 - **Volume is a fraction of market volume.** Measured against the same provider's Intraday
   Historical API across 51 tickers on 3 September 2026: **2.8% of consolidated volume**
   (0.7–5.6% per ticker, median 2.8%) — the ordinary EDGX share. Prices are real trades; volume is
-  not market-wide.
+  not market-wide. That measurement predates 0.9.17: the service was then losing about a quarter
+  of the volume it received, so the true share is higher and needs re-measuring.
 - **A minute with no candle usually still traded.** Of 4 035 main-session minutes with no candle,
   **88.7% saw trades elsewhere**. An absent candle means "no EDGX execution in this minute", not
   "no trade in this minute" — which is why empty intervals must never be filled with a
@@ -199,7 +201,7 @@ REST request -> auth middleware (`X-API-Key` / bearer / query) -> route -> stora
 database and returns `202`; the WebSocket worker polls for it and restarts the real feed.
 An API worker never opens a feed connection itself.
 
-### 5.2 Tick-to-Candle Flow (v0.9.16)
+### 5.2 Tick-to-Candle Flow (v0.9.17)
 
 ```
 EODHD message
@@ -211,8 +213,9 @@ WebSocketManager.on_message()
 async on_tick callback (awaited)
    │
    ▼
-Bounded tick queue (maxsize = TICK_QUEUE_MAXSIZE)
-   │ consumed by N workers
+TickDispatcher (at most TICK_QUEUE_MAXSIZE waiting, across all workers)
+   │ each ticker always goes to the same one of N workers,
+   │ which finishes one tick before taking the next
    ▼
 CandleEngine.process_tick()
    │ rejects ticks stamped ahead of the clock (TICK_MAX_FUTURE_SECONDS),
@@ -234,6 +237,11 @@ Flush tasks (interval-based)
       ▼
 Storage backend (SQLite/PostgreSQL)
 ```
+
+Single-process mode (`src/main.py`, started by `Dockerfile.curl` and `Dockerfile.noHealth`) has no
+`TickDispatcher`: each tick runs as its own task, so ticks can overtake each other and be dropped
+as out of order, as they did in the multi-worker service before 0.9.17. Do not use it where volume
+matters; production runs the multi-worker layout above.
 
 ### 5.3 Config Loading Hierarchy
 

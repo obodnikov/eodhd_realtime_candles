@@ -8,7 +8,9 @@ import pytest
 import asyncio
 import json
 import os
+import random
 import signal
+import time
 from types import SimpleNamespace
 from unittest.mock import Mock, patch, AsyncMock, MagicMock
 from datetime import datetime, timezone
@@ -689,6 +691,77 @@ class TestTickFailureReporting:
         assert len(lines) == 1
         # Whichever of the concurrent workers failed first; the raw value is shown.
         assert 'at 17936368894946000' in lines[0].getMessage()
+
+
+class TestTickOrdering:
+    """A ticker's ticks must reach the engine in the order they arrived.
+
+    Workers used to share one queue and run process_tick in a thread pool, so a
+    later tick could overtake an earlier one, and the engine then dropped the
+    earlier one as out of order. On 2 November 2026 that was 21% of all ticks on
+    a healthy service, with about 77% of the exchange's volume reaching candles,
+    while EODHD's own stream never went backwards.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_pipeline_keeps_each_tickers_ticks_in_order(self, tmp_path):
+        config = Config()
+        config.eodhd_api_key = 'test_key'
+        config.database_path = str(tmp_path / 'order.db')
+        config.default_tickers = []
+        captured = {}
+        order = {}
+        delays = random.Random(1)
+        real_process_tick = CandleEngine.process_tick
+
+        def uneven_process_tick(engine, ticker, price, volume, timestamp_ms):
+            # Thread scheduling is what reorders ticks; make it uneven on purpose.
+            time.sleep(delays.uniform(0, 0.002))
+            order.setdefault(ticker, []).append(timestamp_ms)
+            real_process_tick(engine, ticker, price, volume, timestamp_ms)
+
+        async def spy_status_task(storage, ws_manager, get_tick_metrics):
+            captured['metrics'] = get_tick_metrics
+            await asyncio.Event().wait()
+
+        tickers = [f'T{n}' for n in range(10)]
+        ticks_per_ticker = 100
+
+        with patch('src.websocket_worker.WebSocketManager') as mock_ws, \
+                patch('src.websocket_worker.websocket_status_task', spy_status_task), \
+                patch.object(CandleEngine, 'process_tick', uneven_process_tick):
+            manager = Mock()
+            manager.start = AsyncMock()
+            manager.subscribe = AsyncMock()
+            manager.stop = AsyncMock()
+            mock_ws.return_value = manager
+
+            task = asyncio.create_task(run_worker(config))
+            await asyncio.sleep(0.3)
+
+            on_tick = manager.set_on_tick.call_args[0][0]
+            base_ms = int(time.time() * 1000) - 20000
+            for step in range(ticks_per_ticker):
+                for ticker in tickers:
+                    await on_tick(ticker, 100.0, 1, base_ms + step)
+
+            expected = len(tickers) * ticks_per_ticker
+            for _ in range(400):
+                metrics = captured['metrics']()
+                if metrics['tick_processed_count'] + metrics['tick_failed_count'] >= expected:
+                    break
+                await asyncio.sleep(0.05)
+
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        assert metrics['tick_processed_count'] == expected
+        assert metrics['out_of_order_tick_dropped_count'] == 0
+        for ticker, stamps in order.items():
+            assert stamps == sorted(stamps), f"{ticker} reached the engine out of order"
 
 
 class TestStatusTaskNotices:

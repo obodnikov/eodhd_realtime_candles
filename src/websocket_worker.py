@@ -24,9 +24,10 @@ import logging
 import signal
 import sys
 import time
+import zlib
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Tuple
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -37,6 +38,53 @@ from .storage_factory import create_storage, get_database_type
 from .candle_engine import CandleEngine
 from .log_buffer import LogThrottle
 from .websocket_manager import WebSocketManager
+
+
+class TickDispatcher:
+    """
+    Hands ticks to workers so that each ticker's ticks stay in arrival order.
+
+    Workers used to share one queue and run process_tick in a thread pool, so a
+    later tick of a ticker could overtake an earlier one, and the engine then
+    dropped the earlier one as out of order. Each ticker now always goes to the
+    same worker, which finishes one tick before taking the next. Different
+    tickers still run in parallel.
+
+    The limit covers all workers together rather than dividing between them, so
+    a burst in one ticker can use all of it.
+
+    Not thread-safe: every call comes from the event loop.
+    """
+
+    def __init__(self, worker_count: int, maxsize: int):
+        if worker_count < 1:
+            raise ValueError(f"worker_count must be >= 1, got {worker_count}")
+        self._queues = [asyncio.Queue() for _ in range(worker_count)]
+        self._maxsize = maxsize
+        self._waiting = 0
+
+    def worker_for(self, ticker: str) -> int:
+        """The worker that owns this ticker. The same on every run, unlike hash()."""
+        return zlib.crc32(ticker.upper().encode()) % len(self._queues)
+
+    def put_nowait(self, ticker: str, price: float, volume: int, timestamp_ms: int) -> None:
+        """Queue a tick for its ticker's worker. Raises asyncio.QueueFull at the limit."""
+        if self._waiting >= self._maxsize:
+            raise asyncio.QueueFull()
+        self._queues[self.worker_for(ticker)].put_nowait(
+            (ticker, price, volume, timestamp_ms)
+        )
+        self._waiting += 1
+
+    async def get(self, worker_id: int) -> Tuple[str, float, int, int]:
+        """Wait for this worker's next tick."""
+        tick = await self._queues[worker_id].get()
+        self._waiting -= 1
+        return tick
+
+    def qsize(self) -> int:
+        """Ticks waiting across all workers."""
+        return self._waiting
 
 
 def setup_logging(level: str):
@@ -650,8 +698,9 @@ async def run_worker(config: Config):
         tick_max_future_seconds=config.tick_max_future_seconds
     )
     
-    # Bounded queue + fixed workers to apply backpressure under high tick volume
-    tick_queue: asyncio.Queue[tuple[str, float, int, int]] = asyncio.Queue(
+    # Bounded hand-off + fixed workers to apply backpressure under high tick volume
+    tick_dispatcher = TickDispatcher(
+        worker_count=config.tick_worker_concurrency,
         maxsize=config.tick_queue_maxsize
     )
     tick_enqueued = 0
@@ -668,7 +717,7 @@ async def run_worker(config: Config):
         nonlocal tick_enqueued, tick_dropped
 
         try:
-            tick_queue.put_nowait((ticker, price, volume, timestamp_ms))
+            tick_dispatcher.put_nowait(ticker, price, volume, timestamp_ms)
             tick_enqueued += 1
         except asyncio.QueueFull:
             tick_dropped += 1
@@ -676,43 +725,40 @@ async def run_worker(config: Config):
                 logger.warning(
                     "Tick queue full - dropped %d ticks (queue size=%d, max=%d)",
                     tick_dropped,
-                    tick_queue.qsize(),
+                    tick_dispatcher.qsize(),
                     config.tick_queue_maxsize
                 )
 
     async def tick_worker(worker_id: int):
-        """Consume ticks from queue and process in thread pool."""
+        """Process this worker's ticks in the thread pool, one at a time."""
         nonlocal tick_processed, tick_failed
 
         while True:
             try:
-                ticker, price, volume, timestamp_ms = await tick_queue.get()
+                ticker, price, volume, timestamp_ms = await tick_dispatcher.get(worker_id)
                 try:
-                    try:
-                        await asyncio.to_thread(
-                            candle_engine.process_tick,
+                    await asyncio.to_thread(
+                        candle_engine.process_tick,
+                        ticker,
+                        price,
+                        volume,
+                        timestamp_ms
+                    )
+                    tick_processed += 1
+                except Exception as e:
+                    tick_failed += 1
+                    occurrences = tick_failure_log.allow()
+                    if occurrences is not None:
+                        logger.error(
+                            "Tick worker %d failed processing %s at %d: %s "
+                            "(%d failures since the last report, %d in total)",
+                            worker_id,
                             ticker,
-                            price,
-                            volume,
-                            timestamp_ms
+                            timestamp_ms,
+                            e,
+                            occurrences,
+                            tick_failed
                         )
-                        tick_processed += 1
-                    except Exception as e:
-                        tick_failed += 1
-                        occurrences = tick_failure_log.allow()
-                        if occurrences is not None:
-                            logger.error(
-                                "Tick worker %d failed processing %s at %d: %s "
-                                "(%d failures since the last report, %d in total)",
-                                worker_id,
-                                ticker,
-                                timestamp_ms,
-                                e,
-                                occurrences,
-                                tick_failed
-                            )
-                finally:
-                    tick_queue.task_done()
             except asyncio.CancelledError:
                 logger.debug("Tick worker %d cancelled", worker_id)
                 break
@@ -720,7 +766,7 @@ async def run_worker(config: Config):
     def get_tick_metrics() -> dict:
         """Expose queue metrics via shared websocket status row."""
         tick_metrics = {
-            'tick_queue_size': tick_queue.qsize(),
+            'tick_queue_size': tick_dispatcher.qsize(),
             'tick_queue_maxsize': config.tick_queue_maxsize,
             'tick_enqueued_count': tick_enqueued,
             'tick_processed_count': tick_processed,
