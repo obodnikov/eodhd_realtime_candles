@@ -93,6 +93,10 @@ placement; this file is the coding contract. Persistence rules live in
   flush, candle-write flush, candle-close, reconnect-request, empty-interval audit) must: catch
   `asyncio.CancelledError` and exit cleanly, log-and-continue on other exceptions (never let a
   task die silently), and be cancelled + awaited on shutdown.
+- The WS-status task skips writing an unchanged status, but must still rewrite it at least every
+  `WS_STATUS_STALE_SECONDS / 2`. API workers judge the row by its age alone, so a row left
+  unwritten because nothing changed reads as a dead worker; that happened every night until it was
+  fixed.
 - On shutdown, flush pending candle writes and ticker statuses before exit so no in-memory candle is
   lost. Preserve the existing final-flush sequence.
 - Cleanup and WAL checkpoint (`storage.checkpoint_wal`) run on the cleanup timer, not per candle —

@@ -27,7 +27,7 @@ import time
 import zlib
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Callable, Dict, Tuple
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -163,20 +163,29 @@ async def cleanup_task(storage, candle_engine: CandleEngine):
             logger.error(f"Error in cleanup task: {e}")
 
 
-async def websocket_status_task(storage, ws_manager: WebSocketManager, get_tick_metrics):
+async def websocket_status_task(storage, ws_manager: WebSocketManager, get_tick_metrics,
+                                heartbeat_seconds: float = 15.0,
+                                clock: Callable[[], float] = time.monotonic):
     """
     Background task that periodically writes WebSocket status to database.
     
     Runs every 10 seconds to share WebSocket worker status with API workers.
     This enables API workers to show real WebSocket status in /status endpoint.
     
-    Optimized to only write to database if status has actually changed.
-    Compares all relevant fields including lists and timestamps.
+    Writes when the status has changed, and otherwise once heartbeat_seconds
+    have passed since the last write. API workers judge the row by its age
+    (WS_STATUS_STALE_SECONDS), so a row left alone because nothing changed read
+    as a dead worker: all night, when no tick arrives, /status said "stale".
+    
+    Args:
+        heartbeat_seconds: Longest time an unchanged status goes unwritten.
+        clock: Source of monotonic time, injectable for tests.
     """
     logger = logging.getLogger(__name__)
     logger.info("WebSocket status update task started (10s interval)")
     
     last_status = None
+    last_write = float('-inf')
     
     while True:
         try:
@@ -211,12 +220,14 @@ async def websocket_status_task(storage, ws_manager: WebSocketManager, get_tick_
                 status.get('tick_failed_count')
             )
             
-            if last_status != status_key:
+            now = clock()
+            if last_status != status_key or now - last_write >= heartbeat_seconds:
                 # Write to database (non-blocking)
                 await asyncio.to_thread(storage.update_websocket_status, status)
                 
                 logger.debug(f"Updated WebSocket status: connected={status.get('connected')}, tickers={status.get('subscribed_count')}")
                 last_status = status_key
+                last_write = now
             else:
                 logger.debug("WebSocket status unchanged, skipping DB write")
                 
@@ -813,9 +824,13 @@ async def run_worker(config: Config):
     # Start background cleanup task
     cleanup_task_handle = asyncio.create_task(cleanup_task(storage, candle_engine))
     
-    # Start WebSocket status update task
+    # Start WebSocket status update task. API workers call the row stale after
+    # WS_STATUS_STALE_SECONDS, so it is rewritten at half that when unchanged.
     status_task_handle = asyncio.create_task(
-        websocket_status_task(storage, ws_manager, get_tick_metrics)
+        websocket_status_task(
+            storage, ws_manager, get_tick_metrics,
+            heartbeat_seconds=config.ws_status_stale_seconds / 2,
+        )
     )
     
     # Start active candles update task

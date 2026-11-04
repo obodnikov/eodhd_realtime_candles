@@ -17,6 +17,16 @@ compared against this file. See *Versioning and changelog* in
 ## [Unreleased]
 
 ### Fixed
+- **`GET /status` called the WebSocket status stale all night while the worker was
+  fine.** The worker wrote its status row only when something in it changed, and API
+  workers judge the row by its age alone (`WS_STATUS_STALE_SECONDS`, default 30). With
+  no ticks overnight the row changed only at each 15-minute reconnect, so `is_stale`
+  read `true` with "last update 561s ago" at 03:45 ET on 4 November, minutes before
+  the first premarket ticks arrived and were handled normally. A real stop of the
+  worker looked exactly the same. An unchanged status is now rewritten at least every
+  half of `WS_STATUS_STALE_SECONDS`, so `is_stale: true` means the worker has stopped
+  writing, at any hour. Nothing needs configuring; overnight this adds about three
+  writes a minute to one row.
 - **`analysis/compare_with_intraday.py` overstated the volume share when Intraday had
   no data for a ticker's day.** Such a ticker added its candles' volume to the total
   with nothing beside it in the reference, and its empty minutes counted as minutes
@@ -28,7 +38,7 @@ compared against this file. See *Versioning and changelog* in
   a ticker's latest bar, so the service's candle for that minute had nothing to match.
   On 3 November's evening bars every ticker showed one minute more than the exchange,
   and the total came out at 100.1% instead of 99.7%. The comparison now stops at the
-  newest bar. The service itself is unchanged.
+  newest bar.
 
 ## [0.9.17] - 2026-11-02
 

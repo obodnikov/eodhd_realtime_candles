@@ -655,7 +655,7 @@ class TestTickFailureReporting:
         config.default_tickers = []
         captured = {}
 
-        async def spy_status_task(storage, ws_manager, get_tick_metrics):
+        async def spy_status_task(storage, ws_manager, get_tick_metrics, **kwargs):
             captured['metrics'] = get_tick_metrics
             await asyncio.Event().wait()
 
@@ -720,7 +720,7 @@ class TestTickOrdering:
             order.setdefault(ticker, []).append(timestamp_ms)
             real_process_tick(engine, ticker, price, volume, timestamp_ms)
 
-        async def spy_status_task(storage, ws_manager, get_tick_metrics):
+        async def spy_status_task(storage, ws_manager, get_tick_metrics, **kwargs):
             captured['metrics'] = get_tick_metrics
             await asyncio.Event().wait()
 
@@ -794,13 +794,100 @@ class TestStatusTaskNotices:
 
         with patch('src.websocket_worker.asyncio.sleep', fast_sleep):
             task = asyncio.create_task(
-                websocket_status_task(storage, ws_manager, lambda: dict(values))
+                websocket_status_task(storage, ws_manager, lambda: dict(values),
+                                      heartbeat_seconds=float('inf'))
             )
             await real_sleep(0.05)
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
         assert storage.update_websocket_status.call_count >= 2
+
+
+class TestStatusHeartbeat:
+    """An unchanged status must be rewritten before API workers call it stale.
+
+    The row used to be written only when something changed. All night nothing
+    does, so on 4 November 2026 GET /status reported the status as stale for
+    hours, with "last update 561s ago", while the worker was reconnecting
+    normally and picked up the first premarket ticks at once.
+    """
+
+    @staticmethod
+    async def write_times(passes, heartbeat_seconds):
+        """Run the task for a number of 10-second passes; return when it wrote."""
+        from src.websocket_worker import websocket_status_task
+
+        clock = {'now': 0.0, 'passes': 0}
+        writes = []
+        storage = Mock()
+        storage.update_websocket_status.side_effect = lambda status: writes.append(clock['now'])
+        ws_manager = Mock()
+        ws_manager.get_status.return_value = {'connected': True, 'tick_count': 375160}
+
+        async def fake_sleep(seconds):
+            if clock['passes'] == passes:
+                raise asyncio.CancelledError
+            clock['passes'] += 1
+            clock['now'] += seconds
+
+        with patch('src.websocket_worker.asyncio.sleep', fake_sleep):
+            await websocket_status_task(storage, ws_manager, lambda: {},
+                                        heartbeat_seconds=heartbeat_seconds,
+                                        clock=lambda: clock['now'])
+        return writes
+
+    @pytest.mark.asyncio
+    async def test_an_unchanged_status_is_rewritten_once_the_heartbeat_is_due(self):
+        writes = await self.write_times(passes=5, heartbeat_seconds=15)
+
+        assert writes == [10, 30, 50]
+
+    @pytest.mark.asyncio
+    async def test_an_unchanged_status_is_not_rewritten_before_the_heartbeat(self):
+        """Skipping identical writes, the reason for the change check, still holds."""
+        writes = await self.write_times(passes=5, heartbeat_seconds=1000)
+
+        assert writes == [10]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('stale_seconds', [15, 30, 60])
+    async def test_half_the_stale_threshold_keeps_every_gap_inside_it(self, stale_seconds):
+        writes = await self.write_times(passes=30, heartbeat_seconds=stale_seconds / 2)
+
+        gaps = [later - earlier for earlier, later in zip(writes, writes[1:])]
+        assert max(gaps) < stale_seconds
+
+    @pytest.mark.asyncio
+    async def test_the_worker_takes_the_heartbeat_from_the_stale_threshold(self):
+        config = Config()
+        config.eodhd_api_key = 'test_key'
+        config.database_path = ':memory:'
+        config.default_tickers = []
+        config.ws_status_stale_seconds = 30
+        captured = {}
+
+        async def spy_status_task(storage, ws_manager, get_tick_metrics, **kwargs):
+            captured.update(kwargs)
+            await asyncio.Event().wait()
+
+        with patch('src.websocket_worker.WebSocketManager') as mock_ws, \
+                patch('src.websocket_worker.websocket_status_task', spy_status_task):
+            manager = Mock()
+            manager.start = AsyncMock()
+            manager.subscribe = AsyncMock()
+            manager.stop = AsyncMock()
+            mock_ws.return_value = manager
+
+            task = asyncio.create_task(run_worker(config))
+            await asyncio.sleep(0.3)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        assert captured['heartbeat_seconds'] == 15
 
 
 class TestCandleCloseTaskShutdownOrdering:

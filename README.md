@@ -196,6 +196,7 @@ service and its connection are up. To see whether data is being collected, look 
 | `websocket.late_tick_dropped_count` | Ticks for a candle already closed. A non-trivial count means `CANDLE_CLOSE_GRACE_SECONDS` is too short |
 | `websocket.tick_failed_count` | Ticks that raised an error in the engine. Should stay at zero |
 | `websocket.connection_count` | Rising while ticks keep arriving means more than one connection is competing for the feed |
+| `websocket.is_stale` | The WebSocket worker has not written its status for `WS_STATUS_STALE_SECONDS`. It rewrites it at least every half of that even when nothing changes, so `true` means the worker is stopped or stuck, at any hour |
 
 #### Configuration
 
