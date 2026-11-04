@@ -8,7 +8,9 @@ import pytest
 import asyncio
 import json
 import os
+import random
 import signal
+import time
 from types import SimpleNamespace
 from unittest.mock import Mock, patch, AsyncMock, MagicMock
 from datetime import datetime, timezone
@@ -635,6 +637,257 @@ class TestCandleCloseTask:
             pass
 
         assert task.done()
+
+
+class TestTickFailureReporting:
+    """A tick that raises is counted every time and logged once per interval.
+
+    On 2 November 2026 one failure repeated 123 517 times, once per tick. The
+    database keeps the newest 1000 log entries, so those lines erased every
+    earlier warning, including the ones that would have dated the start.
+    """
+
+    @pytest.mark.asyncio
+    async def test_failed_ticks_are_counted_and_logged_once(self, caplog):
+        config = Config()
+        config.eodhd_api_key = 'test_key'
+        config.database_path = ':memory:'
+        config.default_tickers = []
+        captured = {}
+
+        async def spy_status_task(storage, ws_manager, get_tick_metrics, **kwargs):
+            captured['metrics'] = get_tick_metrics
+            await asyncio.Event().wait()
+
+        with patch('src.websocket_worker.WebSocketManager') as mock_ws, \
+                patch('src.websocket_worker.websocket_status_task', spy_status_task), \
+                patch('src.websocket_worker.CandleEngine.process_tick',
+                      side_effect=ValueError('year 56839265 is out of range')):
+            manager = Mock()
+            manager.start = AsyncMock()
+            manager.subscribe = AsyncMock()
+            manager.stop = AsyncMock()
+            mock_ws.return_value = manager
+
+            with caplog.at_level('ERROR', logger='src.websocket_worker'):
+                task = asyncio.create_task(run_worker(config))
+                await asyncio.sleep(0.3)
+
+                on_tick = manager.set_on_tick.call_args[0][0]
+                for offset in range(50):
+                    await on_tick('NVDA', 207.0, 1, 1793636889494600000 + offset)
+                await asyncio.sleep(0.2)
+                metrics = captured['metrics']()
+
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+        assert metrics['tick_failed_count'] == 50
+        assert metrics['tick_processed_count'] == 0
+        lines = [r for r in caplog.records if 'failed processing' in r.getMessage()]
+        assert len(lines) == 1
+        # Whichever of the concurrent workers failed first; the raw value is shown.
+        assert 'at 17936368894946000' in lines[0].getMessage()
+
+
+class TestTickOrdering:
+    """A ticker's ticks must reach the engine in the order they arrived.
+
+    Workers used to share one queue and run process_tick in a thread pool, so a
+    later tick could overtake an earlier one, and the engine then dropped the
+    earlier one as out of order. On 2 November 2026 that was 21% of all ticks on
+    a healthy service, with about 77% of the exchange's volume reaching candles,
+    while EODHD's own stream never went backwards.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_pipeline_keeps_each_tickers_ticks_in_order(self, tmp_path):
+        config = Config()
+        config.eodhd_api_key = 'test_key'
+        config.database_path = str(tmp_path / 'order.db')
+        config.default_tickers = []
+        captured = {}
+        order = {}
+        delays = random.Random(1)
+        real_process_tick = CandleEngine.process_tick
+
+        def uneven_process_tick(engine, ticker, price, volume, timestamp_ms):
+            # Thread scheduling is what reorders ticks; make it uneven on purpose.
+            time.sleep(delays.uniform(0, 0.002))
+            order.setdefault(ticker, []).append(timestamp_ms)
+            real_process_tick(engine, ticker, price, volume, timestamp_ms)
+
+        async def spy_status_task(storage, ws_manager, get_tick_metrics, **kwargs):
+            captured['metrics'] = get_tick_metrics
+            await asyncio.Event().wait()
+
+        tickers = [f'T{n}' for n in range(10)]
+        ticks_per_ticker = 100
+
+        with patch('src.websocket_worker.WebSocketManager') as mock_ws, \
+                patch('src.websocket_worker.websocket_status_task', spy_status_task), \
+                patch.object(CandleEngine, 'process_tick', uneven_process_tick):
+            manager = Mock()
+            manager.start = AsyncMock()
+            manager.subscribe = AsyncMock()
+            manager.stop = AsyncMock()
+            mock_ws.return_value = manager
+
+            task = asyncio.create_task(run_worker(config))
+            await asyncio.sleep(0.3)
+
+            on_tick = manager.set_on_tick.call_args[0][0]
+            base_ms = int(time.time() * 1000) - 20000
+            for step in range(ticks_per_ticker):
+                for ticker in tickers:
+                    await on_tick(ticker, 100.0, 1, base_ms + step)
+
+            expected = len(tickers) * ticks_per_ticker
+            for _ in range(400):
+                metrics = captured['metrics']()
+                if metrics['tick_processed_count'] + metrics['tick_failed_count'] >= expected:
+                    break
+                await asyncio.sleep(0.05)
+
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        assert metrics['tick_processed_count'] == expected
+        assert metrics['out_of_order_tick_dropped_count'] == 0
+        for ticker, stamps in order.items():
+            assert stamps == sorted(stamps), f"{ticker} reached the engine out of order"
+
+
+class TestStatusTaskNotices:
+    """The status row must be rewritten when any reported counter moves."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('counter', [
+        'future_tick_dropped_count',
+        'late_tick_dropped_count',
+        'tick_failed_count',
+    ])
+    async def test_a_change_in_this_counter_alone_is_written(self, counter):
+        from src.websocket_worker import websocket_status_task
+
+        values = {counter: 0}
+        storage = Mock()
+        ws_manager = Mock()
+        ws_manager.get_status.return_value = {'connected': True}
+
+        passes = {'n': 0}
+        real_sleep = asyncio.sleep
+
+        async def fast_sleep(seconds):
+            if seconds != 10:
+                await real_sleep(seconds)
+                return
+            passes['n'] += 1
+            values[counter] = passes['n']
+            await real_sleep(0)
+
+        with patch('src.websocket_worker.asyncio.sleep', fast_sleep):
+            task = asyncio.create_task(
+                websocket_status_task(storage, ws_manager, lambda: dict(values),
+                                      heartbeat_seconds=float('inf'))
+            )
+            await real_sleep(0.05)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        assert storage.update_websocket_status.call_count >= 2
+
+
+class TestStatusHeartbeat:
+    """An unchanged status must be rewritten before API workers call it stale.
+
+    The row used to be written only when something changed. All night nothing
+    does, so on 4 November 2026 GET /status reported the status as stale for
+    hours, with "last update 561s ago", while the worker was reconnecting
+    normally and picked up the first premarket ticks at once.
+    """
+
+    @staticmethod
+    async def write_times(passes, heartbeat_seconds):
+        """Run the task for a number of 10-second passes; return when it wrote."""
+        from src.websocket_worker import websocket_status_task
+
+        clock = {'now': 0.0, 'passes': 0}
+        writes = []
+        storage = Mock()
+        storage.update_websocket_status.side_effect = lambda status: writes.append(clock['now'])
+        ws_manager = Mock()
+        ws_manager.get_status.return_value = {'connected': True, 'tick_count': 375160}
+
+        async def fake_sleep(seconds):
+            if clock['passes'] == passes:
+                raise asyncio.CancelledError
+            clock['passes'] += 1
+            clock['now'] += seconds
+
+        with patch('src.websocket_worker.asyncio.sleep', fake_sleep):
+            await websocket_status_task(storage, ws_manager, lambda: {},
+                                        heartbeat_seconds=heartbeat_seconds,
+                                        clock=lambda: clock['now'])
+        return writes
+
+    @pytest.mark.asyncio
+    async def test_an_unchanged_status_is_rewritten_once_the_heartbeat_is_due(self):
+        writes = await self.write_times(passes=5, heartbeat_seconds=15)
+
+        assert writes == [10, 30, 50]
+
+    @pytest.mark.asyncio
+    async def test_an_unchanged_status_is_not_rewritten_before_the_heartbeat(self):
+        """Skipping identical writes, the reason for the change check, still holds."""
+        writes = await self.write_times(passes=5, heartbeat_seconds=1000)
+
+        assert writes == [10]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('stale_seconds', [15, 30, 60])
+    async def test_half_the_stale_threshold_keeps_every_gap_inside_it(self, stale_seconds):
+        writes = await self.write_times(passes=30, heartbeat_seconds=stale_seconds / 2)
+
+        gaps = [later - earlier for earlier, later in zip(writes, writes[1:])]
+        assert max(gaps) < stale_seconds
+
+    @pytest.mark.asyncio
+    async def test_the_worker_takes_the_heartbeat_from_the_stale_threshold(self):
+        config = Config()
+        config.eodhd_api_key = 'test_key'
+        config.database_path = ':memory:'
+        config.default_tickers = []
+        config.ws_status_stale_seconds = 30
+        captured = {}
+
+        async def spy_status_task(storage, ws_manager, get_tick_metrics, **kwargs):
+            captured.update(kwargs)
+            await asyncio.Event().wait()
+
+        with patch('src.websocket_worker.WebSocketManager') as mock_ws, \
+                patch('src.websocket_worker.websocket_status_task', spy_status_task):
+            manager = Mock()
+            manager.start = AsyncMock()
+            manager.subscribe = AsyncMock()
+            manager.stop = AsyncMock()
+            mock_ws.return_value = manager
+
+            task = asyncio.create_task(run_worker(config))
+            await asyncio.sleep(0.3)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        assert captured['heartbeat_seconds'] == 15
 
 
 class TestCandleCloseTaskShutdownOrdering:

@@ -275,6 +275,57 @@ class TestFreshTickWatchdog:
 
         assert manager._fresh_tick_count == 1
 
+    def test_default_future_limit_is_one_minute(self):
+        assert WebSocketManager(api_key='test_key').tick_max_future_seconds == 60
+
+    def test_a_future_limit_below_one_second_is_rejected(self):
+        with pytest.raises(ValueError, match='tick_max_future_seconds'):
+            WebSocketManager(api_key='test_key', tick_max_future_seconds=0)
+
+    @pytest.mark.asyncio
+    async def test_a_timestamp_far_ahead_is_not_evidence_of_a_live_feed(self):
+        """The engine drops such a tick, so the two must agree it is not current."""
+        manager = self._manager(tick_max_future_seconds=60)
+
+        await manager._process_message(self._tick(age_seconds=-30 * 60))
+
+        assert manager._tick_count == 1, "still a message, and still forwarded"
+        assert manager._fresh_tick_count == 0
+
+    @pytest.mark.asyncio
+    async def test_a_19_digit_timestamp_is_not_evidence_of_a_live_feed(self):
+        manager = self._manager()
+
+        await manager._process_message(json.dumps(
+            {'s': 'NVDA', 'p': 207.0, 'v': 1, 't': 1793636889494600000}
+        ))
+
+        assert manager._fresh_tick_count == 0
+
+    @pytest.mark.asyncio
+    async def test_the_future_limit_applies_with_the_age_check_disabled(self):
+        manager = self._manager(tick_max_age_seconds=0, tick_max_future_seconds=60)
+
+        await manager._process_message(self._tick(age_seconds=-30 * 60))
+
+        assert manager._fresh_tick_count == 0
+
+    @pytest.mark.asyncio
+    async def test_a_tick_far_ahead_is_still_delivered_to_the_callback(self):
+        """Dropping and counting it is the engine's job, as with a stale tick."""
+        seen = []
+        manager = self._manager()
+        manager.set_on_tick(
+            lambda t, p, v, ts: seen.append(ts),
+            fire_and_forget=False
+        )
+
+        await manager._process_message(json.dumps(
+            {'s': 'NVDA', 'p': 207.0, 'v': 1, 't': 1793636889494600000}
+        ))
+
+        assert seen == [1793636889494600000]
+
     @pytest.mark.asyncio
     async def test_disabled_check_counts_every_tick(self):
         manager = self._manager(tick_max_age_seconds=0)

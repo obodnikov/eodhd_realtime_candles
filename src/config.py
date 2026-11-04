@@ -85,6 +85,7 @@ class Config:
     tick_queue_maxsize: int = field(default_factory=lambda: int(os.environ.get('TICK_QUEUE_MAXSIZE', '50000')))
     tick_worker_concurrency: int = field(default_factory=lambda: int(os.environ.get('TICK_WORKER_CONCURRENCY', '100')))
     tick_max_age_seconds: int = field(default_factory=lambda: int(os.environ.get('TICK_MAX_AGE_SECONDS', '180')))
+    tick_max_future_seconds: int = field(default_factory=lambda: int(os.environ.get('TICK_MAX_FUTURE_SECONDS', '60')))
     candle_close_grace_seconds: float = field(default_factory=lambda: float(os.environ.get('CANDLE_CLOSE_GRACE_SECONDS', '2.0')))
     empty_interval_audit: str = field(default_factory=lambda: os.environ.get('EMPTY_INTERVAL_AUDIT', 'off').strip().lower())
     empty_interval_audit_path: str = field(default_factory=lambda: os.environ.get('EMPTY_INTERVAL_AUDIT_PATH', ''))
@@ -127,6 +128,9 @@ class Config:
 
         if self.tick_max_age_seconds < 0:
             errors.append("tick_max_age_seconds must be >= 0")
+
+        if self.tick_max_future_seconds < 1:
+            errors.append("tick_max_future_seconds must be >= 1")
 
         if self.candle_close_grace_seconds < 0:
             errors.append("candle_close_grace_seconds must be >= 0")
@@ -180,6 +184,7 @@ class Config:
             'ticker_status_update_interval_seconds': self.ticker_status_update_interval_seconds,
             'candle_write_queue_maxsize': self.candle_write_queue_maxsize,
             'tick_max_age_seconds': self.tick_max_age_seconds,
+            'tick_max_future_seconds': self.tick_max_future_seconds,
             'candle_close_grace_seconds': self.candle_close_grace_seconds,
             'empty_interval_audit': self.empty_interval_audit,
             'subscription_silence_minutes': self.subscription_silence_minutes,
@@ -307,6 +312,14 @@ class ConfigManager:
                 errors.append(
                     "Cannot update candle_close_grace_seconds at runtime; "
                     "set CANDLE_CLOSE_GRACE_SECONDS and restart"
+                )
+                continue
+
+            # Same reasoning: the filter runs in the WebSocket worker.
+            if key == 'tick_max_future_seconds':
+                errors.append(
+                    "Cannot update tick_max_future_seconds at runtime; "
+                    "set TICK_MAX_FUTURE_SECONDS and restart"
                 )
                 continue
 

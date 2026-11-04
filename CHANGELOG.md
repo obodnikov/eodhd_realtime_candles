@@ -14,6 +14,218 @@ compared against this file. See *Versioning and changelog* in
 > the commits they cover; they are not release notes written at the time, and
 > they may omit changes that left no trace in a commit message.
 
+## [Unreleased]
+
+### Fixed
+- **`GET /status` called the WebSocket status stale all night while the worker was
+  fine.** The worker wrote its status row only when something in it changed, and API
+  workers judge the row by its age alone (`WS_STATUS_STALE_SECONDS`, default 30). With
+  no ticks overnight the row changed only at each 15-minute reconnect, so `is_stale`
+  read `true` with "last update 561s ago" at 03:45 ET on 4 November, minutes before
+  the first premarket ticks arrived and were handled normally. A real stop of the
+  worker looked exactly the same. An unchanged status is now rewritten at least every
+  half of `WS_STATUS_STALE_SECONDS`, so `is_stale: true` means the worker has stopped
+  writing, at any hour. Nothing needs configuring; overnight this adds about three
+  writes a minute to one row.
+- **`analysis/compare_with_intraday.py` overstated the volume share when Intraday had
+  no data for a ticker's day.** Such a ticker added its candles' volume to the total
+  with nothing beside it in the reference, and its empty minutes counted as minutes
+  nobody traded. On the morning of 4 November, six of 50 tickers still had no Intraday
+  data for 3 November: the total read 4.2% instead of 3.8%, and 62.0% instead of
+  76.5% of the empty minutes traded elsewhere. These tickers are now listed separately
+  and left out of the totals; one of the six had its data an hour later.
+- **`--feed-bars` counted each ticker's newest minute as extra.** EODHD does not return
+  a ticker's latest bar, so the service's candle for that minute had nothing to match.
+  On 3 November's evening bars every ticker showed one minute more than the exchange,
+  and the total came out at 100.1% instead of 99.7%. The comparison now stops at the
+  newest bar.
+
+## [0.9.17] - 2026-11-02
+
+### Fixed
+- **A healthy service was throwing away about a fifth of its ticks.** Workers shared
+  one queue and ran `process_tick` in a thread pool, so a later tick of a ticker
+  could overtake an earlier one, and the out-of-order filter then dropped the earlier
+  one. Those were real trades, and nothing presented them as a loss: the counter read
+  like ordinary filtering. The queue and the filter both date from 2026-02-20, so
+  every candle since then is affected.
+
+  On production on 2 November, right after a restart, 21% of ticks were dropped this
+  way, and candles held about 77% of the volume in EODHD's minute bars from the same
+  exchange. A test feeding strictly ordered ticks through the old pipeline lost
+  20.9% of them.
+
+  Each ticker now always goes to the same worker, which finishes one tick before
+  taking the next (`TickDispatcher`). Different tickers still run in parallel, and
+  `TICK_QUEUE_MAXSIZE` still limits the total waiting, so one busy ticker can use all
+  of it. Nothing needs configuring.
+
+  Both pipelines side by side on the live public demo feed (6 tickers), compared with
+  the exchange's bars:
+
+  | | Shared queue | One worker per ticker |
+  | --- | --- | --- |
+  | Dropped as out of order, 7 minutes | 628 of 2 746 (22.9%) | 0 of 2 775 |
+  | Volume, the 4 minutes compared | 71 533 of 95 776 (74.7%) | 95 776 of 95 776 (100%) |
+
+  A further 15-minute run of the new pipeline dropped 0 of 4 269 ticks as out of
+  order and stored 99.48% of the volume, with 86 of 89 ticker-minutes exact on open,
+  high, low, close and volume. What remains is mostly ticks arriving after their
+  candle closed, 5 in that run, reported in `late_tick_dropped_count`.
+
+  This has not yet been measured on production's 50 tickers; run
+  `analysis/compare_with_intraday.py --feed-bars` after deploying.
+
+  **Candles already stored are not corrected.** They miss real trades, which can also
+  affect their high, low and close. The volume figures in ARCHITECTURE.md §4.4,
+  README and `analysis/README.md` were measured with this loss and now say so; they
+  need re-measuring after a full session.
+
+  **Expect a step in volume on upgrade.** New candles carry roughly a third more volume
+  than the ones before them, so anything comparing a ticker against its own recent
+  volume will read high until the old candles age out. With `MAX_CANDLES_STORED=5000`
+  that took about six sessions for an active ticker in October, and longer for a
+  quiet one.
+
+  Single-process mode (`src/main.py`, not used in production) still has this problem,
+  and `ARCHITECTURE.md` §5.2 says so.
+
+## [0.9.16] - 2026-11-02
+
+### Fixed
+- **One tick with a bad timestamp stopped a ticker producing candles until the
+  worker restarted.** On 2 November 2026 EODHD sent 19-digit values in `t`, which
+  [its documentation](https://eodhd.com/financial-apis/new-real-time-data-api-websockets)
+  gives as epoch milliseconds: `1793636889494600000`, for example. Read as
+  nanoseconds, those values were 30 minutes ahead of the clock. The tick became the
+  ticker's last-seen time, so every ordinary tick after it was dropped as out of
+  order, and its candle could neither be written nor closed.
+
+  That day **all 50 tickers produced no candle at all**, with `/health` answering
+  `healthy` and `connected: true`. Where it could still be measured, EODHD's own
+  minute bars from the same exchange showed 4 941 bars between 10:59 and 13:24 ET
+  against none here. KLAC and UNH had been stuck the same way since the evening of
+  16 October, losing all 3 900 main-session minutes from 19 to 30 October.
+
+  The engine now drops a tick stamped more than `TICK_MAX_FUTURE_SECONDS` (default
+  60) ahead of the clock before it touches any state, and counts it in
+  `future_tick_dropped_count`. The value is not converted, because converting it
+  would put trades in the wrong candle. Those ticks are lost, and the ticker keeps
+  working as soon as ordinary ones return. The watchdog no longer treats such a
+  tick as evidence of a live feed.
+
+  **Candles already lost are not recovered**, and a worker running an older version
+  needs one restart to clear the stuck state.
+- **`POST /reconnect` could leave two connection loops running.** `stop()` only
+  cleared a flag and closed the current socket. While the loop was waiting to
+  reconnect there was no socket to close, so it woke to find the flag set again by
+  `start()` and carried on beside the new loop. Production ran this way: the second
+  loop got `422 Symbols limit reached` because the first held the token's 50-symbol
+  allowance, then stayed silent and reconnected every 15 minutes. `stop()` now
+  cancels the loop and waits for it to end.
+
+  The two loops share one set of flags, so each reconnect of the second also made
+  the first ignore its ticks. From the log that is about 6 seconds in every 15
+  minutes, roughly 0.7% of ticks. That figure is calculated and was not measured
+  directly; a local reproduction confirmed the mechanism. What started the second
+  loop in production, and when, is not known: the log history had been overwritten.
+- **`remove_ticker` kept the ticker's last-seen time**, so a ticker removed and added
+  back could have its ticks dropped as out of order.
+
+### Added
+- **`GET /status` can now show that ticks are arriving but candles are not.**
+  `subscription_health.ticking_without_candles` lists tickers whose newest candle is
+  far behind their last tick. Nothing could show this before, because freshness was
+  judged from tick times alone, and the bad ticks kept moving those. `silent_tickers`
+  entries and ticker rows (`GET /tickers`, `GET /tickers/{ticker}`) gain
+  `last_candle_at`. README explains which fields answer "is data being collected".
+- **`tick_failed_count`, `future_tick_dropped_count` and
+  `late_tick_dropped_count` in `GET /status`.** These need three new columns in
+  `websocket_status`, added automatically on start on both databases and in
+  `scripts/init_postgres.sql`. Existing data is untouched.
+- **`--feed-bars` in `analysis/compare_with_intraday.py`.** Compares the latest
+  minutes against EODHD's minute bars from the same exchange, so a missing minute is
+  a loss inside the service. It works during the session, unlike the Intraday
+  comparison. `analysis/README.md` also records that a run marks every ticker as just
+  requested in `last_candle_request_at`.
+
+### Changed
+- **A failure repeating per tick now writes one log line a minute**, stating how many
+  occurrences it stands for. On 2 November one error repeated 123 517 times, and since
+  the database keeps the newest 1000 entries, it erased the warnings that would have
+  dated the start of the problem. Dropped future-stamped ticks are logged the same way.
+
+## [0.9.15] - 2026-11-02
+
+### Changed
+- **The AI-coding rule set now matches the code it governs.** The previous set
+  was written on 2026-09-02, before 0.9.10-0.9.14 landed, so it described a
+  service that closed candles on the next tick, had no log buffer, and reported
+  only connection-level health. It also carried generic guidance copied from
+  other projects: methods that do not exist here (`get_data`, `get_stats`),
+  a dependency menu naming FastAPI and SQLAlchemy, and the same
+  `asyncio.to_thread` and `/health` rules repeated in three files at once.
+
+  Every rule file is now project-specific and de-duplicated — each rule has
+  exactly one home, and the other files point at it:
+
+  - `AI.md` — general Python rules for `src/**`, `scripts/**`, `tests/**`,
+    `analysis/**`: relative imports inside the package, dotenv at the entry
+    points, the env-var contract between `src/config.py` and `.env.example`,
+    and the rule that `analysis/**` reads and compares but never writes.
+  - `AI_REST_API.md` — adds `/logs` (database first, in-memory ring buffer as
+    fallback, and the response says which), `subscription_health` in
+    `GET /status`, the `202` + database hand-off that `POST /reconnect` uses
+    instead of restarting a feed connection inside an API worker, and the
+    `version` field.
+  - `AI_WEBSOCKET_ENGINE.md` — adds the three tick filters and who owns each
+    (stale by age, out-of-order, late-for-a-closed-bucket), the timer that
+    closes a candle interval rather than the next tick, the empty-interval
+    audit that measures without writing, the reconnect-request task, and the
+    rule that an absent candle is not an empty candle.
+  - `AI_FLASK.md` — adds the log viewer, its level filter and limit clamp, and
+    the `ADMIN_*` variables the UI reads.
+  - `AI_SQLITE.md` / `AI_POSTGRESQL.md` — rewritten from generic tutorials into
+    the settings this code actually uses: the PRAGMAs, the thread-local
+    connection, the retry helper, the WAL checkpoint, and the two places the
+    PostgreSQL schema is defined that must be kept in step with each other.
+
+  `CLAUDE.md` gains the codebase-verification rule, the provider-verification
+  rule (the EODHD feed's behaviour is not in this repository — check the
+  provider's documentation and re-measure with
+  `analysis/compare_with_intraday.py` rather than reasoning from memory), the
+  recurring traps, and a pointer to the `semantic-index` skill for searching
+  this repo.
+
+  `ARCHITECTURE.md` picks up the components that were missing: `log_buffer.py`,
+  the storage factory, `analysis/`, and the reconnect-request task in the
+  background-task list, plus the seven environment variables added since
+  2026-09-02 and their owners in the stability zones.
+
+  No runtime behaviour changed: this release moves documentation only.
+
+### Fixed
+- **The review-fix-loop skill could be killed mid-review.** Its timeout was 15
+  minutes while `code-review.sh` is allowed 55 minutes
+  (`REVIEW_TOTAL_BUDGET=3300` in `~/mbin/.env`), so the calling agent could
+  terminate the script while it was still retrying — and the diagnostic it
+  would have printed was lost with it. The timeout is now 60 minutes, longer
+  than the budget the script is allowed to spend.
+
+  The skill also did not recognise `SERVICE_ERROR`, the outcome the script
+  produces when the review service is unreachable: a run that never reviewed
+  anything was counted as an iteration, and a service failure looked like
+  review feedback. A `SERVICE_ERROR` run now ends the loop, changes no code,
+  and does not consume an iteration.
+
+### Removed
+- **A broken self-referencing symlink** at `.agents/skills/skills` (it pointed
+  at itself), tracked in git and resolvable to nothing.
+
+### Added
+- **A project-level `.pi/bash-restrictions.json`**, holding only what the
+  global `~/.pi/agent/bash-restrictions.json` does not already cover.
+
 ## [0.9.14] - 2026-09-04
 
 ### Added

@@ -27,6 +27,7 @@ def mock_app():
     # active candles, so give it an empty watchlist.
     app['storage'].get_tickers.return_value = []
     app['config_manager'].config.subscription_silence_minutes = 15
+    app['config_manager'].config.candle_interval_minutes = 1
     app['candle_engine'] = Mock()
     app['ws_manager'] = Mock()
     

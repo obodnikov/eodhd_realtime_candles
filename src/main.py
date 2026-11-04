@@ -71,12 +71,14 @@ async def create_app(config: Config) -> web.Application:
         save_every_m_seconds=config.candle_save_every_m_seconds,
         ticker_status_update_interval_seconds=config.ticker_status_update_interval_seconds,
         candle_write_queue_maxsize=config.candle_write_queue_maxsize,
-        tick_max_age_seconds=config.tick_max_age_seconds
+        tick_max_age_seconds=config.tick_max_age_seconds,
+        tick_max_future_seconds=config.tick_max_future_seconds
     )
     ws_manager = WebSocketManager(
         api_key=config.eodhd_api_key,
         reconnect_delay=config.ws_reconnect_delay,
-        ping_interval=config.ws_ping_interval
+        ping_interval=config.ws_ping_interval,
+        tick_max_future_seconds=config.tick_max_future_seconds
     )
     
     # Create async tick handler that runs DB operations in thread pool

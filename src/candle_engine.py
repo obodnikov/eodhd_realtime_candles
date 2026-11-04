@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Callable, Set, Tuple
 from dataclasses import dataclass
 
+from .log_buffer import LogThrottle
 from .storage import Storage, Candle
 
 logger = logging.getLogger(__name__)
@@ -67,7 +68,8 @@ class CandleEngine:
         save_every_m_seconds: float = 5.0,
         ticker_status_update_interval_seconds: float = 1.0,
         candle_write_queue_maxsize: int = 10000,
-        tick_max_age_seconds: int = 0
+        tick_max_age_seconds: int = 0,
+        tick_max_future_seconds: int = 60
     ):
         """
         Initialize candle engine.
@@ -85,6 +87,10 @@ class CandleEngine:
             tick_max_age_seconds: Max accepted age of incoming ticks relative
                 to current UTC time before they are dropped as stale.
                 Set to 0 to disable stale-age filtering.
+            tick_max_future_seconds: How far ahead of current UTC time a tick
+                may be stamped before it is dropped. Always on: such a tick
+                would otherwise become the ticker's last-seen time and make
+                every ordinary tick after it look out of order.
         """
         self.storage = storage
         self.interval_minutes = interval_minutes
@@ -93,7 +99,8 @@ class CandleEngine:
         self.ticker_status_update_interval_seconds = ticker_status_update_interval_seconds
         self.candle_write_queue_maxsize = candle_write_queue_maxsize
         self.tick_max_age_seconds = tick_max_age_seconds
-        
+        self.tick_max_future_seconds = tick_max_future_seconds
+
         # Configurable save frequency thresholds
         self.save_every_n_ticks = save_every_n_ticks
         self.save_every_m_seconds = save_every_m_seconds
@@ -123,6 +130,8 @@ class CandleEngine:
         self._candle_write_dropped_count = 0
         self._stale_tick_dropped_count = 0
         self._out_of_order_tick_dropped_count = 0
+        self._future_tick_dropped_count = 0
+        self._future_tick_log = LogThrottle()
 
         # Start timestamp of the most recently completed bucket per ticker.
         # Guards against a late tick reopening a bucket that is already closed.
@@ -322,8 +331,30 @@ class CandleEngine:
             timestamp_ms: Unix timestamp in milliseconds
         """
         ticker = ticker.upper()
+        now_ms = int(time.time() * 1000)
+
+        # No trade happens in the future, so this is bad data, and it must not
+        # reach any state below. As the last-seen time it would make every
+        # ordinary tick look out of order until a restart. It is dropped rather
+        # than converted: the provider's 19-digit values read as nanoseconds are
+        # 30 minutes ahead of the clock, so converting them would put trades in
+        # the wrong candle.
+        if timestamp_ms > now_ms + self.tick_max_future_seconds * 1000:
+            with self._lock:
+                self._future_tick_dropped_count += 1
+            occurrences = self._future_tick_log.allow()
+            if occurrences is not None:
+                logger.warning(
+                    "Dropped %d tick(s) stamped more than %ds ahead of the clock; "
+                    "latest: %s at %d",
+                    occurrences,
+                    self.tick_max_future_seconds,
+                    ticker,
+                    timestamp_ms
+                )
+            return
+
         if self.tick_max_age_seconds > 0:
-            now_ms = int(time.time() * 1000)
             if timestamp_ms < (now_ms - self.tick_max_age_seconds * 1000):
                 with self._lock:
                     self._stale_tick_dropped_count += 1
@@ -613,6 +644,7 @@ class CandleEngine:
                 logger.info(f"Stopped tracking {ticker}")
             self._pending_ticker_status.pop(ticker, None)
             self._last_ticker_status_write.pop(ticker, None)
+            self._last_tick_timestamp_ms.pop(ticker, None)
             self._last_completed_start.pop(ticker, None)
             self._last_close.pop(ticker, None)
     
@@ -743,6 +775,7 @@ class CandleEngine:
                 'candle_write_dropped_count': self._candle_write_dropped_count,
                 'stale_tick_dropped_count': self._stale_tick_dropped_count,
                 'out_of_order_tick_dropped_count': self._out_of_order_tick_dropped_count,
+                'future_tick_dropped_count': self._future_tick_dropped_count,
                 'late_tick_dropped_count': self._late_tick_dropped_count
             }
 

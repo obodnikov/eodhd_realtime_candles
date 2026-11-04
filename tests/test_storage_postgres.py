@@ -8,6 +8,7 @@ Tests verify the adapter has the same interface as SQLite Storage.
 import pytest
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 from unittest.mock import MagicMock, patch, call
 
 # Skip all tests if psycopg2 is not available
@@ -269,6 +270,86 @@ class TestPostgreSQLStorageWebSocketStatus:
         postgres_storage.update_websocket_status(status)
         
         assert postgres_storage._test_mock['cursor'].execute.called
+
+    NEW_COUNTERS = {
+        'tick_failed_count': 7,
+        'future_tick_dropped_count': 8,
+        'late_tick_dropped_count': 9,
+    }
+
+    def test_status_write_sends_the_new_counters(self, postgres_storage):
+        """No PostgreSQL here, so check the statement against its own values."""
+        status = {
+            'connected': True,
+            'subscribed_tickers': [],
+            'subscribed_count': 0,
+            'pending_subscribe': [],
+            'connection_count': 1,
+            'tick_count': 0,
+            'last_message': None,
+            **self.NEW_COUNTERS,
+        }
+        cursor = postgres_storage._test_mock['cursor']
+        cursor.execute.reset_mock()
+
+        postgres_storage.update_websocket_status(status)
+
+        sql, params = cursor.execute.call_args[0]
+        insert_columns = sql.split('(', 1)[1].split(')', 1)[0].split(',')
+        assert len(insert_columns) == sql.count('%s') + 1, "id is the literal 1"
+        assert sql.count('%s') == len(params)
+        for name, value in self.NEW_COUNTERS.items():
+            assert name in sql
+            assert f'{name} = EXCLUDED.{name}' in sql
+            position = [c.strip() for c in insert_columns].index(name) - 1
+            assert params[position] == value, f"{name} sent in the wrong position"
+
+    def test_status_read_returns_the_new_counters(self, postgres_storage):
+        cursor = postgres_storage._test_mock['cursor']
+        cursor.fetchone.return_value = {
+            'connected': True,
+            'subscribed_tickers': '[]',
+            'subscribed_count': 0,
+            'pending_subscribe': '[]',
+            'connection_count': 1,
+            'tick_count': 0,
+            'last_message': None,
+            'last_update': datetime.now(timezone.utc).isoformat(),
+            **self.NEW_COUNTERS,
+        }
+
+        result = postgres_storage.get_websocket_status()
+
+        for name, value in self.NEW_COUNTERS.items():
+            assert result[name] == value
+
+    def test_both_schema_definitions_add_the_new_columns(self):
+        """storage_postgres.py and init_postgres.sql must stay in step."""
+        root = Path(__file__).parent.parent
+        adapter = (root / 'src' / 'storage_postgres.py').read_text(encoding='utf-8')
+        script = (root / 'scripts' / 'init_postgres.sql').read_text(encoding='utf-8')
+        for name in self.NEW_COUNTERS:
+            statement = f'ADD COLUMN IF NOT EXISTS {name} BIGINT NOT NULL DEFAULT 0'
+            assert statement in adapter
+            assert statement in script
+
+    def test_ticker_rows_carry_the_newest_candle_time(self, postgres_storage):
+        cursor = postgres_storage._test_mock['cursor']
+        cursor.fetchall.return_value = [{
+            'symbol': 'NVDA',
+            'added_at': '2026-10-01T00:00:00+00:00',
+            'status': 'active',
+            'last_tick_at': '2026-11-02T18:00:00+00:00',
+            'last_price': 207.0,
+            'last_candle_request_at': None,
+            'candle_count': 5000,
+            'last_candle_ts': 1793642400,
+        }]
+
+        ticker = postgres_storage.get_tickers()[0]
+
+        assert ticker.last_candle_at == '2026-11-02T18:00:00+00:00'
+        assert ticker.candle_count == 5000
 
     def test_get_websocket_status_returns_none_when_empty(self, postgres_storage):
         """Test that get_websocket_status returns None when no status."""

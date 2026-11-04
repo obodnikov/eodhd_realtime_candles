@@ -14,6 +14,48 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.config import Config, ConfigManager
 
 
+class TestTickMaxFutureSeconds(unittest.TestCase):
+    """tick_max_future_seconds: default, validation, and runtime refusal."""
+
+    def _config(self, **overrides):
+        config = Config()
+        config.eodhd_api_key = 'test_key'
+        config.persist_config = False
+        for key, value in overrides.items():
+            setattr(config, key, value)
+        return config
+
+    def test_default_is_one_minute(self):
+        self.assertEqual(self._config().tick_max_future_seconds, 60)
+
+    def test_read_from_environment(self):
+        with unittest.mock.patch.dict(os.environ, {'TICK_MAX_FUTURE_SECONDS': '10'}):
+            self.assertEqual(Config().tick_max_future_seconds, 10)
+
+    def test_it_cannot_be_switched_off(self):
+        """Zero would bring back the failure this setting exists to prevent."""
+        for value in (0, -1):
+            errors = self._config(tick_max_future_seconds=value).validate()
+            self.assertTrue(
+                any('tick_max_future_seconds' in error for error in errors),
+                f"{value} should be rejected"
+            )
+
+    def test_appears_in_public_config(self):
+        public = self._config(tick_max_future_seconds=10).get_public_config()
+        self.assertEqual(public['tick_max_future_seconds'], 10)
+
+    def test_cannot_be_changed_at_runtime(self):
+        """The filter runs in the WebSocket worker and never sees the change."""
+        manager = ConfigManager(self._config())
+
+        result = manager.update({'tick_max_future_seconds': 5})
+
+        self.assertEqual(result['updated'], [])
+        self.assertIn('Cannot update tick_max_future_seconds', result['errors'][0])
+        self.assertEqual(manager.config.tick_max_future_seconds, 60)
+
+
 class TestCandleCloseGraceSeconds(unittest.TestCase):
     """candle_close_grace_seconds: default, validation, and runtime refusal."""
 

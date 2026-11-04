@@ -1,5 +1,5 @@
 # Claude Chat Export
-**Generated: 2026-09-02 13:01:58**
+**Generated: 2026-09-07 12:10:44**
 
 ---
 
@@ -1200,4 +1200,837 @@ jq -r 'select(.would_fill) | .ticker' /data/empty_interval_audit.jsonl \
 Полная основная сессия — 390 минутных отрезков, расширенная — 960. Отношение к ним и есть ответ.
 
 Напомню про порядок, о котором договорились: три исправления на стороне Terra идут первыми — привязка опроса к границе минуты, сроки на запрос и на цикл, досчёт промежуточных свечей. Они закрывают и отставание в 42 секунды, и зависания на 16–20 минут, и примерно половину пропусков. Измерение в это время просто копит данные, ни на что не влияя, и к моменту решения по задаче 2 у тебя будет число вместо оценки из проектного документа.
+
+---
+
+👤 **USER:**
+> посмотри лог файл tmp/eodhd_04.09.log.gz
+
+1,2 млн строк за двое суток. Смотрю общую картину.
+
+873 принудительных переподключения по «тишине» за двое суток. Смотрю, когда именно.
+
+Ровно раз в минуту, только в 00:00–07:xx UTC — это 20:00–04:00 ET, ночь между сессиями. Теперь главное: работают ли новые задачи.
+
+Обе задачи работают, процесс не перезапускался ни разу. Считаю результаты измерения прямо из лога.
+
+51 бумага. Проверяю ещё две вещи — работу закрытия по таймеру и полноту самого измерения.
+
+Файла наблюдений в архиве нет — только лог. Проверю по нему, как на деле работает закрытие по таймеру.
+
+0.9.10 работает: медиана задержки ровно 2 секунды. Считаю отдельно основную сессию — она важнее для Terra.
+
+Ошибка в разборе полей — пересчитываю.
+
+Разобрался. Служба здорова, обе новые задачи работают, но в самом измерении я нашёл ошибку — оно занижает.
+
+## Состояние службы за двое суток
+
+| | |
+|---|---|
+| Период | 02.09 09:30 — 04.09 08:36 UTC, 51 бумага |
+| Перезапусков процесса | **0** |
+| Ошибок | **1** за всё время (`timed out during opening handshake`, 03.09 05:14) |
+| Свечей завершено | 48 106 |
+
+**0.9.10 работает ровно как задумано.** Задержка от конца отрезка до записи свечи:
+
+| | |
+|---|---|
+| медиана | **2,0 с** — это в точности настроенная `CANDLE_CLOSE_GRACE_SECONDS` |
+| 90-й процентиль | 2,0 с |
+| 99-й процентиль | 13 с |
+| в пределах 3,5 с (задержка + опрос) | **98,6 %** |
+
+То есть свечи больше не ждут следующей сделки. Со стороны источника отставание теперь около двух секунд — против 42 секунд, которые Terra мерила у себя.
+
+## Дефект: ночью служба переподключается каждую минуту
+
+873 предупреждения `feed appears silent, forcing reconnect` — и все они укладываются в 00:00–07:59 UTC, то есть 20:00–04:00 по Нью-Йорку. Это ночь между сессиями: торгов нет, данных нет, сторожевой таймер считает поток мёртвым и рвёт связь. Ровно 54–55 раз в час, вторые сутки подряд, обе ночи одинаково. Днём — ни одного.
+
+Это лишняя нагрузка на EODHD и риск, что там начнут ограничивать. Сторожевой таймер не знает про часы работы рынка. На измерение это не влияет — ночь и так вне окна.
+
+## Измерение: числа есть, но они занижены
+
+За полные сутки 03.09, 51 бумага:
+
+| Окно | Минут без свечи, на бумагу | «Прошли бы все условия» |
+|---|---|---|
+| Основная сессия (09:30–16:00 ET) | **13,7 %** | 7,9 % — около 1 510 записей за день |
+| Расширенная (04:00–20:00 ET) | **45,0 %** | 9,2 % — около 4 505 записей за день |
+
+Первый столбец сходится с отчётом по Terra: там на долю источника приходилось около 9,4 % при девяти ликвидных бумагах, здесь 13,7 % при пятидесяти одной, среди которых есть заметно менее ликвидные. Порядок тот же.
+
+**А вот второй столбец я посчитал неправильно.** Правило цепочки требует, чтобы предыдущий отрезок дал свечу. При настоящем заполнении синтетическая свеча сама продвигала бы цепочку, и серия пустых минут заполнялась бы целиком. Но измерение ничего не пишет, поэтому цепочка не движется, и **засчитывается только первая пустая минута каждой серии** — вторая и дальше помечаются `chain_broken`.
+
+Видно прямо по соотношению: в основной сессии 7,9 из 13,7 — значит средняя дыра около 1,7 минуты, дыры короткие. В расширенной 9,2 из 45,0 — средняя дыра около пяти минут, и там занижение почти пятикратное.
+
+Настоящая величина заполнения — это первый столбец, а не второй: **около 13,7 % в основной сессии и около 45 % в расширенной**.
+
+Это моя ошибка в реализации, а не свойство данных.
+
+## Что предлагаю
+
+**Исправить измерение.** Правило цепочки должно вестись в задаче измерения, а не спрашиваться у движка: задача помнит, какой отрезок по каждой бумаге «покрыт» — настоящей свечой или тем, что было бы заполнено, — и продвигает эту отметку сама. Движок остаётся механизмом и отвечает только на «есть ли свеча за отрезок» и «какая последняя цена», как и записано в проекте: движок — механизм, процесс — политика. Тогда столбец «прошли бы» станет настоящим ответом, и станет видно распределение по бумагам, которого в логе нет.
+
+Заодно два вывода, которые уже можно сделать:
+
+- **45 % в расширенной сессии — это много.** Почти удвоение числа строк. При `MAX_CANDLES_STORED = 100` глубина хранения для тихой бумаги сожмётся примерно вдвое. Если заполнять, то `regular` выглядит гораздо разумнее `extended`.
+- **13,7 % в основной сессии** — величина, ради которой стоит разговаривать. Но напомню: три исправления на стороне Terra (привязка к границе минуты, сроки, досчёт промежуточных свечей) закрывают её собственные 18,8 % плюс отставание в 42 секунды, и они первые в очереди.
+
+Файл наблюдений `/data/empty_interval_audit.jsonl` в архив не попал — в нём разбивка по бумагам, которой в логе нет. Если пришлёшь, посчитаю распределение по ликвидности, не дожидаясь исправления.
+
+Чинить измерение?
+
+---
+
+👤 **USER:**
+> да чиним
+
+Исправляю: правило цепочки уходит из движка в задачу. Движок остаётся механизмом.
+
+Теперь задача ведёт цепочку сама:
+
+Теперь тесты — старые под прежний метод нужно переписать:
+
+Ожидаемо — все под старый метод. Переписываю тесты движка:
+
+Теперь тесты задачи — и главный из них про непрерывную серию пустых минут:
+
+Два теста я построил неверно. Один — на смещении вызовов, второй проверял недостижимое состояние. Разбираюсь и переписываю.
+
+Проверяю, что главный тест действительно ловит прежнюю ошибку — верну цепочку в движок:
+
+Тест ловит ровно ту ошибку. 443 проходят. Сквозная проверка на живом движке — серия молчаливых отрезков подряд:
+
+Пять отрезков подряд — все заполнились бы. До исправления засчитался бы только первый. В базе по-прежнему одна настоящая свеча.
+
+Обновляю документ:
+
+Готово, зафиксировано под меткой **0.9.12**.
+
+## Что было не так
+
+Правило цепочки спрашивалось у движка, а движок продвигает её только когда свеча действительно записана. Измерение сознательно ничего не пишет — поэтому каждый отрезок после первого в серии молчания возвращал `chain_broken`. Настоящее заполнение записало бы свечу за первый отрезок, цепочка пошла бы дальше, и серия заполнилась бы целиком.
+
+## Как исправлено
+
+Цепочку теперь ведёт сама задача измерения: она помнит по каждой бумаге последний «покрытый» отрезок и продвигает эту отметку и для настоящих свечей, и для тех отрезков, которые сочла пригодными — ровно как поступило бы заполнение.
+
+`audit_empty_interval` в движке заменён на `inspect_interval`. Он сообщает только то, что движок знает — состояние отрезка и последнюю торговую цену — и никакой политики не содержит. Это то самое разделение, которое записано в ARCHITECTURE: движок — механизм, процесс — политика. Цепочка в движке жить и не может: чтобы смоделировать заполнение, она обязана продвигаться через отрезки, которых никто не записывал.
+
+## Проверено
+
+**443 теста.** Ключевой — `test_a_run_of_empty_intervals_is_counted_in_full`: вернул прежнее поведение, он упал; вернул исправление, прошёл.
+
+**Сквозной опыт на живом движке** — одна сделка, дальше тишина:
+
+```
+08:50:50  would_fill=True  chain=True  price=150.0
+08:50:55  would_fill=True  chain=True  price=150.0
+08:51:00  would_fill=True  chain=True  price=150.0
+08:51:05  would_fill=True  chain=True  price=150.0
+08:51:10  would_fill=True  chain=True  price=150.0
+```
+
+Пять подряд вместо одного. В базе — по-прежнему одна настоящая свеча.
+
+Заодно нашёл: `subscription_changed` на практике почти недостижим, потому что отписка сама рвёт цепочку раньше. Проверка осталась как страховка, поле пишется всегда, в тесте это оговорено.
+
+## Что это значит для цифр из лога
+
+Записи, снятые на 0.9.11, — нижняя граница, а не итог. Действовать надо по первому столбцу той таблицы:
+
+| Окно | Минут без свечи на бумагу |
+|---|---|
+| Основная сессия | **13,7 %** |
+| Расширенная | **45,0 %** |
+
+Поля в файле наблюдений изменились (`engine_reason` → `reason`, добавлен `chain_intact`, причины стали подробнее), старые файлы не переносятся — для нового прогона нужен чистый файл.
+
+## Дальше
+
+1. Обновить рабочую установку до 0.9.12, удалить `/data/empty_interval_audit.jsonl` и начать прогон заново. Тогда «прошли бы» станет настоящим ответом, и появится разбивка по бумагам, которой в логе нет.
+2. Отдельно остаётся дефект из лога: **873 ложных переподключения за две ночи** — сторожевой таймер тишины срабатывает вне торговых часов. К измерению отношения не имеет, но нагружает EODHD впустую. Готов заняться, когда скажешь.
+
+Три метки не отправлены, ветка `fix/ws-status-and-versioning` не влита.
+
+---
+
+👤 **USER:**
+> Вот это надо починить - 873 ложных переподключения за две ночи
+
+Сначала разберусь, как устроен сторожевой таймер.
+
+Механизм смягчения в коде есть, но ночью он не срабатывает. Смотрю, что происходит на самом деле.
+
+Вижу цикл: подключение → тишина 60 с → разрыв → пауза 5 с → снова. Проверю ключевое — приходит ли ночью хоть один тик.
+
+Свечей ночью нет, а сообщение — из ветки «после предыдущей активности». Значит что-то считается тиком. Смотрю обработку сообщений.
+
+Диагноз точный. Подтверждено данными:
+
+- **874 подключения за двое суток**, из них 873 — ночные переподключения по тишине.
+- Ночью **ни одной** строки «Started tracking» — значит до движка тики не доходят.
+- **Смягчение сторожевого таймера не сработало ни разу**: ноль строк «silent connection #».
+
+## Что происходит
+
+Механизм смягчения в коде есть ([websocket_manager.py:436-441](src/websocket_manager.py#L436-L441)) — он удваивает ожидание, пока поток приходит пустым. Но он мёртв, потому что применяется только к ветке «на подключении не пришло **вообще ничего**».
+
+А ночью кое-что приходит. EODHD при подписке отдаёт последнюю сделку прошедшей сессии. Менеджер увеличивает `_tick_count` ([websocket_manager.py:261](src/websocket_manager.py#L261)), ставит `received_tick_on_connection = True` и переходит на жёсткие 60 секунд. Движок эту сделку отбрасывает как устаревшую — её время на часы в прошлом, `TICK_MAX_AGE_SECONDS = 180`, — поэтому свечи не появляется и «Started tracking» в журнале нет.
+
+Итог: одно сообщение-снимок обманывает сторожевой таймер, и всю ночь идёт цикл «подписка → 60 с тишины → разрыв → пауза 5 с».
+
+## Что предлагаю
+
+**Признаком живого потока считать свежий тик, а не любое сообщение.** Менеджер получает тот же `tick_max_age_seconds`, по которому судит движок, и отмечает подключение живым только когда время сделки близко к настоящему. Снимок прошлой сессии перестаёт переводить таймер в жёсткий режим.
+
+Тогда ночью сработает уже существующая ветка смягчения: ожидание 300 с, потом 600, потом упирается в `WS_MAX_SILENT_TIMEOUT` = 900 с. За восьмичасовую ночь — около **30 переподключений вместо 440**, в четырнадцать раз меньше. Днём ничего не меняется: первый же настоящий тик сбрасывает счётчик, и таймер снова жёсткий, 60 секунд, как и нужно для быстрого обнаружения мёртвого потока.
+
+Правка точечная: один счётчик свежих тиков в менеджере и один параметр в его конструкторе.
+
+Что рассмотрел и отверг:
+
+- **Научить менеджер часам работы рынка** — служба сознательно не знает про рынок, окно сессии живёт в рабочем процессе, а не в клиенте потока. Тащить календарь сюда — сломать разделение.
+- **Просто поднять `WS_DATA_TIMEOUT`** — это настройка, а не исправление: днём мы теряем быстрое обнаружение смерти потока, а ночью всё равно переподключаемся зря.
+- **Считать тихим любое подключение с малым числом тиков** — порог придётся угадывать, и на неликвидной бумаге он сработает ложно.
+
+Делаю так?
+
+---
+
+👤 **USER:**
+> делай
+
+Теперь передать настройку из рабочего процесса:
+
+Теперь тесты на само поведение:
+
+Проверяю, что тесты ловят прежнее поведение:
+
+452 теста, дефект ловится. Считаю, что изменится за ночь:
+
+Расчёт «было» даёт 437 против наблюдавшихся ~440 — модель сходится. Версия и документация:
+
+Готово, **0.9.13**.
+
+## Причина
+
+EODHD при подписке отдаёт последнюю сделку прошедшей сессии. Менеджер считал её активностью, ставил `received_tick_on_connection = True`, сторожевой таймер оставался в жёстком режиме 60 секунд — и смягчение, написанное ровно для этого случая, **не включилось ни разу за двое суток**. Саму сделку движок потом отбрасывал как устаревшую, поэтому свечи не появлялось и в журнале не было ни намёка на причину.
+
+Данные с рабочей установки: 874 подключения, из них 873 — ночные, цикл 66 секунд, 437 за ночь. Ноль строк «silent connection», ноль «Started tracking» между 00:00 и 08:00 UTC.
+
+## Исправление
+
+Признаком живого потока теперь считается только сделка, время которой близко к настоящему — по тому же `TICK_MAX_AGE_SECONDS`, по которому движок отбрасывает устаревшие тики. Менеджер и движок начали одинаково понимать, что такое «текущий тик».
+
+Ночью включается уже существующее смягчение: 300 с → 600 с → потолок `WS_MAX_SILENT_TIMEOUT`. Это **33 переподключения за ночь вместо 437**.
+
+Днём ничего не меняется: первый настоящий тик сбрасывает счётчик, таймер снова жёсткий, реально умерший поток по-прежнему обнаруживается за 60 секунд. Устаревшие тики как передавались движку, так и передаются — решение отбрасывать их остаётся только у него, менеджер судит лишь о живости потока.
+
+## Проверка
+
+**452 теста**, девять новых. Вернул прежнее поведение — два теста упали, вернул исправление — прошли.
+
+Отдельно смоделировал старую логику той же арифметикой: она даёт **437** переподключений за ночь против **440** наблюдавшихся в журнале. Совпадение подтверждает, что объяснение верное, а не правдоподобное.
+
+Добавил `fresh_tick_count` в `/status` рядом с `tick_count` — большой разрыв между ними и означает, что поток в основном повторяет старые сделки.
+
+## Состояние ветки
+
+```
+ef9a680  (0.9.13)  fix(websocket): stop the silent-feed watchdog firing all night
+fcfb65c  (0.9.12)  fix(audit): count whole runs of silence, not one interval per run
+0a7447b  (0.9.11)  feat(candles): measure which empty intervals could be filled, writing none
+45044b8  (0.9.10)  feat(candles): complete candles when their interval ends, not on the next tick
+22d77e0  (0.9.9)   fix(storage): write websocket status row on SQLite, add versioning mechanism
+564b0dc            test: repair suite drift and make worker tests deterministic
+```
+
+Шесть записей на `fix/ws-status-and-versioning`, пять меток. Не отправлено, не влито.
+
+При обновлении установки до 0.9.13 стоит заодно удалить `/data/empty_interval_audit.jsonl` и начать измерение заново — в 0.9.12 изменились и поля, и способ счёта, а прежние числа были нижней границей.
+
+---
+
+👤 **USER:**
+> Забыл тебе показать empty_interval_audit.jsonl. Он в папке tmp/
+
+87 620 записей, поле `engine_reason` — снято на 0.9.11, то есть с недоучётом. Но в файле есть всё, чтобы пересчитать по исправленной логике задним числом. Сначала общая раскладка.
+
+Вот оно: **78 079 `chain_broken` против 8 691 `would_fill`** — недоучёт примерно девятикратный. Пересчитываю по исправленной логике.
+
+Теперь есть настоящий ответ. Досчитаю распределение и влияние на хранение.
+
+Полная картина есть. Соберу данные и оформлю страницей — это тот самый результат, ради которого строилось измерение.
+
+---
+
+👤 **USER:**
+> Approach this as the design lead at a small studio known for their versatility, giving every client a visual identity pitched at the treatment the task actually calls for. Make deliberate choices about palette, typography, and layout that are specific to this subject, and avoid templated designs.
+
+## Read the request first
+
+Calibrate treatment, not whether to design. A doc deserves the same craft as a landing page - what changes is the treatment that craft is delivered in. Format is not part of this read: author HTML, and publish Markdown only when a loaded skill explicitly instructs it - a Markdown publish keeps its filename as its title and takes almost none of the craft below, and is never a way to save time.
+
+Many requests call for a more utilitarian treatment: a plan, a memo, a demo. Make it polished: include real typographic hierarchy, considered spacing, and a proper palette, but avoid over-designing. Most pages do not need a flashy, gigantic hero. Keep flourishes tasteful and limited.
+
+Some requests call for an editorial treatment: a landing page, a game, an app or tool they'll keep or share.
+
+When unsure: a well-composed page is never the wrong answer; an over-designed visual identity sometimes is.
+
+Fundamentals below apply to everything. The editorial process after that runs only when the read above says so.
+
+## Fundamentals for every artifact
+
+**Honor what's already there** Look for an existing design system first - CLAUDE.md, a tokens or theme file, existing component styles. When one exists, apply it; everything below fills gaps and never overrides. Precedence is always: the user's own words, then the project's existing system, then your choices.
+
+**Ground it in the subject.** If the subject isn't already clear, pin it: one concrete subject, its audience, and the page's single job. The subject's own world - its materials, instruments, vernacular - is where distinctive choices come from. Whatever the treatment, carry at least one detail only this subject would have - its real units and scales, its document conventions, its terms of art - as content, not ornament; it costs a plain page nothing. Build with real content throughout, never lorem.
+
+**Pair typefaces** Typography carries the page even when the page isn't about typography. Google Fonts is the one font host the Artifact CSP admits - link it directly (`<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=...&display=swap">`); a face from anywhere else must be inlined as a @font-face data URI or it falls back silently. Either way, declare a real fallback stack. Keep running text near 65 characters wide; set a type scale and stay on it; give headings `text-wrap: balance`, body text room to breathe, and uppercase labels a touch of letter-spacing.
+
+**Load libraries, don't paste them.** When the page genuinely needs a library - React, a charting or highlighting package - load its UMD build from cdnjs (only the script - a library's stylesheet still has to be inlined) with one pinned `<script src="https://cdnjs.cloudflare.com/ajax/libs/...">` placed before the inline script that uses its global, instead of inlining the library's source or hand-writing a stand-in; the Artifact tool's description lists the few other script hosts the CSP admits. The page's own CSS and JS, its images and its data ship with the page. Most pages need no library at all - reach for one only when it carries real weight.
+
+**Choose neutrals, don't default to them.** A pure mid-grey reads as unconsidered; a grey with a slight hue bias toward the page's accent reads as chosen. Pure white and near-black are fine grounds when they suit the subject - the point is that the neutral was picked, not inherited.
+
+**Design both themes.** The page renders in the viewer's theme, and the viewer has three states, not two: an explicit choice stamps `data-theme="dark"` / `data-theme="light"` on the root element, and the default "system" setting stamps *nothing* - most viewers see the un-stamped document, where only `prefers-color-scheme` separates light from dark. Structure the CSS token-level for all three: the bare `:root` block defines the complete light palette (for a deliberately dark-first design, swap light and dark consistently through this whole pattern); `@media (prefers-color-scheme: dark)` redefines only the tokens, guarded as `:root:not([data-theme="light"])` so an explicit light choice beats a dark OS; `:root[data-theme="dark"]` redefines them again so the toggle also wins in the other direction. Style components through the tokens, never directly inside a media or `[data-theme]` block - a color whose only definition sits behind `[data-theme]` never applies in the un-stamped state, and the page renders one theme's text on the other theme's ground. Two more rules keep each theme resolving as a set: the artifact composites over a ground the viewer paints in *its* theme, so `body` must set an explicit `background` from a token - a transparent body silently borrows the host's ground; and every element that sets a color takes it from the same token set as the surface behind it, never a literal that only works in one theme. Declare every token in the bare `:root` block before any media or `[data-theme]` block redefines it - a color that exists only inside one of those blocks is the classic unreadable-artifact bug. Give the second theme the same care as the first - don't naively invert; keep contrast legible and the accent working on both grounds. A design that deliberately commits to one visual world (a neon arcade screen, a letterpress invitation) may stay single-theme - then skip the media query and stamps entirely but still paint the background and every color explicitly, so the page holds on either host ground; make it a choice, not an omission.
+
+**Let layout do the spacing.** Lay out sibling groups with flex or grid and `gap`, not per-element margins that silently collapse or double. Wide content - tables, code, diagrams - gets `overflow-x: auto` on its own container so the page body never scrolls sideways. Reach for `font-variant-numeric: tabular-nums` wherever digits line up in columns.
+
+**Compose repeated things as one object.** Cards in a row, label/value pairs down a list, badges on siblings: same edges, baselines and inner padding from one to the next, and a recurring element sits in the same place on each. Let content set a container's height and pick a column count the items fill, so nothing stretches over dead space or sits alone in a row. Text that can outgrow its track wraps or scrolls in its own container; clipped text is a bug.
+
+**Not everything is a card.** Border, fill, radius and shadow each say "separate object" - spend them by role, lifting the one thing that needs it, instead of one radius and one shadow stamped on every block, which flattens the hierarchy. Lead with big-number tiles only when those figures are the point of the page.
+
+**Draw charts to the scale.** One scale places marks, ticks and labels, and every label names a value the chart reaches; chart text takes its color from the theme tokens so it reads in both themes; marks, labels and edges stay clear of one another and inside the drawing's bounds - in SVG, leave room in the viewBox for the outermost labels and give every drawn shape an explicit fill.
+
+**Show the page at rest.** Everything meant to be read is visible once the page has loaded, without scrolling to trigger it - that first still frame is what a thumbnail, a shared link, and a skimming reader all get. A section may animate in, but from a visible resting state, never parked at `opacity: 0` waiting on an observer. Size a hero to what it holds, not to the viewport; a `100vh` opener pushes the page itself out of that first frame. A tool or app opens in a realistic working state - the user's real data where it exists, otherwise example rows, a loaded sample, a form someone plausibly filled, plainly marked as examples and never passed off as the user's own figures - so the first look shows what it does; an empty shell waiting for input shows nothing.
+
+**Avoid AI-generated design** AI-generated design currently clusters around a few looks: warm cream (#F4F1EA) with a serif display and terracotta accent; near-black with a lone acid-green or vermilion pop; broadsheet hairline rules with dense columns; a purple-to-blue gradient hero on white; Inter or Space Grotesk as the "safe" face; emoji as section markers; everything centered; `rounded-lg` everywhere; accent bar/rail on rounded cards. Where the user pins down a visual direction, follow it exactly - their words always win, including when they ask for one of these looks. Where nothing is specified, don't spend that freedom on one of these defaults.
+
+**Build cleanly** Be cognizant of overlapping elements, cascade collisions, silent font fallbacks. Close every non-void element, double-quote attributes, give keyboard focus a visible state, respect `prefers-reduced-motion`. For generative or decorative graphics, reach for Canvas or WebGL rather than hand-authoring long SVG path data.
+
+**CSS rules** When writing the CSS, watch your selector specificities. It is easy to generate classes that cancel each other out - a type-based selector like `.section` fighting an element-based one like `.cta` over padding and margins between sections. Structure the cascade so it doesn't silently undo your spacing.
+
+**Writing the copy** Words are design material, not decoration. Write from the user's side of the screen - name things by what people recognize, not how the system is built (a person manages *notifications*, not *webhook config*). Active voice; a control says exactly what happens ("Publish", then a toast that says "Published"). Errors explain what went wrong and how to fix it - no apologies, no vagueness. Specific beats clever.
+
+**Name the page like a product, not a caption.** The `<title>` is the artifact's name in the gallery and the browser tab, and it sets the reader's first impression of care. Give the page a real name: a short noun phrase, typically two to four words, specific to the subject - or, for a page that exists to answer one question, that question itself, which is then the page's name. Stop at the name - a title that carries its own explainer after a dash or colon reads as generated filler. The name must also identify the page among many: in the gallery it sits beside dozens of other artifacts, and a generic category label that could sit on any of them fails as a name just as surely as an appended explainer. When a candidate title pairs the name with a generic word - a greeting, a category, a page-type label - the name is the half to keep; a trim that drops the identity and keeps the generic word produces exactly the title that could sit on any page. And the rule removes explainers, it does not impose brevity: a multi-word title that already reads as one specific name is finished, and shortening it further only makes it generic. The one-sentence publish `description` is where the explanation belongs; the gallery shows it right under the title.
+
+**Structure is information** Structural devices, numbering, eyebrows, dividers, labels, should encode something true about the content, not decorate it. Many generic designs use numbered markers (01 / 02 / 03), but that's only appropriate if the content actually is a sequence - like a real process or a typed timeline where order carries information the reader needs. Question if choices like numbered markers actually make sense before incorporating them.
+
+**When it's a UI, not a document** A dashboard or tool is scanned and operated, not read top-to-bottom, so the craft shifts from typography to information design. Surface the summary before the detail; encode state in form as well as number - a pill, a chip, a severity stripe - so what needs attention reads at a glance. Semantic color (good / warning / critical) is separate from the accent hue and doesn't count as your accent. Give sparklines and charts the same care as type: an area fill, a faint grid, an emphasized endpoint. What's interactive should look interactive.
+
+## Process
+
+Before writing code, sketch a short design plan - a compact token system with color, type, and layout:
+- **Color**: describe the palette as 4-6 named hex values.
+- **Type**: typefaces for 2+ roles - a characterful display face used with restraint, a complementary body face, and a utility face for captions or data if needed.
+- **Layout**: a layout concept in one or two sentences.
+
+Then build, following the plan and deriving every color and type decision from it.
+
+**Write, look once, publish.** Before publishing you may look at the rendered page once - one screenshot of the local file, or the Artifact tool's preview where it offers one - then one pass of edits for what it shows, without a second look. For a page that charts real numbers, take that look rather than skip it, and spend it on the chart. Don't build a test loop around your own file: no repeated screenshots, no pulling the script out to run it through node, no scripts that probe the DOM. That loop spends the session re-checking what a careful write already settled, while the user waits for a link. Then publish, check once any `window.claude` call the preview couldn't run, and stop: the live page is the review surface, and further polish is the user's to ask for. If the user reports something visibly broken - a clipped column, unreadable text, a control that does nothing - fix that and republish once.
+
+## When the request is editorial
+
+The stance shifts: the client has already rejected proposals that felt templated, and is paying for a distinctive point of view. Make opinionated calls, and take one real aesthetic risk where it serves the work.
+
+Review the design plan against the subject before building: if any part of it reads like the generic default you would produce for any similar page, revise that part, and note what you changed and why. Only after you've confirmed the plan's uniqueness do you write the code, following the revised plan exactly.
+
+**Principles** 
+
+- The hero is a thesis: open with the most characteristic thing in the subject's world - headline, image, live demo, interactive moment. 
+- Typography carries the personality of the page. Pair the display and body faces deliberately, not the same families you would reach for on any other project, and set a clear type scale with intentional weights, widths, and spacing. Make the type treatment itself a memorable part of the design, not a neutral delivery vehicle for the content. 
+- Leverage motion deliberately. Think about where and if animation can serve the subject: a page-load sequence, hover micro-interactions, ambient atmosphere. An orchestrated moment usually lands harder than scattered effects; choose what the direction calls for. However, sometimes less is more, and extra animation contributes to the feeling that the design is AI-generated. 
+- Match complexity to the vision. Maximalist directions need elaborate execution; minimal directions need precision in spacing, type, and detail. Elegance is executing the chosen vision well.
+- Spend your boldness in one place; keep everything around it quiet. If the accent fights the ground, shift it toward analogous or drop saturation rather than replacing it.
+
+Пишу страницу.
+
+**Палитра** — холодный серо-зелёный ground `#F1F4F2`, чернила `#16201C`, акцент приглушённый бирюзовый `#2F6B65` (данные есть), янтарь `#A9701F` (минуты без сделок), тревожный `#A33B2E`. **Шрифты** — Newsreader для заголовков, Source Sans 3 для текста, JetBrains Mono для чисел. **Раскладка** — одна колонка, главный элемент — таблица 51 бумаги с единой шкалой доли пустых минут.
+
+Файл дал то, чего в журнале не было — разбивку по бумагам. И подтвердил недоучёт.
+
+**https://claude.ai/code/artifact/d12c50f8-3107-4246-b497-659488879790**
+
+## Главное
+
+Файл снят на 0.9.11, до исправления. В нём это видно прямо: **78 079 записей «цепочка разорвана» против 8 691 «заполнили бы»** — недоучёт примерно девятикратный, ровно как я и предполагал.
+
+Но пересчитать можно задним числом: все поля, кроме цепочки, в файле есть, а цепочку я восстановил по правилу 0.9.12. Сетку минут взял из полного диапазона отрезков — отсутствие записи по бумаге означает, что свеча была.
+
+| | было в файле | после пересчёта |
+|---|---|---|
+| Основная сессия | 7,9 % | **13,5 %** |
+| Расширенная | 9,2 % | **41,5 %** |
+
+Совпадает с оценкой, которую я делал по журналу (13,7 % и 45,0 %) — два независимых пути дали одно.
+
+## Что оказалось важнее самих долей
+
+**99,5 % пустых минут основной сессии проходят все пять условий.** Отсеивается практически ничего. Значит вопрос не в том, сработает ли правило, а в том, нужны ли эти строки потребителю.
+
+**Средняя доля не описывает ничего.** Разброс от 0,5 % до 75 %:
+
+- **17 бумаг из 51** — меньше 1 % (NVDA, AMD, META, AVGO…). Для них заполнение бессмысленно.
+- **5 бумаг** — больше 40 %. У **VPG три четверти основной сессии** сейчас просто не существует как свечи; в расширенной — 84,5 %.
+- Медиана — 7,4 %.
+
+**VPG — та самая бумага**, про которую спрашивали в разборе Terra и которой не было в их журнале наблюдений (`_OBSERVED_SYMBOLS` жёстко задаёт девять). Именно у неё дыра максимальная.
+
+**Цена вопроса — глубина хранения.** `MAX_CANDLES_STORED` считает строки, а не минуты. Для NVDA ничего не меняется, для VPG история сжимается с 413 минут до 100 в основной сессии и с 935 до 100 в расширенной.
+
+## Рекомендация
+
+Порядок прежний: **сначала три исправления на стороне Terra** — они снимают её собственные 18,8 %, отставание в 42 секунды и зависания на 16–20 минут, то есть больше, чем даёт заполнение.
+
+Если потом заполнять — то `regular`, не `extended` (13,5 % против 41,5 %, и хранение переживает первое, но не второе), и `MAX_CANDLES_STORED` поднять **до** включения, а не после. И отдельно решить, что делать с `has_gaps`: он считает строки, поэтому пятнадцатиминутный отрезок из четырнадцати пустых свечей и одной настоящей станет неотличим от полного.
+
+Скрипт пересчёта лежит в рабочем каталоге — могу положить его в `analysis/` в репозитории, чтобы следующий прогон считался тем же способом.
+
+---
+
+👤 **USER:**
+> Давай проверим данный по VPG по альтернативным источникам
+Например в папку tmp/  я полажил скрин из другого источника
+
+Три скриншота. Смотрю.
+
+Это независимый источник по VPG за 3 сентября — тот же день. Уже видно пропуски минут (09:48, 09:49, 09:54) и всего четыре свечи за весь премаркет. Смотрю остальные.
+
+Три окна дают непрерывную картину VPG за 3 сентября: 09:31–09:56, 09:58–10:44, 10:45–11:35. Сверю поминутно с нашим файлом наблюдений.
+
+Это важно. 45 из 46 дыр источника совпадают с нашими — значит дыры реальны. Но **у нас лишних 20 минут**, которых у источника свечи есть. Проверю по журналу.
+
+Расхождение: журнал показывает свечу за 13:33, а измерение записало эту минуту как пустую. Проверяю время.
+
+Вот объяснение: свеча за 13:33 записана в **13:34:42** — через 102 секунды после конца отрезка, а измерение опросило в 13:34:03. Тик пришёл с опозданием. Проверю системно, насколько это искажает счёт.
+
+Перечёт мал — 2,8%. Значит расхождение с внешним источником настоящее. Сравню объёмы там, где свечи есть у обоих.
+
+Мы систематически недополучаем — около половины объёма. Проверю, не смещение ли это меток минут.
+
+Смещения нет — метки согласованы. Картина сложилась, и она меняет вывод. Проверю природу ленты EODHD.
+
+---
+
+👤 **USER:**
+> Base directory for this skill: /Users/eobomik/.claude/skills/firecrawl-search
+
+# firecrawl search
+
+Web search with optional content scraping. Returns search results as JSON, optionally with full page content.
+
+## When to use
+
+- You don't have a specific URL yet
+- You need to find pages, answer questions, or discover sources
+- First step in the [workflow escalation pattern](firecrawl-cli): search → scrape → map → crawl → interact
+
+## Quick start
+
+```bash
+# Basic search
+firecrawl search "your query" -o .firecrawl/result.json --json
+
+# Search and scrape full page content from results
+firecrawl search "your query" --scrape -o .firecrawl/scraped.json --json
+
+# News from the past day
+firecrawl search "your query" --sources news --tbs qdr:d -o .firecrawl/news.json --json
+```
+
+## Options
+
+| Option                               | Description                                   |
+| ------------------------------------ | --------------------------------------------- |
+| `--limit <n>`                        | Max number of results                         |
+| `--sources <web,images,news>`        | Source types to search                        |
+| `--categories <github,research,pdf>` | Filter by category                            |
+| `--tbs <qdr:h\|d\|w\|m\|y>`          | Time-based search filter                      |
+| `--location`                         | Location for search results                   |
+| `--country <code>`                   | Country code for search                       |
+| `--scrape`                           | Also scrape full page content for each result |
+| `--scrape-formats`                   | Formats when scraping (default: markdown)     |
+| `-o, --output <path>`                | Output file path                              |
+| `--json`                             | Output as JSON                                |
+
+## Tips
+
+- **`--scrape` fetches full content** — don't re-scrape URLs from search results. This saves credits and avoids redundant fetches.
+- Always write results to `.firecrawl/` with `-o` to avoid context window bloat.
+- Use `jq` to extract URLs or titles: `jq -r '.data.web[].url' .firecrawl/search.json`
+- Naming convention: `.firecrawl/search-{query}.json` or `.firecrawl/search-{query}-scraped.json`
+
+## See also
+
+- [firecrawl-scrape](../firecrawl-scrape/SKILL.md) — scrape a specific URL
+- [firecrawl-map](../firecrawl-map/SKILL.md) — discover URLs within a site
+- [firecrawl-crawl](../firecrawl-crawl/SKILL.md) — bulk extract from a site
+
+ARGUMENTS: EODHD WebSocket US trades feed consolidated tape coverage which exchanges included
+
+Поставщик подтверждает это прямым текстом в своей документации:
+
+> **US trades and quotes come from Cboe EDGX**, one of Cboe's four US equity exchanges. Trades are executions that occurred on EDGX — this is **not** a consolidated (SIP) tape, so it does not include executions from other exchanges, or off-exchange and FINRA TRF prints. […] if you are comparing our prints against a consolidated tape, this is the reason the two will not match tick for tick.
+
+Это меняет вывод. Обновляю страницу.
+
+Подзаголовок вышел с двумя тире подряд — правлю и публикую.
+
+Сверка переворачивает вывод. Страница обновлена по той же ссылке:
+
+**https://claude.ai/code/artifact/d12c50f8-3107-4246-b497-659488879790**
+
+## Что показала сверка
+
+VPG, 3 сентября, 09:31–11:35 ET — 125 минут. Метки согласованы: проверка сдвига на ±2 минуты даёт максимум совпадений ровно на нуле.
+
+| | |
+|---|---|
+| Дыр внешнего источника совпало с нашими | **45 из 46** |
+| Наших пустых минут, где у источника **были сделки** | **20 из 65** |
+| Объёма источника доходит до нас | **57,8 %** (6 527 против 11 299 акций) |
+| Точное совпадение объёма | 21 минута из 79 |
+
+Первая строка подтверждает: тишина реальна, наша служба её не выдумывает. Вторая — ломает всю затею.
+
+## Почему так
+
+Проверил у поставщика. EODHD пишет это прямым текстом:
+
+> US trades and quotes come from **Cboe EDGX**, one of Cboe's four US equity exchanges. […] this is **not** a consolidated (SIP) tape, so it does not include executions from other exchanges, or off-exchange and FINRA TRF prints. […] if you are comparing our prints against a consolidated tape, this is the reason the two will not match tick for tick.
+
+Значит «пустая минута» в наших данных означает **«на EDGX сделок не было»**, а не «на рынке сделок не было».
+
+## Почему это закрывает вопрос о заполнении
+
+Заполнить такую минуту — записать плоскую свечу по прошлой цене за минуту, в которую торговали. Это неправда, и **пять условий §4.2 её не ловят и не могут поймать**: связь держалась, бумага подписана, сессия шла, цепочка цела. Все пять проверяют нашу сторону, а не полноту ленты.
+
+Довод против задачи 2 получен из данных, а не из рассуждений, и он сильнее всех прежних. Правило «никогда не выдумывать значения свечей» стоит оставить безусловным.
+
+## Попутно проверил себя
+
+Заподозрил, что измерение опрашивает отрезок слишком рано (через 3 секунды) и считает пустым тот, чья свеча появится позже — у VPG нашёлся такой случай: свеча за 13:33 записана в 13:34:42, через 102 секунды. Проверил по всему журналу: таких **2,8 % от всех `would_fill`**. Перечёт есть, но он мал и вывода не меняет.
+
+## Что делать дальше
+
+1. **Проверить долю ленты на нескольких бумагах.** 57,8 % получены на одной малоликвидной бумаге в одном окне — а обычная доля EDGX на рынке заметно ниже, так что число нетипично и его стоит перепроверить. Если у ликвидных имён доля близка к полной, разговор касается только тихих бумаг; если нет — это разговор о самом поставщике.
+2. **Сторона Terra** — три исправления, они ни от чего из этого не зависят.
+3. **Сказать потребителю правду о данных.** Сейчас нигде не написано, что объём — это объём одной биржи. Для относительного объёма, на который в разборе Terra опирается единственный признак с приростом выше единицы (1,10), это существенно.
+
+Первое я могу сделать сразу — у меня есть и файл наблюдений, и журнал со всеми объёмами. Нужны только внешние данные ещё по двум-трём бумагам, лучше с разной ликвидностью.
+
+---
+
+👤 **USER:**
+> У EODHD есть еще один интерфейс https://eodhd.com/financial-apis/intraday-historical-data-api который дает данные начиная с предыдущего дня 
+Там тоже только одна биржа?
+
+Хороший вопрос — и проверяемый. Сначала документация.
+
+Документация говорит «US Stocks (NYSE and NASDAQ)» — формулировка уже иная, чем «Cboe EDGX» для потока. Но это надо проверить данными. Есть ли ключ?
+
+Ключ есть. Запрошу VPG за 3 сентября и сравню с обоими источниками.
+
+Неожиданно: intraday даёт объём в **десять раз больше** внешней таблицы. Проверю дневным итогом, кто прав.
+
+Дневной объём VPG — **340 258** акций. Это всё расставляет по местам. Считаю точно.
+
+Всё сошлось. Проверю ещё одно — доступны ли данные за текущий день.
+
+Подтверждено: за сегодня пусто, данные приходят со следующего дня — как вы и сказали. Обновляю страницу.
+
+**Нет, там не одна биржа.** Это полная лента — и она всё расставила по местам. Страница обновлена:
+
+**https://claude.ai/code/artifact/d12c50f8-3107-4246-b497-659488879790**
+
+## Три ленты, VPG, 3 сентября, 09:31–11:35 ET
+
+| Лента | Минут со свечой | Объём | Доля дня |
+|---|---:|---:|---:|
+| **Intraday API** | 93 | 121 528 | 35,7 % |
+| Таблица со скриншота | 79 | 11 299 | 3,3 % |
+| Наш поток | 62 | 6 527 | 1,9 % |
+
+Кто из них полон, решает независимый итог: **дневная свеча даёт 340 258 акций**. Треть дневного объёма за два часа правдоподобна только для Intraday. Ни по одной минуте объём не совпал ни у одной пары лент.
+
+**Наш поток даёт 5,4 % объёма Intraday** — ровно типичная доля Cboe EDGX на рынке США. Всё сходится с тем, что EODHD пишет про поток: одна биржа, не сводная лента.
+
+Заодно выяснилось, что скриншот (3,3 % дня) — тоже частичная лента, поэтому он не совпал ни с нами, ни с Intraday.
+
+## Что это делает с вопросом о заполнении
+
+| | |
+|---|---:|
+| Минут действительно без сделок | **25,6 %** (32 из 125) |
+| Минут без свечи у нас | 50,4 % (63 из 125) |
+| Из них сделки **были** | **58,7 %** (37 минут) |
+
+Почти шесть из десяти минут, которые заполнение закрыло бы плоской свечой по прошлой цене, на самом деле торговались. **Задача 2 отпадает**, и поправка к правилу «никогда не выдумывать значения свечей» не нужна — правило остаётся безусловным.
+
+Заменить поток на Intraday тоже нельзя: за текущий день он пуст, данные появляются со следующего. Именно ради этого разрыва служба и написана.
+
+## Что вскрылось сверх исходного вопроса
+
+**Объём в наших свечах — это объём одной биржи, около 5 % рынка.** Это важнее самого вопроса про пустые минуты. В разборе Terra относительный объём — единственный признак с приростом выше единицы (1,10), и считается он по этой доле. Величину надо либо назвать в ответах прямо, либо поправлять по полной ленте.
+
+Цены при этом в порядке — они с реальных сделок, просто с одной площадки. Страдают объём и наличие свечи, не котировка.
+
+## Могу сделать дальше
+
+**Сверку по всем 51 бумаге через Intraday API** — ключ есть, журнал есть, способ тот же, что здесь. Это покажет, одинакова ли доля у ликвидных и тихих имён, или NVDA мы видим почти целиком, а VPG на пять процентов. Займёт 51 запрос и несколько минут.
+
+Сказать — запускаю?
+
+---
+
+👤 **USER:**
+> запускай
+
+Запускаю. Сначала соберу наши свечи с объёмами из журнала, потом 51 запрос к Intraday.
+
+Фильтр захватил дату записи вместо даты свечи — исправляю.
+
+Все 51 получены. Считаю сравнение.
+
+Результат однозначный — и вскрылся ещё один действующий дефект. Проверю его.
+
+264 свечи всё же есть — значит приходят, но не 3 сентября. Уточню.
+
+SPCX и DASH перестали приходить после 2 сентября. Проверю подписку — бумаг 51, а предел EODHD 50.
+
+Ещё один действующий дефект: **SPCX и DASH перестали приходить после 2 сентября** — 0 свечей за 3 и 4 число, при том что в полной ленте у SPCX 106 млн акций за сессию. Служба этого не заметила.
+
+Перестраиваю страницу под итоговые данные.
+
+Сверка по всем 51 бумаге сделана. Результат однозначный:
+
+**https://claude.ai/code/artifact/d12c50f8-3107-4246-b497-659488879790**
+
+## Три числа
+
+| | |
+|---|---|
+| Объёма рынка доходит до службы | **2,8 %** (17,6 млн из 625,6 млн акций) |
+| Наших «пустых» минут на самом деле торговались | **88,7 %** (3 578 из 4 035) |
+| Бумаг не приходит вовсе | **2** — SPCX и DASH |
+
+## Главное открытие: доля ленты ровная, потери минут — нет
+
+Доля объёма почти одинакова у всех бумаг: **от 0,7 % до 5,6 %, медиана 2,8 %**. Это свойство ленты, а не бумаги — ровно обычная доля Cboe EDGX на рынке США. Служба получает именно то, что ей продано.
+
+А вот теряются ли из-за этого целые минуты — зависит от ликвидности:
+
+- **14 бумаг** (NVDA, AVGO, META, MU…) — все 390 минут на месте. У NVDA даже 3,6 % сделок попадают в каждую минуту.
+- **5 бумаг** (VPG, SEI, P, AXTI, EQPT) — теряется больше половины минут сессии.
+
+Цены при этом настоящие — они с реальных сделок, просто с одной площадки. Страдают **объём и наличие свечи**, не котировка.
+
+## Задача 2 закрыта
+
+Из 4 035 минут без свечи в 3 578 бумага торговалась. Заполнение писало бы плоскую свечу по прошлой цене — **неправду почти в девяти случаях из десяти**. Пять условий §4.2 этого не ловят и не могут: они проверяют нашу сторону, а не полноту ленты.
+
+Правило «никогда не выдумывать значения свечей» остаётся безусловным, поправка к `AI_WEBSOCKET_ENGINE.md` не нужна. Измерение своё дело сделало — можно выключать.
+
+## Попутно: две бумаги молчат, и служба этого не заметила
+
+2 сентября SPCX прислал 246 свечей, DASH — 18. С 3 сентября обе замолчали полностью, при том что в полной ленте у SPCX за сессию **106 млн акций**. Подписка отправляется при каждом переподключении и принимается без ошибки — документация поставщика прямо предупреждает, что неизвестный символ «принимается молча и просто никогда не стримится».
+
+Причину без доступа к живой системе не установить, но факт в том, что **у службы нет признака «подписаны, а данных нет»**, и две бумаги из 51 выпали незаметно на двое суток.
+
+## Что я бы делал дальше
+
+1. **Назвать объём тем, что он есть** — в ответах нигде не сказано, что это одна биржа и около 3 % рынка. В разборе Terra относительный объём — единственный признак с приростом выше единицы, и считается он по этой доле.
+2. **Завести признак молчащей подписки** в `/status`.
+3. **Дополнение по Intraday API** — за вчерашний день он даёт полную ленту. Ночная сверка могла бы закрывать вчерашние дыры **настоящими** свечами. Это делает то, ради чего затевалось заполнение, но честно.
+4. **Сторона Terra** — по-прежнему первая в очереди.
+
+Ветка `fix/ws-status-and-versioning` с шестью записями и пятью метками (до 0.9.13) не отправлена. Скрипты сверки лежат в рабочем каталоге — могу положить их в `analysis/`, чтобы сверку можно было повторять.
+
+---
+
+👤 **USER:**
+> 1. Да надо это где-то описать - например в README и/или ARCHITECTURE
+2. да давай сделаем
+3. Наверно это лучше пусть делает клиент/Terra. У него есть точно такой-же доступ и это будет честнее
+4. проверь, для согласования, что уже сделано в Terra in ../Terra_Runtime/docs/design
+
+Наблюдение за страницей отключилось — на работу не влияет, при необходимости включу заново.
+
+Начну с пункта 4 — он может повлиять на остальные.
+
+Три документа, один прямо про нашу тему. Смотрю структуру.
+
+У Terra уже многое сделано: привязка к минуте, ограничение цикла и статус `MISSED` — внедрено и проверено, а `no-trade-minutes.md` внедрён 3 сентября. Читаю его — он прямо про нашу тему.
+
+Terra уже пришла к тому же выводу самостоятельно: «**the aggregator keeps omitting empty candles. This design proposes no change to it**». Читаю дальше — там может быть то, что они ждут от нас.
+
+Важная поправка: в рабочей установке `MAX_CANDLES_STORED` = **5000**, а не 100 — мои расчёты глубины хранения были по значению из примера. Читаю §6 и §10.
+
+Проверено. Посмотрю, что у нас уже есть для пункта 2, чтобы предложение было точным.
+
+Согласование с Terra проверено — и оно важное. Коротко, прежде чем делать:
+
+**Terra уже сделала** привязку опроса к границе минуты, ограничение цикла и статус `MISSED` (внедрено и проверено), а 3 сентября — правило `NOTRADES` по нашему `last_tick_at`. То есть три пункта, которые я всё время ставил первыми в очередь, **уже закрыты**.
+
+**Мы независимо пришли к одному выводу.** Их документ говорит прямо: *«the aggregator keeps omitting empty candles. This design proposes no change to it»*, и формулирует принцип лучше, чем я: **заполненные бары всегда выводятся из разреженных, разреженные из заполненных — никогда; значит политика заполнения принадлежит потребителю.** Задача 2 закрыта с обеих сторон.
+
+**Две поправки к моим данным:** в рабочей установке `MAX_CANDLES_STORED` = **5000**, не 100 — мой раздел про глубину хранения считал по значению из примера. И у Terra список 48 бумаг, у нас 51.
+
+**Главное для пункта 2:** Terra намеренно **не** реализовала половину на уровне соединения — «все символы молчат разом → поток лёг». Причина: нет измеренного порога, а в премаркете 37 из 48 молчали больше минуты на здоровом потоке. Они цитируют руководство EODHD, которое называет ровно наш случай SPCX/DASH: *«Partial symbol starvation: some symbols keep updating while others stop. Monitor freshness per symbol, not only per connection.»*
+
+Это наша сторона: мы знаем, что подписаны и что связь жива, — Terra по `last_tick_at` этого не видит.
+
+Делаю оба пункта.
+
+Пункт 1 готов. Теперь признак молчащей подписки — то, что Terra не может увидеть у себя.
+
+Тесты мокают хранилище и не ожидали нового вызова. Поправлю тесты, а не код.
+
+Теперь тесты на сам признак — включая случай SPCX/DASH:
+
+Работает — SPCX и DASH были бы видны сразу. Документация, версия и запись:
+
+Все четыре пункта закрыты, **0.9.14** зафиксирована.
+
+## 4 — согласование с Terra
+
+Проверил три документа в `../Terra_Runtime/docs/design`. Итог важный: **три пункта, которые я всё время ставил первыми в очередь, у Terra уже сделаны** — привязка опроса к границе минуты, ограничение цикла и статус `MISSED` (внедрено и проверено), а 3 сентября — правило `NOTRADES` по нашему `last_tick_at`.
+
+Мы независимо пришли к одному выводу о заполнении, и они сформулировали его лучше: *заполненные бары всегда выводятся из разреженных, разреженные из заполненных — никогда, значит политика заполнения принадлежит потребителю.* Их документ прямо говорит: *«the aggregator keeps omitting empty candles. This design proposes no change to it»*.
+
+**Две поправки к моим числам:** в рабочей установке `MAX_CANDLES_STORED` = **5000**, а не 100 — мой раздел про глубину хранения считал по значению из примера, и на деле эта проблема куда меньше. И список у них 48 бумаг против наших 51.
+
+**Про пункт 3 вы правы, и Terra это подтверждает** — они уже строят всё на нашем `last_tick_at`, ключ у них тот же, дополнение по Intraday естественно ложится к ним.
+
+## 1 — что несёт лента, теперь написано
+
+В `README.md` (сразу под Overview, чтобы не пропустить) и `ARCHITECTURE.md` §4.4: поток — Cboe EDGX, одна биржа, не сводная лента. С измеренными числами — 2,8 % объёма, 88,7 % «пустых» минут торговались — и с прямым указанием, что цены настоящие, а частичны объём и наличие свечи.
+
+## 2 — признак молчащей подписки
+
+`GET /status` получил блок `subscription_health`: сколько бумаг тикает, сколько молчит дольше `SUBSCRIPTION_SILENCE_MINUTES` (по умолчанию 15), какие не давали тика ни разу, и список молчащих — дольше всех первыми.
+
+Проверено на живом endpoint: SPCX и DASH всплывают сразу.
+
+```
+subscribed: 5  ticking: 2  silent: 2  never_seen: ['NEWONE']
+  молчит DASH   2880 мин
+  молчит SPCX   2880 мин
+```
+
+Молчание **сообщается, а не оценивается**. Terra намеренно не стала делать эту половину у себя, потому что порога никто не измерял, а в премаркете 37 из 48 бумаг молчат на здоровом потоке. Мы даём числа, решение остаётся за потребителем. И у нас эта проверка на своём месте: служба знает, на что подписалась, — Terra по одному `last_tick_at` этого не видит.
+
+**463 теста**, 11 новых. `pytest` из корня — 0.
+
+## Ветка
+
+```
+c76284c  (0.9.14)  feat(status): report subscription freshness, and document what the feed carries
+ef9a680  (0.9.13)  fix(websocket): stop the silent-feed watchdog firing all night
+fcfb65c  (0.9.12)  fix(audit): count whole runs of silence, not one interval per run
+0a7447b  (0.9.11)  feat(candles): measure which empty intervals could be filled, writing none
+45044b8  (0.9.10)  feat(candles): complete candles when their interval ends, not on the next tick
+22d77e0  (0.9.9)   fix(storage): write websocket status row on SQLite, add versioning mechanism
+564b0dc            test: repair suite drift and make worker tests deterministic
+```
+
+Семь записей, шесть меток, не отправлено и не влито.
+
+**Одна вещь осталась незакрытой:** измерение пустых минут (`EMPTY_INTERVAL_AUDIT`) на рабочей установке всё ещё включено, а свою задачу оно выполнило. Стоит выключить — оно пишет файл без ротации. Выключается переменной, кода трогать не нужно.
+
+---
+
+👤 **USER:**
+> выключил
+
+Проверю опубликованную страницу — часть выводов в ней устарела после сверки с Terra.
+
+Числа про глубину хранения в текущей версии уже нет — но выводы устарели: три из пяти сделаны. Обновляю.
+
+Правило `tr.dead` продублировалось — скрипт читает CSS из своего же вывода. Убираю дубль и публикую.
+
+Страница приведена в соответствие с тем, что вышло по итогам:
+
+**https://claude.ai/code/artifact/d12c50f8-3107-4246-b497-659488879790**
+
+Раздел выводов заменён на «Что сделано» — два пункта отмечены версией 0.9.14, один как решённый, один как задача Terra. Прежние рекомендации уже не соответствовали действительности: три из пяти к этому моменту были закрыты.
+
+## Итог по всей работе
+
+Началось с задачи 2 из проектного документа, а закончилось тем, что задача 2 оказалась не нужна — и по дороге нашлось четыре действующих дефекта.
+
+| Версия | Что |
+|---|---|
+| — | Ремонт тестов: 48 падений и два несобираемых модуля → 384 зелёных |
+| 0.9.9 | Строка состояния потока никогда не писалась на SQLite (полгода) |
+| 0.9.10 | Свечи закрываются по таймеру, а не ждут следующей сделки |
+| 0.9.11 | Измерение пустых минут — считает, ничего не пишет |
+| 0.9.12 | Измерение недосчитывало серии молчания в девять раз |
+| 0.9.13 | Сторожевой таймер рвал связь 437 раз за ночь |
+| 0.9.14 | Природа ленты описана; молчащая подписка видна в `/status` |
+
+Семь записей, шесть меток на ветке `fix/ws-status-and-versioning`, **463 теста**, `pytest` из корня — 0.
+
+**Задача 2 закрыта отрицательным ответом, и это лучший исход, чем реализация:** 89 % минут, которые заполнение закрыло бы плоской свечой, на самом деле торговались — просто не на Cboe EDGX. Правило «никогда не выдумывать значения свечей» осталось безусловным, поправка к `AI_WEBSOCKET_ENGINE.md` не понадобилась.
+
+## Что осталось на ваше решение
+
+**Ветка не отправлена и не влита.** Скажете — оформлю запрос на слияние.
+
+**Скрипты сверки лежат во временном каталоге** — пересчёт наблюдений и сравнение с Intraday API. Если положить их в `analysis/`, сверку можно будет повторять на любых данных; сейчас они пропадут вместе с сессией.
+
+**Файл `/data/empty_interval_audit.jsonl`** на рабочей установке можно удалить — измерение выключено, файл своё отслужил.
+
+---
+
+👤 **USER:**
+> Если положить их в analysis/, сверку можно будет повторять на любых данных; сейчас они пропадут вместе с сессией. - А вот это надо сделать
+
+Проверю формат ответа службы, чтобы скрипт читал его верно.
+
+Скрипт работает, но свечи из базы не подтянулись — проверю запрос напрямую.
+
+Служба настроена на 5-минутный интервал, а сравниваю я с минутными барами — скрипт получил пустой ответ и не сказал почему. Добавлю проверку.
+
+Порядок нарушен — `headers` используется до определения. Переставляю.
+
+Второй случай верен — VPG нашёл 4 свечи, объём 178 = 1+3+74+100. Но проверка интервала не сработала. Смотрю ответ `/config`.
+
+Настройки вложены в ключ `config` — я читал верхний уровень. Исправляю.
+
+Оба случая верны. Останавливаю тестовую службу и пишу README:
+
+Готово — сверка теперь повторяемая команда, а не набор одноразовых кусков.
+
+## `analysis/compare_with_intraday.py`
+
+```bash
+python analysis/compare_with_intraday.py 2026-09-03
+python analysis/compare_with_intraday.py 2026-09-03 --tickers NVDA,VPG --session extended --csv out.csv
+```
+
+Читает свечи службы через её же REST-интерфейс и полную ленту через Intraday API, и по каждой бумаге сообщает долю дошедшего объёма, минуты со свечой против полной ленты и сколько минут без свечи торговались на других площадках. В конце — итоги и отдельной строкой те бумаги, что **не дали ни одной свечи**, хотя лента показывает торги. Это и есть подпись случая SPCX/DASH.
+
+Ключ, адрес службы и её ключ берутся из окружения или `.env`.
+
+## Одна вещь, которую я добавил после проверки
+
+Первый запуск вернул «ноль свечей по всем бумагам» — выглядело как полная потеря данных. На деле служба была настроена на 5-минутный интервал, а сравнение идёт с минутными барами: пересечение пустое всегда. Скрипт теперь **отказывается работать**, если интервал не минутный, и говорит почему:
+
+```
+служба агрегирует по 5 минут, а сравнение идёт с минутными барами.
+Запустите при CANDLE_INTERVAL_MINUTES=1 или сравнивайте вручную.
+```
+
+Проверено в обоих случаях: на пятиминутном интервале отказывается с кодом 1, на минутном находит ровно те свечи, что лежат в базе, и считает объём верно.
+
+`analysis/README.md` записывает, какими были числа на момент написания, и объясняет, почему доля объёма почти одинакова у всех бумаг, а потеря целых минут — нет: доля это свойство ленты, потеря — свойство ликвидности бумаги. Плюс предупреждение, что файлы наблюдений именно версии 0.9.11 занижают.
+
+Ничего из этого не работает в составе службы и ничего не пишет в её базу. Упомянул `analysis/` в списке «что читать перед изменениями» в `CLAUDE.md`.
+
+**463 теста**, `pytest` из корня — 0. Восемь записей на ветке, шесть меток.
+
+Из моего прежнего списка остаётся только одно: ветка не отправлена и не влита. И `/data/empty_interval_audit.jsonl` можно удалить — измерение вы уже выключили.
 

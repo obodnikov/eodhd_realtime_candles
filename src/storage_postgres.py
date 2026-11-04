@@ -18,7 +18,7 @@ try:
 except ImportError:
     PSYCOPG2_AVAILABLE = False
 
-from .storage import Candle, TrackedTicker, ConfigStorage
+from .storage import Candle, TrackedTicker, ConfigStorage, candle_time_iso
 
 logger = logging.getLogger(__name__)
 
@@ -169,6 +169,15 @@ class PostgreSQLStorage:
             cursor.execute(
                 'ALTER TABLE websocket_status ADD COLUMN IF NOT EXISTS out_of_order_tick_dropped_count BIGINT NOT NULL DEFAULT 0'
             )
+            cursor.execute(
+                'ALTER TABLE websocket_status ADD COLUMN IF NOT EXISTS future_tick_dropped_count BIGINT NOT NULL DEFAULT 0'
+            )
+            cursor.execute(
+                'ALTER TABLE websocket_status ADD COLUMN IF NOT EXISTS late_tick_dropped_count BIGINT NOT NULL DEFAULT 0'
+            )
+            cursor.execute(
+                'ALTER TABLE websocket_status ADD COLUMN IF NOT EXISTS tick_failed_count BIGINT NOT NULL DEFAULT 0'
+            )
             conn.commit()
             logger.info("PostgreSQL database schema initialized")
         finally:
@@ -238,6 +247,9 @@ class PostgreSQLStorage:
                 candle_write_dropped_count BIGINT NOT NULL DEFAULT 0,
                 stale_tick_dropped_count BIGINT NOT NULL DEFAULT 0,
                 out_of_order_tick_dropped_count BIGINT NOT NULL DEFAULT 0,
+                future_tick_dropped_count BIGINT NOT NULL DEFAULT 0,
+                late_tick_dropped_count BIGINT NOT NULL DEFAULT 0,
+                tick_failed_count BIGINT NOT NULL DEFAULT 0,
                 last_message TEXT,
                 last_update TEXT NOT NULL
             )
@@ -337,9 +349,10 @@ class PostgreSQLStorage:
                     t.last_tick_at,
                     t.last_price,
                     t.last_candle_request_at,
-                    COUNT(c.id) as candle_count
+                    COUNT(CASE WHEN c.is_complete = true THEN 1 END) as candle_count,
+                    MAX(c.timestamp) as last_candle_ts
                 FROM tickers t
-                LEFT JOIN candles c ON t.symbol = c.ticker AND c.is_complete = true
+                LEFT JOIN candles c ON t.symbol = c.ticker
                 GROUP BY t.symbol, t.added_at, t.status, t.last_tick_at, t.last_price, t.last_candle_request_at
                 ORDER BY t.symbol
             ''')
@@ -353,7 +366,8 @@ class PostgreSQLStorage:
                     last_tick_at=self._to_isoformat(row['last_tick_at']),
                     last_price=float(row['last_price']) if row['last_price'] else None,
                     candle_count=row['candle_count'],
-                    last_candle_request_at=self._to_isoformat(row['last_candle_request_at'])
+                    last_candle_request_at=self._to_isoformat(row['last_candle_request_at']),
+                    last_candle_at=candle_time_iso(row['last_candle_ts'])
                 ))
             
             return tickers
@@ -420,9 +434,10 @@ class PostgreSQLStorage:
                     t.last_tick_at,
                     t.last_price,
                     t.last_candle_request_at,
-                    COUNT(c.id) as candle_count
+                    COUNT(CASE WHEN c.is_complete = true THEN 1 END) as candle_count,
+                    MAX(c.timestamp) as last_candle_ts
                 FROM tickers t
-                LEFT JOIN candles c ON t.symbol = c.ticker AND c.is_complete = true
+                LEFT JOIN candles c ON t.symbol = c.ticker
                 WHERE t.symbol = %s
                 GROUP BY t.symbol, t.added_at, t.status, t.last_tick_at, t.last_price, t.last_candle_request_at
             ''', (symbol.upper(),))
@@ -438,7 +453,8 @@ class PostgreSQLStorage:
                 last_tick_at=self._to_isoformat(row['last_tick_at']),
                 last_price=float(row['last_price']) if row['last_price'] else None,
                 candle_count=row['candle_count'],
-                last_candle_request_at=self._to_isoformat(row['last_candle_request_at'])
+                last_candle_request_at=self._to_isoformat(row['last_candle_request_at']),
+                last_candle_at=candle_time_iso(row['last_candle_ts'])
             )
         finally:
             self._put_connection(conn)
@@ -901,8 +917,9 @@ class PostgreSQLStorage:
                     tick_enqueued_count, tick_processed_count, tick_dropped_count,
                     candle_write_queue_size, candle_write_queue_maxsize, candle_write_dropped_count,
                     stale_tick_dropped_count, out_of_order_tick_dropped_count,
+                    future_tick_dropped_count, late_tick_dropped_count, tick_failed_count,
                     last_message, last_update
-                ) VALUES (1, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ) VALUES (1, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (id) DO UPDATE SET
                     connected = EXCLUDED.connected,
                     subscribed_tickers = EXCLUDED.subscribed_tickers,
@@ -920,6 +937,9 @@ class PostgreSQLStorage:
                     candle_write_dropped_count = EXCLUDED.candle_write_dropped_count,
                     stale_tick_dropped_count = EXCLUDED.stale_tick_dropped_count,
                     out_of_order_tick_dropped_count = EXCLUDED.out_of_order_tick_dropped_count,
+                    future_tick_dropped_count = EXCLUDED.future_tick_dropped_count,
+                    late_tick_dropped_count = EXCLUDED.late_tick_dropped_count,
+                    tick_failed_count = EXCLUDED.tick_failed_count,
                     last_message = EXCLUDED.last_message,
                     last_update = EXCLUDED.last_update
             ''', (
@@ -939,6 +959,9 @@ class PostgreSQLStorage:
                 status.get('candle_write_dropped_count', 0),
                 status.get('stale_tick_dropped_count', 0),
                 status.get('out_of_order_tick_dropped_count', 0),
+                status.get('future_tick_dropped_count', 0),
+                status.get('late_tick_dropped_count', 0),
+                status.get('tick_failed_count', 0),
                 status.get('last_message'),
                 datetime.now(timezone.utc).isoformat()
             ))
@@ -1047,6 +1070,9 @@ class PostgreSQLStorage:
                 'candle_write_dropped_count': row.get('candle_write_dropped_count', 0),
                 'stale_tick_dropped_count': row.get('stale_tick_dropped_count', 0),
                 'out_of_order_tick_dropped_count': row.get('out_of_order_tick_dropped_count', 0),
+                'future_tick_dropped_count': row.get('future_tick_dropped_count', 0),
+                'late_tick_dropped_count': row.get('late_tick_dropped_count', 0),
+                'tick_failed_count': row.get('tick_failed_count', 0),
                 'last_message': row['last_message'],
                 'last_update': last_update.isoformat() if last_update else None,
                 'is_stale': is_stale,

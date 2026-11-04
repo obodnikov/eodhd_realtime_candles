@@ -78,6 +78,63 @@ class TestWebSocketStatusStorage:
         assert result['subscribed_count'] == 2
         assert result['tick_count'] == 200
 
+    def test_drop_and_failure_counters_are_stored(self, storage):
+        """An API worker can only report what the WebSocket worker stored here."""
+        storage.update_websocket_status({
+            'connected': True,
+            'subscribed_tickers': [],
+            'subscribed_count': 0,
+            'pending_subscribe': [],
+            'connection_count': 1,
+            'tick_count': 10,
+            'last_message': None,
+            'tick_failed_count': 7,
+            'future_tick_dropped_count': 8,
+            'late_tick_dropped_count': 9,
+        })
+
+        result = storage.get_websocket_status()
+
+        assert result['tick_failed_count'] == 7
+        assert result['future_tick_dropped_count'] == 8
+        assert result['late_tick_dropped_count'] == 9
+
+    def test_counters_default_to_zero(self, storage):
+        storage.update_websocket_status({
+            'connected': True,
+            'subscribed_tickers': [],
+            'subscribed_count': 0,
+            'pending_subscribe': [],
+            'connection_count': 1,
+            'tick_count': 0,
+            'last_message': None,
+        })
+
+        result = storage.get_websocket_status()
+
+        assert result['tick_failed_count'] == 0
+        assert result['future_tick_dropped_count'] == 0
+        assert result['late_tick_dropped_count'] == 0
+
+    def test_an_existing_database_gains_the_new_columns(self, tmp_path):
+        """Upgrading must not need the database to be recreated."""
+        path = str(tmp_path / 'old.db')
+        old = Storage(path)
+        conn = old._get_connection()
+        for column in ('tick_failed_count', 'future_tick_dropped_count',
+                       'late_tick_dropped_count'):
+            conn.execute(f'ALTER TABLE websocket_status DROP COLUMN {column}')
+        conn.commit()
+
+        upgraded = Storage(path)
+        columns = {
+            row[1] for row in
+            upgraded._get_connection().execute('PRAGMA table_info(websocket_status)')
+        }
+
+        assert {'tick_failed_count', 'future_tick_dropped_count',
+                'late_tick_dropped_count'} <= columns
+
     def test_websocket_status_staleness_detection(self, storage):
         """Test staleness detection with configurable threshold."""
         status = {

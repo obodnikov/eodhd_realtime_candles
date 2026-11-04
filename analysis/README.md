@@ -1,7 +1,8 @@
 # analysis/
 
 Measurement tools. Nothing here runs as part of the service, and nothing here
-writes to its database — these scripts read, compare and print.
+writes candles — these scripts read, compare and print. The one field their
+reads do change is described under *One thing these reads change*.
 
 They exist because two questions about this service can only be answered with
 numbers, and both were once answered with estimates that turned out wrong.
@@ -40,6 +41,12 @@ tape shows it trading. That is the signature of a subscription EODHD accepted
 and never streamed; cross-check it against `subscription_health` in
 `GET /status`.
 
+Intraday can have nothing yet for one ticker's day while the other tickers' days
+are there: on the morning of 4 November 2026, six of 50 tickers still had no data
+for 3 November. Such a ticker is listed separately and left out of the totals,
+because comparing against nothing would count its volume against no reference and
+its empty minutes as minutes nobody traded. Run the comparison again later for it.
+
 ### What the numbers looked like when this was written
 
 51 tickers, main session, 3 September 2026:
@@ -50,12 +57,50 @@ and never streamed; cross-check it against `subscription_health` in
 | Minutes with no candle that traded elsewhere | 88.7% |
 | Tickers producing nothing at all | 2 — SPCX and DASH |
 
+These figures predate 0.9.17, when the service was still losing about a quarter of
+the volume it received. The share is therefore higher than shown, and the table
+needs re-measuring after a full session on 0.9.17 or later.
+
 The volume share is near-constant across tickers because it is a property of the
 feed, not of the stock. Whether that costs whole minutes depends on liquidity: an
 active name prints in every minute even on one venue, a thin one does not. On
 that day 14 of 51 tickers had all 390 minutes, and 5 lost more than half.
 
 Re-run it after a session to confirm those figures still hold.
+
+### Same-exchange check: `--feed-bars`
+
+The figures above describe the feed and the service together, because Intraday
+covers every exchange. To measure the service alone, compare against the minute
+bars EODHD builds from the same exchange feed:
+
+```bash
+# every tracked ticker, the latest minutes
+python analysis/compare_with_intraday.py --feed-bars
+
+# a few tickers
+python analysis/compare_with_intraday.py --feed-bars --tickers NVDA,ONT
+```
+
+A minute these bars have and the service does not is a loss inside the service,
+so the result should be close to 100%. It works during the session, when Intraday
+has nothing yet. The provider returns at most 120 bars per ticker, so it covers
+only the latest minutes and takes no date. The two newest minutes are left out,
+because a candle may not be stored yet.
+
+The comparison also stops at each ticker's newest bar, because the provider does
+not return a ticker's latest bar. After the close on 3 November 2026 every
+ticker's last minute was missing from its bars, while the service held a candle
+for it; counted, that minute read as one extra minute per ticker and as volume
+above 100%. A minute past the newest bar cannot be checked either way.
+
+### One thing these reads change
+
+`GET /candles/{ticker}` records the request in `last_candle_request_at`, and
+`scripts/manage_tickers.py` uses that field to choose which tickers to remove. A
+full run of this script therefore marks every ticker as just requested. This does
+no harm where clients poll every ticker anyway, but on an installation where some
+tickers really are unused, it hides that until they age again.
 
 ## A note on `empty_interval_audit.jsonl`
 
