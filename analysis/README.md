@@ -41,6 +41,12 @@ tape shows it trading. That is the signature of a subscription EODHD accepted
 and never streamed; cross-check it against `subscription_health` in
 `GET /status`.
 
+Intraday can have nothing yet for one ticker's day while the other tickers' days
+are there: on the morning of 4 November 2026, six of 50 tickers still had no data
+for 3 November. Such a ticker is listed separately and left out of the totals,
+because comparing against nothing would count its volume against no reference and
+its empty minutes as minutes nobody traded. Run the comparison again later for it.
+
 ### What the numbers looked like when this was written
 
 51 tickers, main session, 3 September 2026:
@@ -81,6 +87,12 @@ so the result should be close to 100%. It works during the session, when Intrada
 has nothing yet. The provider returns at most 120 bars per ticker, so it covers
 only the latest minutes and takes no date. The two newest minutes are left out,
 because a candle may not be stored yet.
+
+The comparison also stops at each ticker's newest bar, because the provider does
+not return a ticker's latest bar. After the close on 3 November 2026 every
+ticker's last minute was missing from its bars, while the service held a candle
+for it; counted, that minute read as one extra minute per ticker and as volume
+above 100%. A minute past the newest bar cannot be checked either way.
 
 ### One thing these reads change
 

@@ -14,6 +14,22 @@ compared against this file. See *Versioning and changelog* in
 > the commits they cover; they are not release notes written at the time, and
 > they may omit changes that left no trace in a commit message.
 
+## [Unreleased]
+
+### Fixed
+- **`analysis/compare_with_intraday.py` overstated the volume share when Intraday had
+  no data for a ticker's day.** Such a ticker added its candles' volume to the total
+  with nothing beside it in the reference, and its empty minutes counted as minutes
+  nobody traded. On the morning of 4 November, six of 50 tickers still had no Intraday
+  data for 3 November: the total read 4.2% instead of 3.8%, and 62.0% instead of
+  76.5% of the empty minutes traded elsewhere. These tickers are now listed separately
+  and left out of the totals; one of the six had its data an hour later.
+- **`--feed-bars` counted each ticker's newest minute as extra.** EODHD does not return
+  a ticker's latest bar, so the service's candle for that minute had nothing to match.
+  On 3 November's evening bars every ticker showed one minute more than the exchange,
+  and the total came out at 100.1% instead of 99.7%. The comparison now stops at the
+  newest bar. The service itself is unchanged.
+
 ## [0.9.17] - 2026-11-02
 
 ### Fixed

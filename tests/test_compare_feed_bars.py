@@ -38,13 +38,22 @@ class TestFeedBarsToMinutes:
 
 class TestFeedWindow:
 
-    def test_runs_from_the_oldest_bar_up_to_the_settled_minutes(self):
+    def test_runs_from_the_oldest_bar_to_the_newest_one(self):
+        """The provider does not return a ticker's latest bar, so nothing past it is checked."""
         bars = {MINUTE: 1, MINUTE + 120: 1}
         now = MINUTE + 600
 
         grid = compare_tool.feed_window(bars, now, settle_seconds=120)
 
         assert grid[0] == MINUTE
+        assert grid[-1] == MINUTE + 120, "the newest bar is the last minute compared"
+
+    def test_a_bar_still_settling_is_left_out(self):
+        bars = {MINUTE: 1, MINUTE + 120: 1, MINUTE + 480: 1}
+        now = MINUTE + 600
+
+        grid = compare_tool.feed_window(bars, now, settle_seconds=120)
+
         assert grid[-1] == MINUTE + 420, "the minute ending at now - 120s is the last"
 
     def test_a_minute_still_closing_is_left_out(self):
@@ -69,3 +78,14 @@ class TestComparisonOverTheWindow:
 
         assert result['traded_elsewhere'] == 1
         assert result['volume_share'] == pytest.approx(400 / 600 * 100)
+
+    def test_our_candle_after_the_newest_bar_is_not_counted_as_extra(self):
+        """After the close the provider withheld each ticker's last minute; ours had volume."""
+        theirs = {MINUTE: 100, MINUTE + 60: 200}
+        ours = {MINUTE: 100, MINUTE + 60: 200, MINUTE + 120: 1755}
+        grid = compare_tool.feed_window(theirs, MINUTE + 3600, settle_seconds=120)
+
+        result = compare_tool.compare(ours, theirs, grid)
+
+        assert result['our_minutes'] == 2
+        assert result['volume_share'] == pytest.approx(100)

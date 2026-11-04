@@ -158,10 +158,17 @@ def fetch_feed_bars(eodhd_key: str, ticker: str) -> Optional[Dict[int, int]]:
 
 def feed_window(bars: Dict[int, int], now_ts: int,
                 settle_seconds: int = FEED_SETTLE_SECONDS) -> List[int]:
-    """Minutes to compare: from the oldest bar up to the last settled minute."""
+    """Minutes to compare: from the oldest bar to the newest settled one.
+
+    The window stops at the newest bar because the provider does not return a
+    ticker's latest bar: after the close on 2026-11-03 every ticker's last
+    minute was missing from its bars while the service held a candle for it.
+    A minute past the newest bar cannot be checked, so it is not compared.
+    """
     if not bars:
         return []
-    return minute_grid(min(bars), (now_ts - settle_seconds) // 60 * 60)
+    end = min(max(bars) + 60, (now_ts - settle_seconds) // 60 * 60)
+    return minute_grid(min(bars), end)
 
 
 def compare(ours: Dict[int, int], theirs: Dict[int, int],
@@ -185,6 +192,32 @@ def compare(ours: Dict[int, int], theirs: Dict[int, int],
         'traded_elsewhere': traded_elsewhere,
         'false_empty_share': (traded_elsewhere / len(our_empty) * 100
                               if our_empty else None),
+    }
+
+
+def has_reference(result: dict) -> bool:
+    """Whether the reference had any bar in the window to compare against.
+
+    Intraday can have nothing yet for one ticker's day while other tickers'
+    days are there. Comparing against that would add the ticker's volume to the
+    total with nothing beside it, and count its empty minutes as untraded.
+    """
+    return result['their_minutes'] > 0
+
+
+def summarize(rows: List[dict]) -> dict:
+    """Totals over the tickers that have a reference; the others listed apart."""
+    compared = [r for r in rows if has_reference(r)]
+    return {
+        'our_volume': sum(r['our_volume'] for r in compared),
+        'their_volume': sum(r['their_volume'] for r in compared),
+        'our_empty': sum(r['our_empty'] for r in compared),
+        'traded_elsewhere': sum(r['traded_elsewhere'] for r in compared),
+        'shares': sorted(r['volume_share'] for r in compared
+                         if r['volume_share'] is not None),
+        'silent': [r['ticker'] for r in compared
+                   if r['our_volume'] == 0 and r['their_volume'] > 0],
+        'no_reference': [r['ticker'] for r in rows if not has_reference(r)],
     }
 
 
@@ -345,6 +378,10 @@ def main() -> int:
         result = compare(ours, theirs, grid)
         result['ticker'] = ticker
         rows.append(result)
+        if not has_reference(result):
+            print(f"{index:3d}/{len(tickers)} {ticker:8} нет данных Intraday, "
+                  f"у нас свечей {result['our_minutes']:4d}")
+            continue
         share = (f"{result['volume_share']:5.1f}%"
                  if result['volume_share'] is not None else "    —")
         print(f"{index:3d}/{len(tickers)} {ticker:8} объём {share}   "
@@ -356,12 +393,12 @@ def main() -> int:
         print("\nсравнить не удалось ни по одной бумаге", file=sys.stderr)
         return 2
 
-    our_total = sum(r['our_volume'] for r in rows)
-    their_total = sum(r['their_volume'] for r in rows)
-    empty_total = sum(r['our_empty'] for r in rows)
-    traded_total = sum(r['traded_elsewhere'] for r in rows)
-    shares = sorted(r['volume_share'] for r in rows
-                    if r['volume_share'] is not None)
+    summary = summarize(rows)
+    our_total = summary['our_volume']
+    their_total = summary['their_volume']
+    empty_total = summary['our_empty']
+    traded_total = summary['traded_elsewhere']
+    shares = summary['shares']
 
     print(f"\n{'=' * 62}")
     print(f"объём: {our_total:,} из {their_total:,} = "
@@ -373,11 +410,14 @@ def main() -> int:
     if empty_total:
         print(f"минут без свечи у нас: {empty_total}, из них торговались: "
               f"{traded_total} = {traded_total / empty_total * 100:.1f}%")
-    silent = [r['ticker'] for r in rows if r['our_volume'] == 0
-              and r['their_volume'] > 0]
-    if silent:
-        print(f"\nНИ ОДНОЙ СВЕЧИ, хотя бумага торговалась: {', '.join(silent)}")
+    if summary['silent']:
+        print(f"\nНИ ОДНОЙ СВЕЧИ, хотя бумага торговалась: "
+              f"{', '.join(summary['silent'])}")
         print("  проверьте subscription_health в GET /status")
+    if summary['no_reference']:
+        print(f"\nнет данных Intraday за этот день, в итоги не вошли: "
+              f"{', '.join(summary['no_reference'])}")
+        print("  повторите сравнение позже")
 
     if args.csv:
         write_csv(args.csv, rows)
